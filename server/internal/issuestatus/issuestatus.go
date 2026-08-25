@@ -106,6 +106,13 @@ func IsBuiltIn(key string) bool {
 // and exists so calling code can say which of the two it means.
 func IsCategory(value string) bool { return IsBuiltIn(value) }
 
+// IsTerminal reports whether a status category ends the active issue flow.
+// Done and Cancelled share the card-session retention contract: either one
+// may retain the current generation until a follow-up comment reopens it.
+func IsTerminal(category string) bool {
+	return category == Done || category == Cancelled
+}
+
 // CategoryRank returns the display rank of a category, or len(canonicalOrder)
 // for an unrecognized one so it sorts last instead of colliding with rank 0.
 func CategoryRank(category string) int {

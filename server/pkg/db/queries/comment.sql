@@ -434,20 +434,21 @@ WHERE c.id = (SELECT id FROM root_of WHERE parent_id IS NULL LIMIT 1);
 --     pair matches 0 rows in the CTE, the dependent INSERT then selects nothing,
 --     and the :one query returns pgx.ErrNoRows. A wrong workspace can therefore
 --     never leave a mis-attributed comment or a silently un-touched issue.
---   * done reopen — a comment is the supported follow-up after Done, so the
---     same statement changes a done-category issue to in_review. The issue
---     status trigger reopens the retained card generation in that transaction.
+--   * terminal reopen — a comment is the supported follow-up after Done or
+--     Cancelled, so the same statement changes a terminal-category issue to
+--     in_review. The issue status trigger reopens the retained card generation
+--     in that transaction.
 -- Centralizing this here means every comment entrypoint inherits both
 -- guarantees regardless of what a caller passes. The "Updated date" sort and
 -- the daemon GC TTL both read updated_at, so this consistency is load-bearing.
 WITH touched_issue AS (
     UPDATE issue SET
         status = CASE
-            WHEN issue_effective_status(issue.workspace_id, issue.status) = 'done' THEN 'in_review'
+            WHEN issue_effective_status(issue.workspace_id, issue.status) IN ('done', 'cancelled') THEN 'in_review'
             ELSE issue.status
         END,
         position = CASE
-            WHEN issue_effective_status(issue.workspace_id, issue.status) = 'done' THEN (
+            WHEN issue_effective_status(issue.workspace_id, issue.status) IN ('done', 'cancelled') THEN (
                 SELECT COALESCE(MIN(target.position), 0) - 1
                 FROM issue AS target
                 WHERE target.workspace_id = issue.workspace_id

@@ -1901,7 +1901,7 @@ func (h *Handler) CreateComment(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	comment := created.Comment()
-	issue = h.reopenDoneIssueOnComment(r.Context(), issue, created.IssueStatus, authorType, authorID)
+	issue = h.reopenTerminalIssueOnComment(r.Context(), issue, created.IssueStatus, authorType, authorID)
 
 	// Link uploaded attachments to this comment.
 	if len(attachmentIDs) > 0 {

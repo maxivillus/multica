@@ -15,11 +15,11 @@ close requests and bound retained resources.
 
 Store a server-owned `card_session` generation per issue and agent. Keep it
 open through the work/review flow, retain it for a workspace-configured period
-after `done`, and reopen the same generation when a comment moves the issue to
-`in_review`. Enforce the workspace open-generation cap under a workspace row
-lock. Make the comment reopen and issue activity update one database operation,
-and enforce status-to-generation synchronization with a database trigger so
-non-HTTP status writers follow the same contract.
+after `done` or `cancelled`, and reopen the same generation when a comment
+moves the issue to `in_review`. Enforce the workspace open-generation cap under
+a workspace row lock. Make the comment reopen and issue activity update one
+database operation, and enforce status-to-generation synchronization with a
+database trigger so non-HTTP status writers follow the same contract.
 
 Persist the latest provider session/workdir pointer when the daemon pins a
 task session. Use provider-specific rejoin/resume when available and retain a

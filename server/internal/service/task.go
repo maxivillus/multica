@@ -6659,12 +6659,12 @@ func commentEventFields(c db.Comment) map[string]any {
 	}
 }
 
-// reconcileDoneCommentIssue reads back the atomic status change performed by
-// CreateComment. Agent comments use the same reopen contract as human
+// reconcileTerminalCommentIssue reads back the atomic status change performed
+// by CreateComment. Agent comments use the same reopen contract as human
 // comments, but they do not pass through the HTTP handler that publishes the
 // issue update event.
-func (s *TaskService) reconcileDoneCommentIssue(ctx context.Context, previous db.Issue, newStatus string) db.Issue {
-	if s == nil || s.Queries == nil || newStatus == "" || newStatus == previous.Status || issuestatus.Effective(ctx, s.Queries, previous.WorkspaceID, previous.Status) != issuestatus.Done {
+func (s *TaskService) reconcileTerminalCommentIssue(ctx context.Context, previous db.Issue, newStatus string) db.Issue {
+	if s == nil || s.Queries == nil || newStatus == "" || newStatus == previous.Status || !issuestatus.IsTerminal(issuestatus.Effective(ctx, s.Queries, previous.WorkspaceID, previous.Status)) {
 		return previous
 	}
 	updated, err := s.Queries.GetIssueInWorkspace(ctx, db.GetIssueInWorkspaceParams{
@@ -6720,7 +6720,7 @@ func (s *TaskService) createAgentComment(ctx context.Context, issueID, agentID p
 		return
 	}
 	comment := created.Comment()
-	issue = s.reconcileDoneCommentIssue(ctx, issue, created.IssueStatus)
+	issue = s.reconcileTerminalCommentIssue(ctx, issue, created.IssueStatus)
 	s.CancelDeferredEscalationsForIssueAgent(ctx, issueID, agentID)
 	commentFields := commentEventFields(comment)
 	commentFields["revision"] = comment.Revision
