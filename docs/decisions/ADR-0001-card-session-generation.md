@@ -40,3 +40,10 @@ resume attempts while the retention window is valid. Expiry, capacity, and
 intermediate token usage are observable and bounded. The first slice does not
 yet provide a long-lived provider host or token-savings measurement; those
 remain a separate runtime implementation and evaluation step.
+
+The experimental lifecycle also has a separately toggleable diagnostic layer:
+`MULTICA_CARD_SESSION_OBSERVABILITY_ENABLED` gates structured lifecycle logs
+and the `multica_card_session_*` Prometheus families. It uses bounded labels
+and excludes prompts, provider session IDs, work directories, and token
+payloads, so disabling the layer does not alter lifecycle state or ordinary
+task metrics.

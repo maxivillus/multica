@@ -213,10 +213,15 @@ func NewRouter(pool *pgxpool.Pool, hub *realtime.Hub, bus *events.Bus, analytics
 }
 
 type RouterOptions struct {
-	HTTPMetrics         *obsmetrics.HTTPMetrics
-	BusinessMetrics     *obsmetrics.BusinessMetrics
-	ChannelLeaseMetrics *obsmetrics.ChannelLeaseMetrics
-	SeatCapacityMetrics *obsmetrics.SeatCapacityMetrics
+	HTTPMetrics        *obsmetrics.HTTPMetrics
+	BusinessMetrics    *obsmetrics.BusinessMetrics
+	CardSessionMetrics *obsmetrics.CardSessionMetrics
+	// CardSessionObservabilityEnabled gates the experimental card-session
+	// diagnostic logs. Metrics are separately absent when CardSessionMetrics is
+	// nil, so deployments can disable the whole diagnostic surface together.
+	CardSessionObservabilityEnabled bool
+	ChannelLeaseMetrics             *obsmetrics.ChannelLeaseMetrics
+	SeatCapacityMetrics             *obsmetrics.SeatCapacityMetrics
 	// ChannelLeaseRedis is a dedicated non-blocking Redis client/pool. It is
 	// required only when CHANNEL_WS_LEASE_BACKEND=redis.
 	ChannelLeaseRedis *redis.Client
@@ -403,6 +408,8 @@ func NewRouterWithOptions(pool *pgxpool.Pool, hub *realtime.Hub, bus *events.Bus
 	h.FeatureFlags = opts.FeatureFlags
 	h.TaskService.FeatureFlags = opts.FeatureFlags
 	h.TaskService.Metrics = opts.BusinessMetrics
+	h.TaskService.CardSessionMetrics = opts.CardSessionMetrics
+	h.TaskService.CardSessionObservabilityEnabled = opts.CardSessionObservabilityEnabled
 	h.IssueService.Metrics = opts.BusinessMetrics
 	entitlementClient, entitlementErr := entitlement.New(entitlement.Config{
 		Enabled:      envBool("MULTICA_ENTITLEMENT_POLICY_ENABLED", false),
