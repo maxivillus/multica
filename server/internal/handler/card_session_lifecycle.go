@@ -10,9 +10,9 @@ import (
 )
 
 // reconcileCardSessionStatus keeps the durable generation aligned with the
-// issue's business status. A done transition enters the configured retention
-// window; leaving done reopens the same generation while it is retained.
-// Cancellation and other status changes deliberately do not close a session.
+// issue's business status. A Done or Cancelled transition enters the
+// configured retention window; leaving either terminal category reopens the
+// same generation while it is retained.
 func (h *Handler) reconcileCardSessionStatus(ctx context.Context, previous, current db.Issue) {
 	if h.TaskService == nil || previous.Status == current.Status {
 		return
@@ -21,14 +21,14 @@ func (h *Handler) reconcileCardSessionStatus(ctx context.Context, previous, curr
 	currentCategory := issuestatus.Effective(ctx, h.Queries, current.WorkspaceID, current.Status)
 
 	switch {
-	case previousCategory != issuestatus.Done && currentCategory == issuestatus.Done:
-		if err := h.TaskService.MarkIssueCardSessionsDone(ctx, current.ID, current.WorkspaceID); err != nil {
-			slog.Warn("failed to retain card session after issue done",
+	case !issuestatus.IsTerminal(previousCategory) && issuestatus.IsTerminal(currentCategory):
+		if err := h.TaskService.MarkIssueCardSessionsTerminal(ctx, current.ID, current.WorkspaceID); err != nil {
+			slog.Warn("failed to retain card session after terminal issue status",
 				"issue_id", uuidToString(current.ID),
 				"error", err,
 			)
 		}
-	case previousCategory == issuestatus.Done && currentCategory != issuestatus.Done:
+	case issuestatus.IsTerminal(previousCategory) && !issuestatus.IsTerminal(currentCategory):
 		if err := h.TaskService.ReopenIssueCardSessions(ctx, current.ID, current.WorkspaceID); err != nil {
 			slog.Warn("failed to reopen retained card session",
 				"issue_id", uuidToString(current.ID),
@@ -38,12 +38,12 @@ func (h *Handler) reconcileCardSessionStatus(ctx context.Context, previous, curr
 	}
 }
 
-// reopenDoneIssueOnComment publishes the status transition performed by the
-// CreateComment SQL statement and wakes the retained generation. The database
-// statement owns the transition itself, so this helper is deliberately a
-// readback/reconcile step rather than a second status write.
-func (h *Handler) reopenDoneIssueOnComment(ctx context.Context, issue db.Issue, newStatus, actorType, actorID string) db.Issue {
-	if h.Queries == nil || newStatus == "" || newStatus == issue.Status || issuestatus.Effective(ctx, h.Queries, issue.WorkspaceID, issue.Status) != issuestatus.Done {
+// reopenTerminalIssueOnComment publishes the status transition performed by
+// the CreateComment SQL statement and wakes the retained generation. The
+// database statement owns the transition itself, so this helper is deliberately
+// a readback/reconcile step rather than a second status write.
+func (h *Handler) reopenTerminalIssueOnComment(ctx context.Context, issue db.Issue, newStatus, actorType, actorID string) db.Issue {
+	if h.Queries == nil || newStatus == "" || newStatus == issue.Status || !issuestatus.IsTerminal(issuestatus.Effective(ctx, h.Queries, issue.WorkspaceID, issue.Status)) {
 		return issue
 	}
 
@@ -75,7 +75,7 @@ func (h *Handler) reopenDoneIssueOnComment(ctx context.Context, issue db.Issue, 
 		"issue":          resp,
 		"status_changed": true,
 		"prev_status":    issue.Status,
-		"source":         "comment_after_done",
+		"source":         "comment_after_terminal",
 	})
 	return updated
 }

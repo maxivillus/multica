@@ -906,7 +906,7 @@ func (h *Handler) RunQuickAction(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	comment := created.Comment()
-	issue = h.reopenDoneIssueOnComment(r.Context(), issue, created.IssueStatus, actorType, actorID)
+	issue = h.reopenTerminalIssueOnComment(r.Context(), issue, created.IssueStatus, actorType, actorID)
 
 	resp := commentToResponse(comment, nil, nil)
 	resp.IssueRevision = created.IssueRevision

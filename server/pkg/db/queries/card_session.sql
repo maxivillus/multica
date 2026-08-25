@@ -66,9 +66,10 @@ WHERE id = $1
   AND state <> 'closed'
 RETURNING *;
 
--- name: MarkCardSessionsDone :many
+-- name: MarkCardSessionsTerminal :many
 -- Only a status transition handler may call this query. It moves sessions into
--- the retention state; physical close is a separate expiry operation below.
+-- the retention state for either terminal category; physical close is a
+-- separate expiry operation below.
 UPDATE card_session
 SET state = 'done_retained',
     done_at = now(),
@@ -85,7 +86,7 @@ WHERE issue_id = $1
       FROM issue
       WHERE issue.id = card_session.issue_id
         AND issue.workspace_id = card_session.workspace_id
-        AND issue_effective_status(issue.workspace_id, issue.status) = 'done'
+        AND issue_effective_status(issue.workspace_id, issue.status) IN ('done', 'cancelled')
   )
 RETURNING *;
 
@@ -105,14 +106,14 @@ WHERE issue_id = $1
       FROM issue
       WHERE issue.id = card_session.issue_id
         AND issue.workspace_id = card_session.workspace_id
-        AND issue_effective_status(issue.workspace_id, issue.status) <> 'done'
+        AND issue_effective_status(issue.workspace_id, issue.status) NOT IN ('done', 'cancelled')
   )
   AND retain_until > now()
 RETURNING *;
 
 -- name: ExpireCardSessionsForWorkspace :many
 -- The expiry worker is the only path allowed to close a session row. It can
--- never close an open todo/in_review generation.
+-- never close an open work/review generation.
 UPDATE card_session
 SET state = 'closed',
     closed_at = now(),
@@ -124,7 +125,7 @@ RETURNING *;
 
 -- name: ExpireCardSessions :many
 -- Server-wide expiry pass. The state guard and close trigger ensure this can
--- only close rows that already completed their post-done retention window.
+-- only close rows that already completed their terminal retention window.
 UPDATE card_session
 SET state = 'closed',
     closed_at = now(),
