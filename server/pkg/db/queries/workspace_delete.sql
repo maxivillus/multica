@@ -307,6 +307,9 @@ ws_channel_installations AS MATERIALIZED (
 ws_lark_installations AS MATERIALIZED (
     SELECT id FROM lark_installation WHERE workspace_id = $1
 ),
+deleted_card_sessions AS (
+    DELETE FROM card_session WHERE workspace_id = $1
+),
 -- One of three explicit task_token paths. This is the workspace-keyed one;
 -- DeleteTaskBatch covers task_id and DeleteTaskTokensByAgent covers agent_id, so
 -- a token whose workspace_id points at a neighbour while its task or agent lives

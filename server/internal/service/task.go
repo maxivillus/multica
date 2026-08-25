@@ -7508,6 +7508,8 @@ func (s *TaskService) createAgentComment(ctx context.Context, issueID, agentID p
 		return
 	}
 	comment := created.Comment()
+	issue = s.reconcileDoneCommentIssue(ctx, issue, created.IssueStatus)
+	s.CancelDeferredEscalationsForIssueAgent(ctx, issueID, agentID)
 	commentFields := commentEventFields(comment)
 	commentFields["revision"] = comment.Revision
 	s.Bus.Publish(events.Event{
@@ -7523,6 +7525,31 @@ func (s *TaskService) createAgentComment(ctx context.Context, issueID, agentID p
 		},
 	})
 	s.AutoUnresolveThreadOnReply(ctx, rootComment, util.UUIDToString(issue.WorkspaceID), "agent", util.UUIDToString(agentID), sourceTaskID)
+}
+
+// reconcileDoneCommentIssue reads back the atomic status change performed by
+// CreateComment. Agent comments use the same reopen contract as human
+// comments, but they do not pass through the HTTP handler that publishes the
+// issue update event.
+func (s *TaskService) reconcileDoneCommentIssue(ctx context.Context, previous db.Issue, newStatus string) db.Issue {
+	if s == nil || s.Queries == nil || newStatus == "" || newStatus == previous.Status || issuestatus.Effective(ctx, s.Queries, previous.WorkspaceID, previous.Status) != issuestatus.Done {
+		return previous
+	}
+	updated, err := s.Queries.GetIssueInWorkspace(ctx, db.GetIssueInWorkspaceParams{
+		ID:          previous.ID,
+		WorkspaceID: previous.WorkspaceID,
+	})
+	if err != nil {
+		slog.Warn("agent comment: read reopened issue failed", "issue_id", util.UUIDToString(previous.ID), "error", err)
+		return previous
+	}
+	if err := s.ReopenIssueCardSessions(ctx, updated.ID, updated.WorkspaceID); err != nil {
+		slog.Warn("agent comment: reopen retained card session failed", "issue_id", util.UUIDToString(updated.ID), "error", err)
+	}
+	if s.Bus != nil {
+		s.broadcastIssueUpdated(ctx, updated, previous.Status)
+	}
+	return updated
 }
 
 // AutoUnresolveThreadOnReply clears resolved_at on the thread root when a

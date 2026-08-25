@@ -170,6 +170,16 @@ func runRuntimeSweeper(ctx context.Context, queries *db.Queries, liveness handle
 		sweepStaleTasks(ctx, queries, taskSvc, bus, reconnectGrace)
 		sweepExpiredQueuedTasks(ctx, queries, taskSvc, reconnectGrace)
 		sweepDeferredChatFinalizations(ctx, queries, taskSvc)
+		if expired, err := taskSvc.ExpireCardSessions(ctx); err != nil {
+			slog.Warn("card session expiry sweep failed", "error", err)
+		} else if expired > 0 {
+			slog.Info("card session expiry sweep completed", "count", expired)
+		}
+		if published, err := taskSvc.PublishDueCardSessionTokenStats(ctx); err != nil {
+			slog.Warn("card session token stats sweep failed", "error", err)
+		} else if published > 0 {
+			slog.Info("card session token stats sweep completed", "count", published)
+		}
 	})
 }
 

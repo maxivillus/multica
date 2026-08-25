@@ -431,7 +431,7 @@ WHERE c.id = (SELECT id FROM root_of WHERE parent_id IS NULL LIMIT 1);
 -- A new comment counts as activity on its issue, so the same statement bumps
 -- the parent issue's updated_at and last_activity_at. The touch is a leading data-modifying CTE and
 -- the INSERT selects the issue/workspace back out of it, which makes the two
--- inseparable and gives two query-level guarantees:
+-- inseparable and gives three query-level guarantees:
 --   * atomicity — the insert and the timestamp bump commit or roll back
 --     together, so an issue is never left with a stale updated_at after a
 --     comment persists; and
@@ -440,23 +440,39 @@ WHERE c.id = (SELECT id FROM root_of WHERE parent_id IS NULL LIMIT 1);
 --     pair matches 0 rows in the CTE, the dependent INSERT then selects nothing,
 --     and the :one query returns pgx.ErrNoRows. A wrong workspace can therefore
 --     never leave a mis-attributed comment or a silently un-touched issue.
+--   * done reopen — a comment is the supported follow-up after Done, so the
+--     same statement changes a done-category issue to in_review. The issue
+--     status trigger reopens the retained card generation in that transaction.
 -- Centralizing this here means every comment entrypoint inherits both
 -- guarantees regardless of what a caller passes. The "Updated date" sort and
 -- the daemon GC TTL both read updated_at, so this consistency is load-bearing.
 WITH touched_issue AS (
     UPDATE issue SET
+        status = CASE
+            WHEN issue_effective_status(issue.workspace_id, issue.status) = 'done' THEN 'in_review'
+            ELSE issue.status
+        END,
+        position = CASE
+            WHEN issue_effective_status(issue.workspace_id, issue.status) = 'done' THEN (
+                SELECT COALESCE(MIN(target.position), 0) - 1
+                FROM issue AS target
+                WHERE target.workspace_id = issue.workspace_id
+                  AND target.status = 'in_review'
+            )
+            ELSE issue.position
+        END,
         updated_at = now(),
         revision = revision + 1,
         last_activity_at = GREATEST(COALESCE(last_activity_at, updated_at), now())
     WHERE issue.id = sqlc.arg(issue_id) AND issue.workspace_id = sqlc.arg(workspace_id)
-    RETURNING issue.id, issue.workspace_id, issue.revision
+    RETURNING issue.id, issue.workspace_id, issue.revision, issue.status
 ), inserted_comment AS (
     INSERT INTO comment (issue_id, workspace_id, author_type, author_id, content, type, parent_id, source_task_id, quick_action_id, via_plugin_id, id)
     SELECT ti.id, ti.workspace_id, sqlc.arg(author_type), sqlc.arg(author_id), sqlc.arg(content), sqlc.arg(type), sqlc.narg(parent_id), sqlc.narg(source_task_id), sqlc.narg(quick_action_id), sqlc.narg(via_plugin_id), COALESCE(sqlc.narg('id')::uuid, gen_random_uuid())
     FROM touched_issue ti
     RETURNING *
 )
-SELECT inserted_comment.*, touched_issue.revision AS issue_revision
+SELECT inserted_comment.*, touched_issue.revision AS issue_revision, touched_issue.status AS issue_status
 FROM inserted_comment
 JOIN touched_issue ON touched_issue.id = inserted_comment.issue_id;
 

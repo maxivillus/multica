@@ -4010,6 +4010,9 @@ func (h *Handler) UpdateIssue(w http.ResponseWriter, r *http.Request) {
 		(prevIssue.AssigneeType.String != issue.AssigneeType.String || uuidToString(prevIssue.AssigneeID) != uuidToString(issue.AssigneeID))
 	statusChanged := req.Status != nil && prevIssue.Status != issue.Status
 	priorityChanged := req.Priority != nil && prevIssue.Priority != issue.Priority
+	if statusChanged {
+		h.reconcileCardSessionStatus(r.Context(), prevIssue, issue)
+	}
 	// project_changed gates the client's per-project issue-list refetch the way
 	// status/assignee flags gate theirs. Without it the client must diff
 	// project_id against its own cache, which breaks once an optimistic local
@@ -4791,6 +4794,9 @@ func (h *Handler) BatchUpdateIssues(w http.ResponseWriter, r *http.Request) {
 		statusChanged := req.Updates.Status != nil && prevIssue.Status != issue.Status
 		priorityChanged := req.Updates.Priority != nil && prevIssue.Priority != issue.Priority
 		projectChanged := req.Updates.ProjectID != nil && uuidToString(prevIssue.ProjectID) != uuidToString(issue.ProjectID)
+		if statusChanged {
+			h.reconcileCardSessionStatus(r.Context(), prevIssue, issue)
+		}
 
 		h.publish(protocol.EventIssueUpdated, workspaceID, actorType, actorID, map[string]any{
 			"issue":                      resp,

@@ -53,6 +53,54 @@ interface WorkspaceDetailsDraft {
   context: string;
 }
 
+interface CardSessionSettingsDraft {
+  postDoneRetentionHours: string;
+  maxOpenSessions: string;
+  tokenStatsIntervalMinutes: string;
+}
+
+const defaultCardSessionSettings: CardSessionSettingsDraft = {
+  postDoneRetentionHours: "24",
+  maxOpenSessions: "100",
+  tokenStatsIntervalMinutes: "15",
+};
+
+function readCardSessionSettings(workspace: Workspace | null): CardSessionSettingsDraft {
+  const raw = workspace?.settings?.card_sessions;
+  if (!raw || typeof raw !== "object" || Array.isArray(raw)) {
+    return defaultCardSessionSettings;
+  }
+  const settings = raw as Record<string, unknown>;
+  return {
+    postDoneRetentionHours:
+      typeof settings.post_done_retention_hours === "number" &&
+      Number.isFinite(settings.post_done_retention_hours)
+        ? String(settings.post_done_retention_hours)
+        : defaultCardSessionSettings.postDoneRetentionHours,
+    maxOpenSessions:
+      typeof settings.max_open_sessions === "number" &&
+      Number.isFinite(settings.max_open_sessions)
+        ? String(settings.max_open_sessions)
+        : defaultCardSessionSettings.maxOpenSessions,
+    tokenStatsIntervalMinutes:
+      typeof settings.token_stats_interval_minutes === "number" &&
+      Number.isFinite(settings.token_stats_interval_minutes)
+        ? String(settings.token_stats_interval_minutes)
+        : defaultCardSessionSettings.tokenStatsIntervalMinutes,
+  };
+}
+
+function cardSessionSettingsEqual(
+  left: CardSessionSettingsDraft,
+  right: CardSessionSettingsDraft,
+) {
+  return (
+    left.postDoneRetentionHours === right.postDoneRetentionHours &&
+    left.maxOpenSessions === right.maxOpenSessions &&
+    left.tokenStatsIntervalMinutes === right.tokenStatsIntervalMinutes
+  );
+}
+
 function workspaceDetailsEqual(
   left: WorkspaceDetailsDraft,
   right: WorkspaceDetailsDraft,
@@ -131,6 +179,15 @@ export function WorkspaceTab() {
   const [description, setDescription] = useState(workspace?.description ?? "");
   const [context, setContext] = useState(workspace?.context ?? "");
   const [issuePrefix, setIssuePrefix] = useState(workspace?.issue_prefix ?? "");
+  const [postDoneRetentionHours, setPostDoneRetentionHours] = useState(
+    readCardSessionSettings(workspace).postDoneRetentionHours,
+  );
+  const [maxOpenSessions, setMaxOpenSessions] = useState(
+    readCardSessionSettings(workspace).maxOpenSessions,
+  );
+  const [tokenStatsIntervalMinutes, setTokenStatsIntervalMinutes] = useState(
+    readCardSessionSettings(workspace).tokenStatsIntervalMinutes,
+  );
   const [prefixSaveStatus, setPrefixSaveStatus] =
     useState<SettingsSaveStatus>("idle");
   const [actionId, setActionId] = useState<string | null>(null);
@@ -162,6 +219,10 @@ export function WorkspaceTab() {
     setDescription(workspace?.description ?? "");
     setContext(workspace?.context ?? "");
     setIssuePrefix(workspace?.issue_prefix ?? "");
+    const cardSessionSettings = readCardSessionSettings(workspace);
+    setPostDoneRetentionHours(cardSessionSettings.postDoneRetentionHours);
+    setMaxOpenSessions(cardSessionSettings.maxOpenSessions);
+    setTokenStatsIntervalMinutes(cardSessionSettings.tokenStatsIntervalMinutes);
     // eslint-disable-next-line react-hooks/exhaustive-deps -- intentionally keyed on id only; see comment above
   }, [workspace?.id]);
 
@@ -214,6 +275,59 @@ export function WorkspaceTab() {
       ),
     enabled: !!workspace && canManageWorkspace && !!name.trim(),
     isEqual: workspaceDetailsEqual,
+  });
+
+  const cardSessionDraft = useMemo(
+    () => ({ postDoneRetentionHours, maxOpenSessions, tokenStatsIntervalMinutes }),
+    [maxOpenSessions, postDoneRetentionHours, tokenStatsIntervalMinutes],
+  );
+  const savedCardSessionSettings = useMemo(
+    () => readCardSessionSettings(workspace),
+    [workspace?.settings],
+  );
+  const saveCardSessionSettings = useCallback(
+    async (next: CardSessionSettingsDraft) => {
+      if (!workspace) return;
+      const currentSettings = (workspace.settings ?? {}) as Record<string, unknown>;
+      const currentCardSessionSettings =
+        currentSettings.card_sessions &&
+        typeof currentSettings.card_sessions === "object" &&
+        !Array.isArray(currentSettings.card_sessions)
+          ? (currentSettings.card_sessions as Record<string, unknown>)
+          : {};
+      const updated = await api.updateWorkspace(workspace.id, {
+        settings: {
+          ...currentSettings,
+          card_sessions: {
+            ...currentCardSessionSettings,
+            post_done_retention_hours: Number(next.postDoneRetentionHours),
+            max_open_sessions: Number(next.maxOpenSessions),
+            token_stats_interval_minutes: Number(next.tokenStatsIntervalMinutes),
+          },
+        },
+      });
+      qc.setQueryData(workspaceKeys.list(), (old: Workspace[] | undefined) =>
+        old?.map((ws) => (ws.id === updated.id ? updated : ws)),
+      );
+    },
+    [qc, workspace],
+  );
+  const cardSessionAutoSave = useAutoSave({
+    value: cardSessionDraft,
+    savedValue: savedCardSessionSettings,
+    onSave: saveCardSessionSettings,
+    onSuccess: () =>
+      toast.success(t(($) => $.workspace.toast_saved), {
+        id: "settings-auto-save",
+      }),
+    onError: (error) =>
+      toast.error(
+        error instanceof Error
+          ? error.message
+          : t(($) => $.workspace.toast_save_failed),
+      ),
+    enabled: !!workspace && canManageWorkspace,
+    isEqual: cardSessionSettingsEqual,
   });
 
   const performPrefixSave = async (nextPrefix: string) => {
@@ -461,6 +575,78 @@ export function WorkspaceTab() {
                 {t(($) => $.workspace.manage_hint)}
               </div>
             )}
+        </SettingsCard>
+      </SettingsSection>
+
+      <SettingsSection
+        title={t(($) => $.workspace.section_card_sessions)}
+        action={
+          <SettingsSaveState
+            status={cardSessionAutoSave.status}
+            savingLabel={t(($) => $.auto_save.saving)}
+            savedLabel={t(($) => $.auto_save.saved)}
+            errorLabel={t(($) => $.auto_save.failed)}
+          />
+        }
+      >
+        <SettingsCard>
+          <SettingsRow
+            label={t(($) => $.workspace.post_done_retention_label)}
+            description={t(($) => $.workspace.post_done_retention_hint)}
+            size="code"
+          >
+            <Input
+              type="number"
+              name="workspace-post-done-retention-hours"
+              min={1}
+              max={720}
+              step={1}
+              aria-label={t(($) => $.workspace.post_done_retention_label)}
+              value={postDoneRetentionHours}
+              onChange={(event) => setPostDoneRetentionHours(event.target.value)}
+              onBlur={cardSessionAutoSave.flush}
+              disabled={!canManageWorkspace}
+              className="font-mono"
+            />
+          </SettingsRow>
+          <SettingsRow
+            label={t(($) => $.workspace.max_open_sessions_label)}
+            description={t(($) => $.workspace.max_open_sessions_hint)}
+            size="code"
+          >
+            <Input
+              type="number"
+              name="workspace-max-open-sessions"
+              min={1}
+              max={10000}
+              step={1}
+              aria-label={t(($) => $.workspace.max_open_sessions_label)}
+              value={maxOpenSessions}
+              onChange={(event) => setMaxOpenSessions(event.target.value)}
+              onBlur={cardSessionAutoSave.flush}
+              disabled={!canManageWorkspace}
+              className="font-mono"
+            />
+          </SettingsRow>
+          <SettingsRow
+            label={t(($) => $.workspace.token_stats_interval_label)}
+            description={t(($) => $.workspace.token_stats_interval_hint)}
+            size="code"
+          >
+            <Input
+              type="number"
+              name="workspace-token-stats-interval-minutes"
+              min={1}
+              max={1440}
+              step={1}
+              aria-label={t(($) => $.workspace.token_stats_interval_label)}
+              value={tokenStatsIntervalMinutes}
+              onChange={(event) => setTokenStatsIntervalMinutes(event.target.value)}
+              onBlur={cardSessionAutoSave.flush}
+              disabled={!canManageWorkspace}
+              className="font-mono"
+            />
+          </SettingsRow>
         </SettingsCard>
       </SettingsSection>
 
