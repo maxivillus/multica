@@ -287,6 +287,9 @@ ws_channel_installations AS MATERIALIZED (
 ws_lark_installations AS MATERIALIZED (
     SELECT id FROM lark_installation WHERE workspace_id = $1
 ),
+deleted_card_sessions AS (
+    DELETE FROM card_session WHERE workspace_id = $1
+),
 deleted_task_tokens AS (
     DELETE FROM task_token
     WHERE workspace_id = $1
