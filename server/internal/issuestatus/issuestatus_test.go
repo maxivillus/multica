@@ -139,6 +139,22 @@ func TestEffectiveIsIdentityOnBuiltInsWithoutQuerying(t *testing.T) {
 	}
 }
 
+func TestIsTerminalCoversDoneAndCancelledOnly(t *testing.T) {
+	for _, tc := range []struct {
+		category string
+		want     bool
+	}{
+		{Done, true},
+		{Cancelled, true},
+		{InReview, false},
+		{Blocked, false},
+	} {
+		if got := IsTerminal(tc.category); got != tc.want {
+			t.Errorf("IsTerminal(%q) = %t, want %t", tc.category, got, tc.want)
+		}
+	}
+}
+
 func TestEffectiveMapsCustomStatusToItsCategory(t *testing.T) {
 	q := newFakeQuerier(
 		custom("human_review", InReview),

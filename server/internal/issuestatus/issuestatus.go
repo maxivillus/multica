@@ -116,6 +116,11 @@ func Categories() []string {
 	return out
 }
 
+// IsTerminal reports whether a built-in lifecycle category ends active work.
+func IsTerminal(category string) bool {
+	return category == Done || category == Cancelled
+}
+
 // IsCategory reports whether value names a public lifecycle category.
 func IsCategory(value string) bool {
 	_, ok := categoryRank[value]

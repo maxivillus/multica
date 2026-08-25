@@ -1941,7 +1941,7 @@ func (h *Handler) CreateComment(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	comment := created.Comment()
-	issue = h.reopenDoneIssueOnComment(r.Context(), issue, created.IssueStatus, authorType, authorID)
+	issue = h.reopenTerminalIssueOnComment(r.Context(), issue, created.IssueStatus, authorType, authorID)
 
 	// Fetch linked attachments so the response includes them.
 	groupedAtt := h.groupAttachments(r, []pgtype.UUID{comment.ID})

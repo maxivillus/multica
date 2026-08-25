@@ -9,13 +9,13 @@ in-memory cache are implementation details and may be restarted.
 - A generation is `open` while its issue is in the non-terminal work/review
   flow. New task enqueue paths reuse that generation for the same issue and
   agent.
-- A transition into the effective `done` category changes the generation to
-  `done_retained`. The retention window is read from
+- A transition into the effective `done` or `cancelled` category changes the
+  generation to `done_retained`. The retention window is read from
   `workspace.settings.card_sessions.post_done_retention_hours`.
-- A comment on a done issue atomically changes the issue to `in_review`. The
-  same transaction also fires the database lifecycle trigger, which reopens
-  the retained generation when it has not expired. Repeated comments and
-  concurrent status writers are idempotent at the row boundary.
+- A comment on a done or cancelled issue atomically changes the issue to
+  `in_review`. The same transaction also fires the database lifecycle trigger,
+  which reopens the retained generation when it has not expired. Repeated
+  comments and concurrent status writers are idempotent at the row boundary.
 - Expired retained rows are closed by the server's periodic expiry sweep (and
   opportunistically during allocation). There is no arbitrary close operation
   for an open generation; an ordinary status or comment path cannot close it.
@@ -34,9 +34,9 @@ in-memory cache are implementation details and may be restarted.
   reconciliation. A due session with no usage advances the watermark without
   posting a zero-token comment.
 
-The settings are bounded to 1–720 retention hours, 1–10,000 open sessions, and
-1–1,440 token-statistics interval minutes. The defaults are 24 hours, 100
-sessions, and 15 minutes.
+The terminal-retention setting is bounded to 1–720 hours, open sessions to
+1–10,000, and token-statistics interval to 1–1,440 minutes. The defaults are
+24 hours, 100 sessions, and 15 minutes.
 
 ### Provider continuity
 

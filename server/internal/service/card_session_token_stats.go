@@ -139,7 +139,7 @@ func (s *TaskService) publishCardSessionTokenStats(ctx context.Context, sessionI
 	if err != nil {
 		return nil, fmt.Errorf("load card session token stats issue: %w", err)
 	}
-	if issuestatus.Effective(ctx, qtx, issue.WorkspaceID, issue.Status) == issuestatus.Done {
+	if issuestatus.IsTerminal(issuestatus.Effective(ctx, qtx, issue.WorkspaceID, issue.Status)) {
 		// The status trigger normally moves the session out of open before this
 		// transaction can observe it. Do not let a drifted row produce a comment
 		// that would reopen the issue through CreateComment.

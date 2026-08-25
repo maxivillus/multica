@@ -18,9 +18,9 @@ var (
 	// generation would exceed the workspace's configured open-session cap.
 	ErrCardSessionCapacity = errors.New("card session capacity exhausted")
 	// ErrCardSessionCloseForbidden makes the lifecycle rule explicit for future
-	// close endpoints: an open generation can only enter retention through the
-	// issue's done transition, never through an arbitrary close request.
-	ErrCardSessionCloseForbidden = errors.New("card session can only close after issue reaches done")
+	// close endpoints: an open generation can only enter retention through a
+	// terminal issue transition, never through an arbitrary close request.
+	ErrCardSessionCloseForbidden = errors.New("card session can only close after issue reaches done or cancelled")
 )
 
 // EnsureCardSession creates or reopens the server-owned generation for an
@@ -136,10 +136,10 @@ func (s *TaskService) ensureCardSessionWithQueries(ctx context.Context, q *db.Qu
 	return created, nil
 }
 
-// MarkIssueCardSessionsDone moves every open generation for an issue into the
-// configured post-done retention state. It is intentionally callable only by
-// status-write code; there is no generic close operation for open sessions.
-func (s *TaskService) MarkIssueCardSessionsDone(ctx context.Context, issueID, workspaceID pgtype.UUID) error {
+// MarkIssueCardSessionsTerminal moves every open generation for an issue into
+// the configured terminal retention state. It is intentionally callable only
+// by status-write code; there is no generic close operation for open sessions.
+func (s *TaskService) MarkIssueCardSessionsTerminal(ctx context.Context, issueID, workspaceID pgtype.UUID) error {
 	if s == nil || s.Queries == nil || s.TxStarter == nil {
 		return nil
 	}
@@ -157,7 +157,7 @@ func (s *TaskService) MarkIssueCardSessionsDone(ctx context.Context, issueID, wo
 	if err != nil {
 		return err
 	}
-	if _, err := qtx.MarkCardSessionsDone(ctx, db.MarkCardSessionsDoneParams{
+	if _, err := qtx.MarkCardSessionsTerminal(ctx, db.MarkCardSessionsTerminalParams{
 		IssueID:        issueID,
 		WorkspaceID:    workspaceID,
 		RetentionHours: int64(settings.PostDoneRetentionHours),
@@ -167,8 +167,8 @@ func (s *TaskService) MarkIssueCardSessionsDone(ctx context.Context, issueID, wo
 	return tx.Commit(ctx)
 }
 
-// ReopenIssueCardSessions preserves the same generation when a done issue is
-// reopened during its configured retention window.
+// ReopenIssueCardSessions preserves the same generation when a terminal issue
+// is reopened during its configured retention window.
 func (s *TaskService) ReopenIssueCardSessions(ctx context.Context, issueID, workspaceID pgtype.UUID) error {
 	if s == nil || s.Queries == nil || s.TxStarter == nil {
 		return nil
@@ -191,7 +191,7 @@ func (s *TaskService) ReopenIssueCardSessions(ctx context.Context, issueID, work
 	return tx.Commit(ctx)
 }
 
-// ExpireCardSessions closes retained generations whose post-done window has
+// ExpireCardSessions closes retained generations whose terminal window has
 // elapsed. The server sweeper calls this globally; a missing table is ignored
 // so a rolling deployment can start the new binary before migration 420 has
 // reached every database node.

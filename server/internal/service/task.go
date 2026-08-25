@@ -7508,10 +7508,14 @@ func (s *TaskService) createAgentComment(ctx context.Context, issueID, agentID p
 		return
 	}
 	comment := created.Comment()
-	issue = s.reconcileDoneCommentIssue(ctx, issue, created.IssueStatus)
+	issue = s.reconcileTerminalCommentIssue(ctx, issue, created.IssueStatus)
 	s.CancelDeferredEscalationsForIssueAgent(ctx, issueID, agentID)
 	commentFields := commentEventFields(comment)
 	commentFields["revision"] = comment.Revision
+	issueRevision := created.IssueRevision
+	if issue.Revision > issueRevision {
+		issueRevision = issue.Revision
+	}
 	s.Bus.Publish(events.Event{
 		Type:        protocol.EventCommentCreated,
 		WorkspaceID: util.UUIDToString(issue.WorkspaceID),
@@ -7521,18 +7525,18 @@ func (s *TaskService) createAgentComment(ctx context.Context, issueID, agentID p
 			"comment":        commentFields,
 			"issue_title":    issue.Title,
 			"issue_status":   issue.Status,
-			"issue_revision": created.IssueRevision,
+			"issue_revision": issueRevision,
 		},
 	})
 	s.AutoUnresolveThreadOnReply(ctx, rootComment, util.UUIDToString(issue.WorkspaceID), "agent", util.UUIDToString(agentID), sourceTaskID)
 }
 
-// reconcileDoneCommentIssue reads back the atomic status change performed by
+// reconcileTerminalCommentIssue reads back the atomic status change performed by
 // CreateComment. Agent comments use the same reopen contract as human
 // comments, but they do not pass through the HTTP handler that publishes the
 // issue update event.
-func (s *TaskService) reconcileDoneCommentIssue(ctx context.Context, previous db.Issue, newStatus string) db.Issue {
-	if s == nil || s.Queries == nil || newStatus == "" || newStatus == previous.Status || issuestatus.Effective(ctx, s.Queries, previous.WorkspaceID, previous.Status) != issuestatus.Done {
+func (s *TaskService) reconcileTerminalCommentIssue(ctx context.Context, previous db.Issue, newStatus string) db.Issue {
+	if s == nil || s.Queries == nil || newStatus == "" || newStatus == previous.Status || !issuestatus.IsTerminal(issuestatus.Effective(ctx, s.Queries, previous.WorkspaceID, previous.Status)) {
 		return previous
 	}
 	updated, err := s.Queries.GetIssueInWorkspace(ctx, db.GetIssueInWorkspaceParams{

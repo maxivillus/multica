@@ -94,7 +94,7 @@ RETURNING id, workspace_id, issue_id, agent_id, generation, state, provider, pro
 `
 
 // Server-wide expiry pass. The state guard and close trigger ensure this can
-// only close rows that already completed their post-done retention window.
+// only close rows that already completed their terminal retention window.
 func (q *Queries) ExpireCardSessions(ctx context.Context) ([]CardSession, error) {
 	rows, err := q.db.Query(ctx, expireCardSessions)
 	if err != nil {
@@ -148,7 +148,7 @@ RETURNING id, workspace_id, issue_id, agent_id, generation, state, provider, pro
 `
 
 // The expiry worker is the only path allowed to close a session row. It can
-// never close an open todo/in_review generation.
+// never close an open work/review generation.
 func (q *Queries) ExpireCardSessionsForWorkspace(ctx context.Context, workspaceID pgtype.UUID) ([]CardSession, error) {
 	rows, err := q.db.Query(ctx, expireCardSessionsForWorkspace, workspaceID)
 	if err != nil {
@@ -426,7 +426,7 @@ func (q *Queries) LockWorkspaceForCardSession(ctx context.Context, id pgtype.UUI
 	return i, err
 }
 
-const markCardSessionsDone = `-- name: MarkCardSessionsDone :many
+const markCardSessionsTerminal = `-- name: MarkCardSessionsTerminal :many
 UPDATE card_session
 SET state = 'done_retained',
     done_at = now(),
@@ -443,21 +443,22 @@ WHERE issue_id = $1
       FROM issue
       WHERE issue.id = card_session.issue_id
         AND issue.workspace_id = card_session.workspace_id
-        AND issue_effective_status(issue.workspace_id, issue.status) = 'done'
+        AND issue_effective_status(issue.workspace_id, issue.status) IN ('done', 'cancelled')
   )
 RETURNING id, workspace_id, issue_id, agent_id, generation, state, provider, provider_session_id, work_dir, opened_at, last_activity_at, done_at, retain_until, closed_at, lease_owner, lease_epoch, lease_heartbeat_at, created_at, updated_at, last_token_stats_at
 `
 
-type MarkCardSessionsDoneParams struct {
+type MarkCardSessionsTerminalParams struct {
 	IssueID        pgtype.UUID `json:"issue_id"`
 	RetentionHours int64       `json:"retention_hours"`
 	WorkspaceID    pgtype.UUID `json:"workspace_id"`
 }
 
 // Only a status transition handler may call this query. It moves sessions into
-// the retention state; physical close is a separate expiry operation below.
-func (q *Queries) MarkCardSessionsDone(ctx context.Context, arg MarkCardSessionsDoneParams) ([]CardSession, error) {
-	rows, err := q.db.Query(ctx, markCardSessionsDone, arg.IssueID, arg.RetentionHours, arg.WorkspaceID)
+// the retention state for either terminal category; physical close is a
+// separate expiry operation below.
+func (q *Queries) MarkCardSessionsTerminal(ctx context.Context, arg MarkCardSessionsTerminalParams) ([]CardSession, error) {
+	rows, err := q.db.Query(ctx, markCardSessionsTerminal, arg.IssueID, arg.RetentionHours, arg.WorkspaceID)
 	if err != nil {
 		return nil, err
 	}
@@ -555,7 +556,7 @@ WHERE issue_id = $1
       FROM issue
       WHERE issue.id = card_session.issue_id
         AND issue.workspace_id = card_session.workspace_id
-        AND issue_effective_status(issue.workspace_id, issue.status) <> 'done'
+        AND issue_effective_status(issue.workspace_id, issue.status) NOT IN ('done', 'cancelled')
   )
   AND retain_until > now()
 RETURNING id, workspace_id, issue_id, agent_id, generation, state, provider, provider_session_id, work_dir, opened_at, last_activity_at, done_at, retain_until, closed_at, lease_owner, lease_epoch, lease_heartbeat_at, created_at, updated_at, last_token_stats_at
