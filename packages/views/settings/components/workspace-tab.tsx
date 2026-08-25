@@ -56,11 +56,13 @@ interface WorkspaceDetailsDraft {
 interface CardSessionSettingsDraft {
   postDoneRetentionHours: string;
   maxOpenSessions: string;
+  tokenStatsIntervalMinutes: string;
 }
 
 const defaultCardSessionSettings: CardSessionSettingsDraft = {
   postDoneRetentionHours: "24",
   maxOpenSessions: "100",
+  tokenStatsIntervalMinutes: "15",
 };
 
 function readCardSessionSettings(workspace: Workspace | null): CardSessionSettingsDraft {
@@ -80,6 +82,11 @@ function readCardSessionSettings(workspace: Workspace | null): CardSessionSettin
       Number.isFinite(settings.max_open_sessions)
         ? String(settings.max_open_sessions)
         : defaultCardSessionSettings.maxOpenSessions,
+    tokenStatsIntervalMinutes:
+      typeof settings.token_stats_interval_minutes === "number" &&
+      Number.isFinite(settings.token_stats_interval_minutes)
+        ? String(settings.token_stats_interval_minutes)
+        : defaultCardSessionSettings.tokenStatsIntervalMinutes,
   };
 }
 
@@ -89,7 +96,8 @@ function cardSessionSettingsEqual(
 ) {
   return (
     left.postDoneRetentionHours === right.postDoneRetentionHours &&
-    left.maxOpenSessions === right.maxOpenSessions
+    left.maxOpenSessions === right.maxOpenSessions &&
+    left.tokenStatsIntervalMinutes === right.tokenStatsIntervalMinutes
   );
 }
 
@@ -177,6 +185,9 @@ export function WorkspaceTab() {
   const [maxOpenSessions, setMaxOpenSessions] = useState(
     readCardSessionSettings(workspace).maxOpenSessions,
   );
+  const [tokenStatsIntervalMinutes, setTokenStatsIntervalMinutes] = useState(
+    readCardSessionSettings(workspace).tokenStatsIntervalMinutes,
+  );
   const [prefixSaveStatus, setPrefixSaveStatus] =
     useState<SettingsSaveStatus>("idle");
   const [actionId, setActionId] = useState<string | null>(null);
@@ -211,6 +222,7 @@ export function WorkspaceTab() {
     const cardSessionSettings = readCardSessionSettings(workspace);
     setPostDoneRetentionHours(cardSessionSettings.postDoneRetentionHours);
     setMaxOpenSessions(cardSessionSettings.maxOpenSessions);
+    setTokenStatsIntervalMinutes(cardSessionSettings.tokenStatsIntervalMinutes);
     // eslint-disable-next-line react-hooks/exhaustive-deps -- intentionally keyed on id only; see comment above
   }, [workspace?.id]);
 
@@ -266,8 +278,8 @@ export function WorkspaceTab() {
   });
 
   const cardSessionDraft = useMemo(
-    () => ({ postDoneRetentionHours, maxOpenSessions }),
-    [maxOpenSessions, postDoneRetentionHours],
+    () => ({ postDoneRetentionHours, maxOpenSessions, tokenStatsIntervalMinutes }),
+    [maxOpenSessions, postDoneRetentionHours, tokenStatsIntervalMinutes],
   );
   const savedCardSessionSettings = useMemo(
     () => readCardSessionSettings(workspace),
@@ -290,6 +302,7 @@ export function WorkspaceTab() {
             ...currentCardSessionSettings,
             post_done_retention_hours: Number(next.postDoneRetentionHours),
             max_open_sessions: Number(next.maxOpenSessions),
+            token_stats_interval_minutes: Number(next.tokenStatsIntervalMinutes),
           },
         },
       });
@@ -610,6 +623,25 @@ export function WorkspaceTab() {
               aria-label={t(($) => $.workspace.max_open_sessions_label)}
               value={maxOpenSessions}
               onChange={(event) => setMaxOpenSessions(event.target.value)}
+              onBlur={cardSessionAutoSave.flush}
+              disabled={!canManageWorkspace}
+              className="font-mono"
+            />
+          </SettingsRow>
+          <SettingsRow
+            label={t(($) => $.workspace.token_stats_interval_label)}
+            description={t(($) => $.workspace.token_stats_interval_hint)}
+            size="code"
+          >
+            <Input
+              type="number"
+              name="workspace-token-stats-interval-minutes"
+              min={1}
+              max={1440}
+              step={1}
+              aria-label={t(($) => $.workspace.token_stats_interval_label)}
+              value={tokenStatsIntervalMinutes}
+              onChange={(event) => setTokenStatsIntervalMinutes(event.target.value)}
               onBlur={cardSessionAutoSave.flush}
               disabled={!canManageWorkspace}
               className="font-mono"

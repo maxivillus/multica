@@ -656,6 +656,8 @@
     "post_done_retention_hint": "フォローアップコメントで同じカード世代を再開できるよう、完了後も保持します。",
     "max_open_sessions_label": "開いているセッションの最大数",
     "max_open_sessions_hint": "このワークスペースでアクティブまたは保持されるカード世代の上限です。",
+    "token_stats_interval_label": "トークン統計の間隔（分）",
+    "token_stats_interval_hint": "エージェントセッションが開いている間、この間隔で累積トークン使用量をカードに記録します。",
     "slug_label": "スラッグ",
     "issue_prefix_label": "タスク接頭辞",
     "issue_prefix_hint": "{{example}} のようなタスク番号に使用されます。",

@@ -331,6 +331,7 @@ type CardSession struct {
 	LeaseHeartbeatAt  pgtype.Timestamptz `json:"lease_heartbeat_at"`
 	CreatedAt         pgtype.Timestamptz `json:"created_at"`
 	UpdatedAt         pgtype.Timestamptz `json:"updated_at"`
+	LastTokenStatsAt  pgtype.Timestamptz `json:"last_token_stats_at"`
 }
 
 type ChannelBindingToken struct {

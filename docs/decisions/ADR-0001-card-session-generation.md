@@ -27,10 +27,16 @@ fresh-session fallback for rejected or poisoned sessions. Do not keep an
 unbounded provider process alive merely because the logical generation is
 retained.
 
+While a generation is open, publish cumulative token statistics to the card at
+the workspace-configured interval. Store the publication watermark on the
+generation and commit it with the system comment so concurrent runtime
+sweepers cannot duplicate a snapshot. Scope usage to the generation's opening
+time and matching issue/agent rather than mixing previous generations.
+
 ### Consequences
 
 The same generation survives `done → in_review`, daemon restarts, and provider
-resume attempts while the retention window is valid. Expiry and capacity are
-observable and bounded. The first slice does not yet provide a long-lived
-provider host or token-savings measurement; those remain a separate runtime
-implementation and evaluation step.
+resume attempts while the retention window is valid. Expiry, capacity, and
+intermediate token usage are observable and bounded. The first slice does not
+yet provide a long-lived provider host or token-savings measurement; those
+remain a separate runtime implementation and evaluation step.

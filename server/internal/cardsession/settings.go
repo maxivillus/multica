@@ -8,18 +8,21 @@ import (
 )
 
 const (
-	DefaultPostDoneRetentionHours = 24
-	DefaultMaxOpenSessions        = 100
-	MaxPostDoneRetentionHours     = 24 * 30
-	MaxOpenSessions               = 10_000
+	DefaultPostDoneRetentionHours    = 24
+	DefaultMaxOpenSessions           = 100
+	DefaultTokenStatsIntervalMinutes = 15
+	MaxPostDoneRetentionHours        = 24 * 30
+	MaxOpenSessions                  = 10_000
+	MaxTokenStatsIntervalMinutes     = 24 * 60
 )
 
 // Settings are stored under workspace.settings.card_sessions. Values are
 // deliberately bounded because this setting controls server-held provider
 // state and therefore memory, MCP processes, and workspace capacity.
 type Settings struct {
-	PostDoneRetentionHours int
-	MaxOpenSessions        int
+	PostDoneRetentionHours    int
+	MaxOpenSessions           int
+	TokenStatsIntervalMinutes int
 }
 
 type rawSettings struct {
@@ -27,14 +30,16 @@ type rawSettings struct {
 }
 
 type rawCardSessionSettings struct {
-	PostDoneRetentionHours *int `json:"post_done_retention_hours"`
-	MaxOpenSessions        *int `json:"max_open_sessions"`
+	PostDoneRetentionHours    *int `json:"post_done_retention_hours"`
+	MaxOpenSessions           *int `json:"max_open_sessions"`
+	TokenStatsIntervalMinutes *int `json:"token_stats_interval_minutes"`
 }
 
 func Defaults() Settings {
 	return Settings{
-		PostDoneRetentionHours: DefaultPostDoneRetentionHours,
-		MaxOpenSessions:        DefaultMaxOpenSessions,
+		PostDoneRetentionHours:    DefaultPostDoneRetentionHours,
+		MaxOpenSessions:           DefaultMaxOpenSessions,
+		TokenStatsIntervalMinutes: DefaultTokenStatsIntervalMinutes,
 	}
 }
 
@@ -58,6 +63,9 @@ func Parse(raw []byte) (Settings, error) {
 	if decoded.CardSessions.MaxOpenSessions != nil {
 		settings.MaxOpenSessions = *decoded.CardSessions.MaxOpenSessions
 	}
+	if decoded.CardSessions.TokenStatsIntervalMinutes != nil {
+		settings.TokenStatsIntervalMinutes = *decoded.CardSessions.TokenStatsIntervalMinutes
+	}
 	if err := settings.Validate(); err != nil {
 		return Settings{}, err
 	}
@@ -70,6 +78,9 @@ func (s Settings) Validate() error {
 	}
 	if s.MaxOpenSessions < 1 || s.MaxOpenSessions > MaxOpenSessions {
 		return fmt.Errorf("card_sessions.max_open_sessions must be between 1 and %d", MaxOpenSessions)
+	}
+	if s.TokenStatsIntervalMinutes < 1 || s.TokenStatsIntervalMinutes > MaxTokenStatsIntervalMinutes {
+		return fmt.Errorf("card_sessions.token_stats_interval_minutes must be between 1 and %d", MaxTokenStatsIntervalMinutes)
 	}
 	return nil
 }

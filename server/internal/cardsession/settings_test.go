@@ -13,11 +13,11 @@ func TestParseDefaults(t *testing.T) {
 }
 
 func TestParseConfiguredValues(t *testing.T) {
-	got, err := Parse([]byte(`{"card_sessions":{"post_done_retention_hours":48,"max_open_sessions":12}}`))
+	got, err := Parse([]byte(`{"card_sessions":{"post_done_retention_hours":48,"max_open_sessions":12,"token_stats_interval_minutes":30}}`))
 	if err != nil {
 		t.Fatalf("Parse: %v", err)
 	}
-	if got.PostDoneRetentionHours != 48 || got.MaxOpenSessions != 12 {
+	if got.PostDoneRetentionHours != 48 || got.MaxOpenSessions != 12 || got.TokenStatsIntervalMinutes != 30 {
 		t.Fatalf("settings = %#v", got)
 	}
 }
@@ -28,6 +28,8 @@ func TestParseRejectsUnsafeBounds(t *testing.T) {
 		`{"card_sessions":{"post_done_retention_hours":721}}`,
 		`{"card_sessions":{"max_open_sessions":0}}`,
 		`{"card_sessions":{"max_open_sessions":10001}}`,
+		`{"card_sessions":{"token_stats_interval_minutes":0}}`,
+		`{"card_sessions":{"token_stats_interval_minutes":1441}}`,
 	} {
 		if _, err := Parse([]byte(raw)); err == nil {
 			t.Errorf("Parse(%s) accepted unsafe settings", raw)

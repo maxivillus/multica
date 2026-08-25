@@ -144,3 +144,42 @@ WHERE t.id = $1
   AND t.issue_id = cs.issue_id
   AND t.agent_id = cs.agent_id
   AND cs.state <> 'closed';
+
+-- Token snapshots are selected without locks first. The service then locks
+-- the issue, workspace, and session in that order before creating the system
+-- comment, matching the issue-status trigger's lock order and preventing two
+-- concurrent sweepers from publishing the same interval snapshot.
+-- The one-minute SQL floor keeps the candidate scan bounded while the Go
+-- settings parser applies each workspace's configured interval.
+-- name: ListOpenCardSessionTokenStatsCandidateIDs :many
+SELECT id, workspace_id, issue_id
+FROM card_session
+WHERE state = 'open'
+  AND (
+      last_token_stats_at IS NULL
+      OR last_token_stats_at <= now() - interval '1 minute'
+  )
+ORDER BY last_token_stats_at NULLS FIRST, id
+LIMIT sqlc.arg('limit');
+
+-- name: LockIssueForCardSessionTokenStats :one
+SELECT id
+FROM issue
+WHERE id = sqlc.arg(issue_id)
+  AND workspace_id = sqlc.arg(workspace_id)
+FOR UPDATE;
+
+-- name: LockWorkspaceAndGetCardSessionTokenStats :one
+SELECT cs.*, w.settings AS workspace_settings
+FROM card_session AS cs
+JOIN workspace AS w ON w.id = cs.workspace_id
+WHERE cs.id = sqlc.arg(id)
+  AND cs.state = 'open'
+FOR UPDATE OF cs;
+
+-- name: UpdateCardSessionTokenStatsAt :exec
+UPDATE card_session
+SET last_token_stats_at = sqlc.arg(published_at),
+    updated_at = now()
+WHERE id = sqlc.arg(id)
+  AND state = 'open';

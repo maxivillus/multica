@@ -143,6 +143,11 @@ func runRuntimeSweeper(ctx context.Context, txStarter runtimeGCTxStarter, querie
 			} else if expired > 0 {
 				slog.Info("card session expiry sweep completed", "count", expired)
 			}
+			if published, err := taskSvc.PublishDueCardSessionTokenStats(ctx); err != nil {
+				slog.Warn("card session token stats sweep failed", "error", err)
+			} else if published > 0 {
+				slog.Info("card session token stats sweep completed", "count", published)
+			}
 			if cleaned, err := taskSvc.CleanupSourceContextObjectIntents(ctx, 50); err != nil {
 				slog.Warn("source context object intent cleanup failed", "error", err)
 			} else if cleaned > 0 {

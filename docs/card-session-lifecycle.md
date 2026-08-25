@@ -22,9 +22,21 @@ in-memory cache are implementation details and may be restarted.
 - `workspace.settings.card_sessions.max_open_sessions` limits the number of
   open or unexpired retained generations. Workspace-row locking serializes
   expiry, capacity checks, and new generation allocation.
+- While a generation is `open`, the runtime sweeper periodically writes a
+  cumulative system comment with input, output, cache-read, cache-write, and
+  task counts from `task_usage`. The interval is configured by
+  `workspace.settings.card_sessions.token_stats_interval_minutes`; it defaults
+  to 15 minutes and is bounded to 1–1,440 minutes. The snapshot is scoped to
+  the generation's `opened_at` boundary and the matching issue/agent.
+- The publication watermark is stored on the generation row and advanced in
+  the same transaction as the comment. This makes concurrent server sweepers
+  idempotent and keeps these system comments out of ordinary agent-trigger
+  reconciliation. A due session with no usage advances the watermark without
+  posting a zero-token comment.
 
-The settings are bounded to 1–720 retention hours and 1–10,000 open sessions.
-The defaults are 24 hours and 100 sessions.
+The settings are bounded to 1–720 retention hours, 1–10,000 open sessions, and
+1–1,440 token-statistics interval minutes. The defaults are 24 hours, 100
+sessions, and 15 minutes.
 
 ### Provider continuity
 

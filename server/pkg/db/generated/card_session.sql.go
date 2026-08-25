@@ -38,7 +38,7 @@ JOIN agent ON agent.id = $4
 WHERE issue.id = $5
   AND issue.workspace_id = $1
   AND agent.workspace_id = $1
-RETURNING id, workspace_id, issue_id, agent_id, generation, state, provider, provider_session_id, work_dir, opened_at, last_activity_at, done_at, retain_until, closed_at, lease_owner, lease_epoch, lease_heartbeat_at, created_at, updated_at
+RETURNING id, workspace_id, issue_id, agent_id, generation, state, provider, provider_session_id, work_dir, opened_at, last_activity_at, done_at, retain_until, closed_at, lease_owner, lease_epoch, lease_heartbeat_at, created_at, updated_at, last_token_stats_at
 `
 
 type CreateCardSessionParams struct {
@@ -78,6 +78,7 @@ func (q *Queries) CreateCardSession(ctx context.Context, arg CreateCardSessionPa
 		&i.LeaseHeartbeatAt,
 		&i.CreatedAt,
 		&i.UpdatedAt,
+		&i.LastTokenStatsAt,
 	)
 	return i, err
 }
@@ -89,7 +90,7 @@ SET state = 'closed',
     updated_at = now()
 WHERE state = 'done_retained'
   AND retain_until <= now()
-RETURNING id, workspace_id, issue_id, agent_id, generation, state, provider, provider_session_id, work_dir, opened_at, last_activity_at, done_at, retain_until, closed_at, lease_owner, lease_epoch, lease_heartbeat_at, created_at, updated_at
+RETURNING id, workspace_id, issue_id, agent_id, generation, state, provider, provider_session_id, work_dir, opened_at, last_activity_at, done_at, retain_until, closed_at, lease_owner, lease_epoch, lease_heartbeat_at, created_at, updated_at, last_token_stats_at
 `
 
 // Server-wide expiry pass. The state guard and close trigger ensure this can
@@ -123,6 +124,7 @@ func (q *Queries) ExpireCardSessions(ctx context.Context) ([]CardSession, error)
 			&i.LeaseHeartbeatAt,
 			&i.CreatedAt,
 			&i.UpdatedAt,
+			&i.LastTokenStatsAt,
 		); err != nil {
 			return nil, err
 		}
@@ -142,7 +144,7 @@ SET state = 'closed',
 WHERE state = 'done_retained'
   AND workspace_id = $1
   AND retain_until <= now()
-RETURNING id, workspace_id, issue_id, agent_id, generation, state, provider, provider_session_id, work_dir, opened_at, last_activity_at, done_at, retain_until, closed_at, lease_owner, lease_epoch, lease_heartbeat_at, created_at, updated_at
+RETURNING id, workspace_id, issue_id, agent_id, generation, state, provider, provider_session_id, work_dir, opened_at, last_activity_at, done_at, retain_until, closed_at, lease_owner, lease_epoch, lease_heartbeat_at, created_at, updated_at, last_token_stats_at
 `
 
 // The expiry worker is the only path allowed to close a session row. It can
@@ -176,6 +178,7 @@ func (q *Queries) ExpireCardSessionsForWorkspace(ctx context.Context, workspaceI
 			&i.LeaseHeartbeatAt,
 			&i.CreatedAt,
 			&i.UpdatedAt,
+			&i.LastTokenStatsAt,
 		); err != nil {
 			return nil, err
 		}
@@ -188,7 +191,7 @@ func (q *Queries) ExpireCardSessionsForWorkspace(ctx context.Context, workspaceI
 }
 
 const getLatestCardSession = `-- name: GetLatestCardSession :one
-SELECT id, workspace_id, issue_id, agent_id, generation, state, provider, provider_session_id, work_dir, opened_at, last_activity_at, done_at, retain_until, closed_at, lease_owner, lease_epoch, lease_heartbeat_at, created_at, updated_at
+SELECT id, workspace_id, issue_id, agent_id, generation, state, provider, provider_session_id, work_dir, opened_at, last_activity_at, done_at, retain_until, closed_at, lease_owner, lease_epoch, lease_heartbeat_at, created_at, updated_at, last_token_stats_at
 FROM card_session
 WHERE issue_id = $1
   AND agent_id = $2
@@ -226,12 +229,13 @@ func (q *Queries) GetLatestCardSession(ctx context.Context, arg GetLatestCardSes
 		&i.LeaseHeartbeatAt,
 		&i.CreatedAt,
 		&i.UpdatedAt,
+		&i.LastTokenStatsAt,
 	)
 	return i, err
 }
 
 const getResumableCardSession = `-- name: GetResumableCardSession :one
-SELECT id, workspace_id, issue_id, agent_id, generation, state, provider, provider_session_id, work_dir, opened_at, last_activity_at, done_at, retain_until, closed_at, lease_owner, lease_epoch, lease_heartbeat_at, created_at, updated_at
+SELECT id, workspace_id, issue_id, agent_id, generation, state, provider, provider_session_id, work_dir, opened_at, last_activity_at, done_at, retain_until, closed_at, lease_owner, lease_epoch, lease_heartbeat_at, created_at, updated_at, last_token_stats_at
 FROM card_session
 WHERE issue_id = $1
   AND agent_id = $2
@@ -271,6 +275,133 @@ func (q *Queries) GetResumableCardSession(ctx context.Context, arg GetResumableC
 		&i.LeaseHeartbeatAt,
 		&i.CreatedAt,
 		&i.UpdatedAt,
+		&i.LastTokenStatsAt,
+	)
+	return i, err
+}
+
+const listOpenCardSessionTokenStatsCandidateIDs = `-- name: ListOpenCardSessionTokenStatsCandidateIDs :many
+SELECT id, workspace_id, issue_id
+FROM card_session
+WHERE state = 'open'
+  AND (
+      last_token_stats_at IS NULL
+      OR last_token_stats_at <= now() - interval '1 minute'
+  )
+ORDER BY last_token_stats_at NULLS FIRST, id
+LIMIT $1
+`
+
+type ListOpenCardSessionTokenStatsCandidateIDsRow struct {
+	ID          pgtype.UUID `json:"id"`
+	WorkspaceID pgtype.UUID `json:"workspace_id"`
+	IssueID     pgtype.UUID `json:"issue_id"`
+}
+
+// Token snapshots are selected without locks first. The service then locks
+// the issue, workspace, and session in that order before creating the system
+// comment, matching the issue-status trigger's lock order and preventing two
+// concurrent sweepers from publishing the same interval snapshot.
+// The one-minute SQL floor keeps the candidate scan bounded while the Go
+// settings parser applies each workspace's configured interval.
+func (q *Queries) ListOpenCardSessionTokenStatsCandidateIDs(ctx context.Context, limit int32) ([]ListOpenCardSessionTokenStatsCandidateIDsRow, error) {
+	rows, err := q.db.Query(ctx, listOpenCardSessionTokenStatsCandidateIDs, limit)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	items := []ListOpenCardSessionTokenStatsCandidateIDsRow{}
+	for rows.Next() {
+		var i ListOpenCardSessionTokenStatsCandidateIDsRow
+		if err := rows.Scan(&i.ID, &i.WorkspaceID, &i.IssueID); err != nil {
+			return nil, err
+		}
+		items = append(items, i)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
+	return items, nil
+}
+
+const lockIssueForCardSessionTokenStats = `-- name: LockIssueForCardSessionTokenStats :one
+SELECT id
+FROM issue
+WHERE id = $1
+  AND workspace_id = $2
+FOR UPDATE
+`
+
+type LockIssueForCardSessionTokenStatsParams struct {
+	IssueID     pgtype.UUID `json:"issue_id"`
+	WorkspaceID pgtype.UUID `json:"workspace_id"`
+}
+
+func (q *Queries) LockIssueForCardSessionTokenStats(ctx context.Context, arg LockIssueForCardSessionTokenStatsParams) (pgtype.UUID, error) {
+	row := q.db.QueryRow(ctx, lockIssueForCardSessionTokenStats, arg.IssueID, arg.WorkspaceID)
+	var id pgtype.UUID
+	err := row.Scan(&id)
+	return id, err
+}
+
+const lockWorkspaceAndGetCardSessionTokenStats = `-- name: LockWorkspaceAndGetCardSessionTokenStats :one
+SELECT cs.id, cs.workspace_id, cs.issue_id, cs.agent_id, cs.generation, cs.state, cs.provider, cs.provider_session_id, cs.work_dir, cs.opened_at, cs.last_activity_at, cs.done_at, cs.retain_until, cs.closed_at, cs.lease_owner, cs.lease_epoch, cs.lease_heartbeat_at, cs.created_at, cs.updated_at, cs.last_token_stats_at, w.settings AS workspace_settings
+FROM card_session AS cs
+JOIN workspace AS w ON w.id = cs.workspace_id
+WHERE cs.id = $1
+  AND cs.state = 'open'
+FOR UPDATE OF cs
+`
+
+type LockWorkspaceAndGetCardSessionTokenStatsRow struct {
+	ID                pgtype.UUID        `json:"id"`
+	WorkspaceID       pgtype.UUID        `json:"workspace_id"`
+	IssueID           pgtype.UUID        `json:"issue_id"`
+	AgentID           pgtype.UUID        `json:"agent_id"`
+	Generation        int64              `json:"generation"`
+	State             string             `json:"state"`
+	Provider          string             `json:"provider"`
+	ProviderSessionID pgtype.Text        `json:"provider_session_id"`
+	WorkDir           pgtype.Text        `json:"work_dir"`
+	OpenedAt          pgtype.Timestamptz `json:"opened_at"`
+	LastActivityAt    pgtype.Timestamptz `json:"last_activity_at"`
+	DoneAt            pgtype.Timestamptz `json:"done_at"`
+	RetainUntil       pgtype.Timestamptz `json:"retain_until"`
+	ClosedAt          pgtype.Timestamptz `json:"closed_at"`
+	LeaseOwner        pgtype.Text        `json:"lease_owner"`
+	LeaseEpoch        int64              `json:"lease_epoch"`
+	LeaseHeartbeatAt  pgtype.Timestamptz `json:"lease_heartbeat_at"`
+	CreatedAt         pgtype.Timestamptz `json:"created_at"`
+	UpdatedAt         pgtype.Timestamptz `json:"updated_at"`
+	LastTokenStatsAt  pgtype.Timestamptz `json:"last_token_stats_at"`
+	WorkspaceSettings []byte             `json:"workspace_settings"`
+}
+
+func (q *Queries) LockWorkspaceAndGetCardSessionTokenStats(ctx context.Context, id pgtype.UUID) (LockWorkspaceAndGetCardSessionTokenStatsRow, error) {
+	row := q.db.QueryRow(ctx, lockWorkspaceAndGetCardSessionTokenStats, id)
+	var i LockWorkspaceAndGetCardSessionTokenStatsRow
+	err := row.Scan(
+		&i.ID,
+		&i.WorkspaceID,
+		&i.IssueID,
+		&i.AgentID,
+		&i.Generation,
+		&i.State,
+		&i.Provider,
+		&i.ProviderSessionID,
+		&i.WorkDir,
+		&i.OpenedAt,
+		&i.LastActivityAt,
+		&i.DoneAt,
+		&i.RetainUntil,
+		&i.ClosedAt,
+		&i.LeaseOwner,
+		&i.LeaseEpoch,
+		&i.LeaseHeartbeatAt,
+		&i.CreatedAt,
+		&i.UpdatedAt,
+		&i.LastTokenStatsAt,
+		&i.WorkspaceSettings,
 	)
 	return i, err
 }
@@ -314,7 +445,7 @@ WHERE issue_id = $1
         AND issue.workspace_id = card_session.workspace_id
         AND issue_effective_status(issue.workspace_id, issue.status) = 'done'
   )
-RETURNING id, workspace_id, issue_id, agent_id, generation, state, provider, provider_session_id, work_dir, opened_at, last_activity_at, done_at, retain_until, closed_at, lease_owner, lease_epoch, lease_heartbeat_at, created_at, updated_at
+RETURNING id, workspace_id, issue_id, agent_id, generation, state, provider, provider_session_id, work_dir, opened_at, last_activity_at, done_at, retain_until, closed_at, lease_owner, lease_epoch, lease_heartbeat_at, created_at, updated_at, last_token_stats_at
 `
 
 type MarkCardSessionsDoneParams struct {
@@ -354,6 +485,7 @@ func (q *Queries) MarkCardSessionsDone(ctx context.Context, arg MarkCardSessions
 			&i.LeaseHeartbeatAt,
 			&i.CreatedAt,
 			&i.UpdatedAt,
+			&i.LastTokenStatsAt,
 		); err != nil {
 			return nil, err
 		}
@@ -376,7 +508,7 @@ SET state = 'open',
 WHERE id = $1
   AND state = 'done_retained'
   AND retain_until > now()
-RETURNING id, workspace_id, issue_id, agent_id, generation, state, provider, provider_session_id, work_dir, opened_at, last_activity_at, done_at, retain_until, closed_at, lease_owner, lease_epoch, lease_heartbeat_at, created_at, updated_at
+RETURNING id, workspace_id, issue_id, agent_id, generation, state, provider, provider_session_id, work_dir, opened_at, last_activity_at, done_at, retain_until, closed_at, lease_owner, lease_epoch, lease_heartbeat_at, created_at, updated_at, last_token_stats_at
 `
 
 func (q *Queries) ReopenCardSession(ctx context.Context, id pgtype.UUID) (CardSession, error) {
@@ -402,6 +534,7 @@ func (q *Queries) ReopenCardSession(ctx context.Context, id pgtype.UUID) (CardSe
 		&i.LeaseHeartbeatAt,
 		&i.CreatedAt,
 		&i.UpdatedAt,
+		&i.LastTokenStatsAt,
 	)
 	return i, err
 }
@@ -425,7 +558,7 @@ WHERE issue_id = $1
         AND issue_effective_status(issue.workspace_id, issue.status) <> 'done'
   )
   AND retain_until > now()
-RETURNING id, workspace_id, issue_id, agent_id, generation, state, provider, provider_session_id, work_dir, opened_at, last_activity_at, done_at, retain_until, closed_at, lease_owner, lease_epoch, lease_heartbeat_at, created_at, updated_at
+RETURNING id, workspace_id, issue_id, agent_id, generation, state, provider, provider_session_id, work_dir, opened_at, last_activity_at, done_at, retain_until, closed_at, lease_owner, lease_epoch, lease_heartbeat_at, created_at, updated_at, last_token_stats_at
 `
 
 type ReopenCardSessionsForIssueParams struct {
@@ -462,6 +595,7 @@ func (q *Queries) ReopenCardSessionsForIssue(ctx context.Context, arg ReopenCard
 			&i.LeaseHeartbeatAt,
 			&i.CreatedAt,
 			&i.UpdatedAt,
+			&i.LastTokenStatsAt,
 		); err != nil {
 			return nil, err
 		}
@@ -478,7 +612,7 @@ UPDATE card_session
 SET last_activity_at = now(), updated_at = now()
 WHERE id = $1
   AND state <> 'closed'
-RETURNING id, workspace_id, issue_id, agent_id, generation, state, provider, provider_session_id, work_dir, opened_at, last_activity_at, done_at, retain_until, closed_at, lease_owner, lease_epoch, lease_heartbeat_at, created_at, updated_at
+RETURNING id, workspace_id, issue_id, agent_id, generation, state, provider, provider_session_id, work_dir, opened_at, last_activity_at, done_at, retain_until, closed_at, lease_owner, lease_epoch, lease_heartbeat_at, created_at, updated_at, last_token_stats_at
 `
 
 func (q *Queries) TouchCardSession(ctx context.Context, id pgtype.UUID) (CardSession, error) {
@@ -504,6 +638,7 @@ func (q *Queries) TouchCardSession(ctx context.Context, id pgtype.UUID) (CardSes
 		&i.LeaseHeartbeatAt,
 		&i.CreatedAt,
 		&i.UpdatedAt,
+		&i.LastTokenStatsAt,
 	)
 	return i, err
 }
@@ -529,5 +664,23 @@ type UpdateCardSessionProviderStateByTaskParams struct {
 
 func (q *Queries) UpdateCardSessionProviderStateByTask(ctx context.Context, arg UpdateCardSessionProviderStateByTaskParams) error {
 	_, err := q.db.Exec(ctx, updateCardSessionProviderStateByTask, arg.ID, arg.ProviderSessionID, arg.WorkDir)
+	return err
+}
+
+const updateCardSessionTokenStatsAt = `-- name: UpdateCardSessionTokenStatsAt :exec
+UPDATE card_session
+SET last_token_stats_at = $1,
+    updated_at = now()
+WHERE id = $2
+  AND state = 'open'
+`
+
+type UpdateCardSessionTokenStatsAtParams struct {
+	PublishedAt pgtype.Timestamptz `json:"published_at"`
+	ID          pgtype.UUID        `json:"id"`
+}
+
+func (q *Queries) UpdateCardSessionTokenStatsAt(ctx context.Context, arg UpdateCardSessionTokenStatsAtParams) error {
+	_, err := q.db.Exec(ctx, updateCardSessionTokenStatsAt, arg.PublishedAt, arg.ID)
 	return err
 }
