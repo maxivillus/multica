@@ -1185,6 +1185,14 @@ func (s *TaskService) enqueueIssueTaskWithCommentPlan(ctx context.Context, issue
 	originatorUserID := attr.UserID
 	runtimeMCPOverlay := s.buildRuntimeMCPOverlay(ctx, originatorUserID, agent)
 	attrSource, attrDelegatedFrom, attrEvidenceKind, attrEvidenceRef := attributionCreateParams(attr)
+	if _, err := s.EnsureCardSession(ctx, issue.ID, issue.WorkspaceID, agent.ID, agent.RuntimeMode); err != nil {
+		slog.Warn("task enqueue refused: card session unavailable",
+			"issue_id", util.UUIDToString(issue.ID),
+			"agent_id", util.UUIDToString(agent.ID),
+			"error", err,
+		)
+		return db.AgentTaskQueue{}, err
+	}
 	createParams := db.CreateAgentTaskParams{
 		ID:                   dbid.NewV7(),
 		AgentID:              issue.AssigneeID,
@@ -1337,6 +1345,14 @@ func (s *TaskService) enqueueMentionTaskWithCommentPlan(ctx context.Context, iss
 	originatorUserID := attr.UserID
 	runtimeMCPOverlay := s.buildRuntimeMCPOverlay(ctx, originatorUserID, agent)
 	attrSource, attrDelegatedFrom, attrEvidenceKind, attrEvidenceRef := attributionCreateParams(attr)
+	if _, err := s.EnsureCardSession(ctx, issue.ID, issue.WorkspaceID, agent.ID, agent.RuntimeMode); err != nil {
+		slog.Warn("mention task enqueue refused: card session unavailable",
+			"issue_id", util.UUIDToString(issue.ID),
+			"agent_id", util.UUIDToString(agent.ID),
+			"error", err,
+		)
+		return db.AgentTaskQueue{}, err
+	}
 	task, err := s.Queries.CreateAgentTask(ctx, db.CreateAgentTaskParams{
 		ID:                   dbid.NewV7(),
 		AgentID:              agentID,
@@ -6630,6 +6646,31 @@ func commentEventFields(c db.Comment) map[string]any {
 	}
 }
 
+// reconcileDoneCommentIssue reads back the atomic status change performed by
+// CreateComment. Agent comments use the same reopen contract as human
+// comments, but they do not pass through the HTTP handler that publishes the
+// issue update event.
+func (s *TaskService) reconcileDoneCommentIssue(ctx context.Context, previous db.Issue, newStatus string) db.Issue {
+	if s == nil || s.Queries == nil || newStatus == "" || newStatus == previous.Status || issuestatus.Effective(ctx, s.Queries, previous.WorkspaceID, previous.Status) != issuestatus.Done {
+		return previous
+	}
+	updated, err := s.Queries.GetIssueInWorkspace(ctx, db.GetIssueInWorkspaceParams{
+		ID:          previous.ID,
+		WorkspaceID: previous.WorkspaceID,
+	})
+	if err != nil {
+		slog.Warn("agent comment: read reopened issue failed", "issue_id", util.UUIDToString(previous.ID), "error", err)
+		return previous
+	}
+	if err := s.ReopenIssueCardSessions(ctx, updated.ID, updated.WorkspaceID); err != nil {
+		slog.Warn("agent comment: reopen retained card session failed", "issue_id", util.UUIDToString(updated.ID), "error", err)
+	}
+	if s.Bus != nil {
+		s.broadcastIssueUpdated(ctx, updated, previous.Status)
+	}
+	return updated
+}
+
 func (s *TaskService) createAgentComment(ctx context.Context, issueID, agentID pgtype.UUID, content, commentType string, parentID, sourceTaskID pgtype.UUID) {
 	if content == "" {
 		return
@@ -6666,9 +6707,14 @@ func (s *TaskService) createAgentComment(ctx context.Context, issueID, agentID p
 		return
 	}
 	comment := created.Comment()
+	issue = s.reconcileDoneCommentIssue(ctx, issue, created.IssueStatus)
 	s.CancelDeferredEscalationsForIssueAgent(ctx, issueID, agentID)
 	commentFields := commentEventFields(comment)
 	commentFields["revision"] = comment.Revision
+	issueRevision := created.IssueRevision
+	if issue.Revision > issueRevision {
+		issueRevision = issue.Revision
+	}
 	s.Bus.Publish(events.Event{
 		Type:        protocol.EventCommentCreated,
 		WorkspaceID: util.UUIDToString(issue.WorkspaceID),
@@ -6678,7 +6724,7 @@ func (s *TaskService) createAgentComment(ctx context.Context, issueID, agentID p
 			"comment":        commentFields,
 			"issue_title":    issue.Title,
 			"issue_status":   issue.Status,
-			"issue_revision": created.IssueRevision,
+			"issue_revision": issueRevision,
 		},
 	})
 	s.AutoUnresolveThreadOnReply(ctx, rootComment, util.UUIDToString(issue.WorkspaceID), "agent", util.UUIDToString(agentID))

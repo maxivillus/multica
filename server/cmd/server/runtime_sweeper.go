@@ -138,6 +138,11 @@ func runRuntimeSweeper(ctx context.Context, txStarter runtimeGCTxStarter, querie
 		case <-ctx.Done():
 			return
 		case <-ticker.C:
+			if expired, err := taskSvc.ExpireCardSessions(ctx); err != nil {
+				slog.Warn("card session expiry sweep failed", "error", err)
+			} else if expired > 0 {
+				slog.Info("card session expiry sweep completed", "count", expired)
+			}
 			if cleaned, err := taskSvc.CleanupSourceContextObjectIntents(ctx, 50); err != nil {
 				slog.Warn("source context object intent cleanup failed", "error", err)
 			} else if cleaned > 0 {

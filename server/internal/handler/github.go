@@ -1903,6 +1903,7 @@ func (h *Handler) advanceIssueToDone(ctx context.Context, issue db.Issue, worksp
 		slog.Warn("github: advance issue to done failed", "err", err)
 		return
 	}
+	h.reconcileCardSessionStatus(ctx, issue, updated)
 
 	// Fire the platform parent-notification path on the same transition the
 	// HTTP UpdateIssue / BatchUpdateIssues paths use. A merged PR is one of
