@@ -6,6 +6,7 @@ import (
 	"io"
 	"log/slog"
 	"net/http"
+	"time"
 
 	"github.com/go-chi/chi/v5"
 	"github.com/jackc/pgx/v5"
@@ -82,6 +83,12 @@ func (h *Handler) PinTaskSession(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusBadRequest, "session_id or work_dir required")
 		return
 	}
+	started := time.Now()
+	recordCardSessionPin := func(result string) {
+		if h.TaskService != nil {
+			h.TaskService.ObserveCardSessionProviderPinDuration(r.Context(), parseUUID(taskID), result, time.Since(started))
+		}
+	}
 
 	params := db.UpdateAgentTaskSessionParams{ID: parseUUID(taskID)}
 	if req.SessionID != "" {
@@ -107,6 +114,7 @@ func (h *Handler) PinTaskSession(w http.ResponseWriter, r *http.Request) {
 	// means there is no session to lock or advance.
 	tx, err := h.TxStarter.Begin(r.Context())
 	if err != nil {
+		recordCardSessionPin("error")
 		slog.Warn("pin-session failed to start tx", "task_id", taskID, "error", err)
 		writeError(w, http.StatusInternalServerError, "pin session failed")
 		return
@@ -115,11 +123,13 @@ func (h *Handler) PinTaskSession(w http.ResponseWriter, r *http.Request) {
 	qtx := h.Queries.WithTx(tx)
 
 	if _, err := qtx.LockChatSessionForTask(r.Context(), params.ID); err != nil && !errors.Is(err, pgx.ErrNoRows) {
+		recordCardSessionPin("error")
 		slog.Warn("pin-session failed to lock chat session", "task_id", taskID, "error", err)
 		writeError(w, http.StatusInternalServerError, "pin session failed")
 		return
 	}
 	if err := qtx.UpdateAgentTaskSession(r.Context(), params); err != nil {
+		recordCardSessionPin("error")
 		slog.Warn("pin-session failed", "task_id", taskID, "error", err)
 		writeError(w, http.StatusInternalServerError, "pin session failed")
 		return
@@ -129,6 +139,7 @@ func (h *Handler) PinTaskSession(w http.ResponseWriter, r *http.Request) {
 		ProviderSessionID: req.SessionID,
 		WorkDir:           req.WorkDir,
 	}); err != nil {
+		recordCardSessionPin("error")
 		slog.Warn("pin-session failed to update card session", "task_id", taskID, "error", err)
 		writeError(w, http.StatusInternalServerError, "pin session failed")
 		return
@@ -137,15 +148,18 @@ func (h *Handler) PinTaskSession(w http.ResponseWriter, r *http.Request) {
 	// chat task, and refuses to move the pointer when a newer turn already owns
 	// a session — so a straggler pin cannot drag the conversation backwards.
 	if err := qtx.AdvanceCancelledChatSessionPointer(r.Context(), params.ID); err != nil {
+		recordCardSessionPin("error")
 		slog.Warn("advance cancelled chat session pointer failed", "task_id", taskID, "error", err)
 		writeError(w, http.StatusInternalServerError, "pin session failed")
 		return
 	}
 	if err := tx.Commit(r.Context()); err != nil {
+		recordCardSessionPin("error")
 		slog.Warn("pin-session commit failed", "task_id", taskID, "error", err)
 		writeError(w, http.StatusInternalServerError, "pin session failed")
 		return
 	}
+	recordCardSessionPin("updated")
 	w.WriteHeader(http.StatusNoContent)
 }
 

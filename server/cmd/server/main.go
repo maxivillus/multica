@@ -617,9 +617,11 @@ func main() {
 	registerNotificationListeners(bus, queries)
 
 	metricsConfig := obsmetrics.ConfigFromEnv()
+	cardSessionObservabilityEnabled := envBool("MULTICA_CARD_SESSION_OBSERVABILITY_ENABLED", true)
 	var metricsServer *http.Server
 	var httpMetrics *obsmetrics.HTTPMetrics
 	var businessMetrics *obsmetrics.BusinessMetrics
+	var cardSessionMetrics *obsmetrics.CardSessionMetrics
 	var channelMediaMetrics *obsmetrics.ChannelMediaReconcilerMetrics
 	var channelLeaseMetrics *obsmetrics.ChannelLeaseMetrics
 	var wecomMetrics *obsmetrics.WecomMetrics
@@ -632,9 +634,11 @@ func main() {
 			DaemonWS:    daemonws.M,
 			Version:     version,
 			Commit:      commit,
+			CardSessionObservability: cardSessionObservabilityEnabled,
 		})
 		httpMetrics = metricsRegistry.HTTP
 		businessMetrics = metricsRegistry.Business
+		cardSessionMetrics = metricsRegistry.CardSession
 		channelMediaMetrics = metricsRegistry.ChannelMedia
 		channelLeaseMetrics = metricsRegistry.ChannelLease
 		wecomMetrics = metricsRegistry.Wecom
@@ -682,6 +686,8 @@ func main() {
 	r, h := NewRouterWithOptions(pool, hub, bus, analyticsClient, storeRedis, RouterOptions{
 		HTTPMetrics:         httpMetrics,
 		BusinessMetrics:     businessMetrics,
+		CardSessionMetrics:  cardSessionMetrics,
+		CardSessionObservabilityEnabled: cardSessionObservabilityEnabled,
 		ChannelLeaseMetrics: channelLeaseMetrics,
 		ChannelLeaseRedis:   channelLeaseRedis,
 		WecomMetrics:        wecomMetrics,

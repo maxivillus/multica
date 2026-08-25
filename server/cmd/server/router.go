@@ -216,6 +216,8 @@ func NewRouter(pool *pgxpool.Pool, hub *realtime.Hub, bus *events.Bus, analytics
 type RouterOptions struct {
 	HTTPMetrics         *obsmetrics.HTTPMetrics
 	BusinessMetrics     *obsmetrics.BusinessMetrics
+	CardSessionMetrics  *obsmetrics.CardSessionMetrics
+	CardSessionObservabilityEnabled bool
 	ChannelLeaseMetrics *obsmetrics.ChannelLeaseMetrics
 	// ChannelLeaseRedis is a dedicated non-blocking Redis client/pool. It is
 	// required only when CHANNEL_WS_LEASE_BACKEND=redis.
@@ -454,6 +456,8 @@ func NewRouterWithOptions(pool *pgxpool.Pool, hub *realtime.Hub, bus *events.Bus
 	h.FeatureFlags = opts.FeatureFlags
 	h.TaskService.FeatureFlags = opts.FeatureFlags
 	h.TaskService.Metrics = opts.BusinessMetrics
+	h.TaskService.CardSessionMetrics = opts.CardSessionMetrics
+	h.TaskService.CardSessionObservabilityEnabled = opts.CardSessionObservabilityEnabled
 	h.IssueService.Metrics = opts.BusinessMetrics
 	entitlementClient, entitlementErr := entitlement.New(entitlement.Config{
 		BaseURL:  signupConfig.CloudURL,

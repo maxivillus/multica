@@ -22,14 +22,14 @@ func (h *Handler) reconcileCardSessionStatus(ctx context.Context, previous, curr
 
 	switch {
 	case !issuestatus.IsTerminal(previousCategory) && issuestatus.IsTerminal(currentCategory):
-		if err := h.TaskService.MarkIssueCardSessionsTerminal(ctx, current.ID, current.WorkspaceID); err != nil {
+		if err := h.TaskService.MarkIssueCardSessionsTerminalWithStatus(ctx, current.ID, current.WorkspaceID, currentCategory); err != nil {
 			slog.Warn("failed to retain card session after terminal issue status",
 				"issue_id", uuidToString(current.ID),
 				"error", err,
 			)
 		}
 	case issuestatus.IsTerminal(previousCategory) && !issuestatus.IsTerminal(currentCategory):
-		if err := h.TaskService.ReopenIssueCardSessions(ctx, current.ID, current.WorkspaceID); err != nil {
+		if err := h.TaskService.ReopenIssueCardSessionsWithSource(ctx, current.ID, current.WorkspaceID, "status_transition"); err != nil {
 			slog.Warn("failed to reopen retained card session",
 				"issue_id", uuidToString(current.ID),
 				"error", err,
@@ -60,7 +60,7 @@ func (h *Handler) reopenTerminalIssueOnComment(ctx context.Context, issue db.Iss
 	}
 
 	if h.TaskService != nil {
-		if err := h.TaskService.ReopenIssueCardSessions(ctx, updated.ID, updated.WorkspaceID); err != nil {
+		if err := h.TaskService.ReopenIssueCardSessionsWithSource(ctx, updated.ID, updated.WorkspaceID, "comment_after_terminal"); err != nil {
 			slog.Warn("failed to reopen retained card session from comment",
 				"issue_id", uuidToString(updated.ID),
 				"error", err,

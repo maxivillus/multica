@@ -166,6 +166,7 @@ func (s *TaskService) publishCardSessionTokenStats(ctx context.Context, sessionI
 		if err := tx.Commit(ctx); err != nil {
 			return nil, fmt.Errorf("commit empty card session token stats: %w", err)
 		}
+		s.observeCardSessionIdentity(ctx, cardSessionEventTokenStats, "empty", locked.IssueID, locked.ID, locked.AgentID, locked.Generation, locked.Provider)
 		return nil, nil
 	}
 
@@ -186,6 +187,9 @@ func (s *TaskService) publishCardSessionTokenStats(ctx context.Context, sessionI
 	if err := tx.Commit(ctx); err != nil {
 		return nil, fmt.Errorf("commit card session token stats: %w", err)
 	}
+	s.observeCardSessionIdentity(ctx, cardSessionEventTokenStats, "published", locked.IssueID, locked.ID, locked.AgentID, locked.Generation, locked.Provider,
+		"task_count", usage.TaskCount,
+	)
 
 	return &cardSessionTokenStatsPublication{
 		comment:       created.Comment(),

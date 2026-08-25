@@ -43,6 +43,8 @@ type TaskService struct {
 	Bus       *events.Bus
 	Analytics analytics.Client
 	Metrics   *obsmetrics.BusinessMetrics
+	CardSessionMetrics              *obsmetrics.CardSessionMetrics
+	CardSessionObservabilityEnabled bool
 	Wakeup    TaskWakeupNotifier
 	// Entitlements supplies Cloud's workspace-scoped issue-count instruction.
 	// Nil keeps self-hosted and isolated test services unlimited.
@@ -1148,6 +1150,15 @@ func (s *TaskService) EnqueueDeferredChannelIssueTask(ctx context.Context, issue
 // claimed while deferred, so the optional external overlay is hydrated after
 // commit without holding database locks across a network call.
 func (s *TaskService) createDeferredChannelIssueTaskWithQueries(ctx context.Context, q *db.Queries, issue db.Issue, fireAt time.Time) (db.AgentTaskQueue, error) {
+	if s != nil && s.TxStarter != nil && issue.AssigneeID.Valid {
+		agent, err := q.GetAgent(ctx, issue.AssigneeID)
+		if err != nil {
+			return db.AgentTaskQueue{}, fmt.Errorf("load agent for card session: %w", err)
+		}
+		if _, _, err := s.ensureCardSessionWithQueries(ctx, q, issue.ID, issue.WorkspaceID, agent.ID, agent.RuntimeMode); err != nil {
+			return db.AgentTaskQueue{}, err
+		}
+	}
 	txService := &TaskService{Queries: q}
 	return txService.enqueueIssueTask(ctx, issue, pgtype.UUID{}, false, "", pgtype.UUID{}, pgtype.UUID{}, pgtype.Timestamptz{Time: fireAt, Valid: true}, OriginDerived)
 }
