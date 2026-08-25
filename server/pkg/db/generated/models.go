@@ -310,6 +310,30 @@ type AutopilotTrigger struct {
 	PublishedByID pgtype.UUID `json:"published_by_id"`
 }
 
+// Server-owned lifecycle for a per-issue agent generation; provider process state is resumable but not the source of truth.
+type CardSession struct {
+	ID                pgtype.UUID        `json:"id"`
+	WorkspaceID       pgtype.UUID        `json:"workspace_id"`
+	IssueID           pgtype.UUID        `json:"issue_id"`
+	AgentID           pgtype.UUID        `json:"agent_id"`
+	Generation        int64              `json:"generation"`
+	State             string             `json:"state"`
+	Provider          string             `json:"provider"`
+	ProviderSessionID pgtype.Text        `json:"provider_session_id"`
+	WorkDir           pgtype.Text        `json:"work_dir"`
+	OpenedAt          pgtype.Timestamptz `json:"opened_at"`
+	LastActivityAt    pgtype.Timestamptz `json:"last_activity_at"`
+	DoneAt            pgtype.Timestamptz `json:"done_at"`
+	RetainUntil       pgtype.Timestamptz `json:"retain_until"`
+	ClosedAt          pgtype.Timestamptz `json:"closed_at"`
+	LeaseOwner        pgtype.Text        `json:"lease_owner"`
+	LeaseEpoch        int64              `json:"lease_epoch"`
+	LeaseHeartbeatAt  pgtype.Timestamptz `json:"lease_heartbeat_at"`
+	CreatedAt         pgtype.Timestamptz `json:"created_at"`
+	UpdatedAt         pgtype.Timestamptz `json:"updated_at"`
+	LastTokenStatsAt  pgtype.Timestamptz `json:"last_token_stats_at"`
+}
+
 type ChannelBindingToken struct {
 	TokenHash      string             `json:"token_hash"`
 	WorkspaceID    pgtype.UUID        `json:"workspace_id"`

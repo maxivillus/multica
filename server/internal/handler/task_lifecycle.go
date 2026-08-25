@@ -124,6 +124,15 @@ func (h *Handler) PinTaskSession(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusInternalServerError, "pin session failed")
 		return
 	}
+	if err := qtx.UpdateCardSessionProviderStateByTask(r.Context(), db.UpdateCardSessionProviderStateByTaskParams{
+		ID:                params.ID,
+		ProviderSessionID: req.SessionID,
+		WorkDir:           req.WorkDir,
+	}); err != nil {
+		slog.Warn("pin-session failed to update card session", "task_id", taskID, "error", err)
+		writeError(w, http.StatusInternalServerError, "pin session failed")
+		return
+	}
 	// The statement re-reads the row, ignores anything that is not a cancelled
 	// chat task, and refuses to move the pointer when a newer turn already owns
 	// a session — so a straggler pin cannot drag the conversation backwards.
