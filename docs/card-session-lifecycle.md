@@ -34,6 +34,22 @@ in-memory cache are implementation details and may be restarted.
   reconciliation. A due session with no usage advances the watermark without
   posting a zero-token comment.
 
+### Diagnostics
+
+The experimental lifecycle has a separate observability surface controlled by
+`MULTICA_CARD_SESSION_OBSERVABILITY_ENABLED` (default `true`). When enabled,
+the server emits structured diagnostic events for generation allocation/reuse,
+terminal retention, reopen attempts, expiry, provider-state pins, token-stat
+publication, and capacity rejection. With `METRICS_ADDR` enabled it also
+registers the bounded Prometheus families
+`multica_card_session_events_total` and
+`multica_card_session_operation_duration_seconds`.
+
+Metric labels are fixed event/result enums and never contain issue IDs,
+session IDs, provider session IDs, work directories, prompts, or token
+payloads. The flag disables both the additional logs and these metric
+families; ordinary server logs and existing task/LLM metrics are unchanged.
+
 The terminal-retention setting is bounded to 1–720 hours, open sessions to
 1–10,000, and token-statistics interval to 1–1,440 minutes. The defaults are
 24 hours, 100 sessions, and 15 minutes.

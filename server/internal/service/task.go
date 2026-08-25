@@ -41,7 +41,12 @@ type TaskService struct {
 	Bus       *events.Bus
 	Analytics analytics.Client
 	Metrics   *obsmetrics.BusinessMetrics
-	Wakeup    TaskWakeupNotifier
+	// CardSessionMetrics and CardSessionObservabilityEnabled are kept separate
+	// from the general business metrics so the experimental lifecycle
+	// diagnostics can be removed or disabled without changing task telemetry.
+	CardSessionMetrics              *obsmetrics.CardSessionMetrics
+	CardSessionObservabilityEnabled bool
+	Wakeup                          TaskWakeupNotifier
 	// SourceContextStorage is used only by the bounded 30-day cleanup pass for
 	// terminal quick-create captures. Nil disables it where storage is absent.
 	SourceContextStorage SourceContextObjectStore
@@ -1063,7 +1068,7 @@ func (s *TaskService) createDeferredChannelIssueTaskWithQueries(ctx context.Cont
 		if err != nil {
 			return db.AgentTaskQueue{}, fmt.Errorf("load agent for card session: %w", err)
 		}
-		if _, err := s.ensureCardSessionWithQueries(ctx, q, issue.ID, issue.WorkspaceID, agent.ID, agent.RuntimeMode); err != nil {
+		if _, _, err := s.ensureCardSessionWithQueries(ctx, q, issue.ID, issue.WorkspaceID, agent.ID, agent.RuntimeMode); err != nil {
 			return db.AgentTaskQueue{}, err
 		}
 	}
@@ -6675,7 +6680,7 @@ func (s *TaskService) reconcileTerminalCommentIssue(ctx context.Context, previou
 		slog.Warn("agent comment: read reopened issue failed", "issue_id", util.UUIDToString(previous.ID), "error", err)
 		return previous
 	}
-	if err := s.ReopenIssueCardSessions(ctx, updated.ID, updated.WorkspaceID); err != nil {
+	if err := s.ReopenIssueCardSessionsWithSource(ctx, updated.ID, updated.WorkspaceID, "agent_comment_after_terminal"); err != nil {
 		slog.Warn("agent comment: reopen retained card session failed", "issue_id", util.UUIDToString(updated.ID), "error", err)
 	}
 	if s.Bus != nil {

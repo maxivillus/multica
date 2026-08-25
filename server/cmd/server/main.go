@@ -481,9 +481,11 @@ func main() {
 	registerNotificationListeners(bus, queries)
 
 	metricsConfig := obsmetrics.ConfigFromEnv()
+	cardSessionObservabilityEnabled := envBool("MULTICA_CARD_SESSION_OBSERVABILITY_ENABLED", true)
 	var metricsServer *http.Server
 	var httpMetrics *obsmetrics.HTTPMetrics
 	var businessMetrics *obsmetrics.BusinessMetrics
+	var cardSessionMetrics *obsmetrics.CardSessionMetrics
 	var samplerPool *pgxpool.Pool
 	var channelMediaMetrics *obsmetrics.ChannelMediaReconcilerMetrics
 	var channelLeaseMetrics *obsmetrics.ChannelLeaseMetrics
@@ -502,11 +504,12 @@ func main() {
 		}
 
 		metricsRegistry := obsmetrics.NewRegistry(obsmetrics.RegistryOptions{
-			Pool:     pool,
-			Realtime: realtime.M,
-			DaemonWS: daemonws.M,
-			Version:  version,
-			Commit:   commit,
+			Pool:                     pool,
+			Realtime:                 realtime.M,
+			DaemonWS:                 daemonws.M,
+			Version:                  version,
+			Commit:                   commit,
+			CardSessionObservability: cardSessionObservabilityEnabled,
 			BusinessSampler: func() *obsmetrics.BusinessSamplerOptions {
 				if samplerPool == nil {
 					return nil
@@ -516,6 +519,7 @@ func main() {
 		})
 		httpMetrics = metricsRegistry.HTTP
 		businessMetrics = metricsRegistry.Business
+		cardSessionMetrics = metricsRegistry.CardSession
 		channelMediaMetrics = metricsRegistry.ChannelMedia
 		channelLeaseMetrics = metricsRegistry.ChannelLease
 		seatCapacityMetrics = metricsRegistry.SeatCapacity
@@ -553,17 +557,19 @@ func main() {
 	}
 
 	r, h := NewRouterWithOptions(pool, hub, bus, analyticsClient, storeRedis, RouterOptions{
-		HTTPMetrics:         httpMetrics,
-		BusinessMetrics:     businessMetrics,
-		ChannelLeaseMetrics: channelLeaseMetrics,
-		SeatCapacityMetrics: seatCapacityMetrics,
-		ChannelLeaseRedis:   channelLeaseRedis,
-		WecomMetrics:        wecomMetrics,
-		DaemonHub:           daemonHub,
-		DaemonWakeup:        daemonWakeup,
-		FeatureFlags:        flags,
-		HeartbeatScheduler:  heartbeatScheduler,
-		LLMMaxRetries:       llmMaxRetries,
+		HTTPMetrics:                     httpMetrics,
+		BusinessMetrics:                 businessMetrics,
+		CardSessionMetrics:              cardSessionMetrics,
+		CardSessionObservabilityEnabled: cardSessionObservabilityEnabled,
+		ChannelLeaseMetrics:             channelLeaseMetrics,
+		SeatCapacityMetrics:             seatCapacityMetrics,
+		ChannelLeaseRedis:               channelLeaseRedis,
+		WecomMetrics:                    wecomMetrics,
+		DaemonHub:                       daemonHub,
+		DaemonWakeup:                    daemonWakeup,
+		FeatureFlags:                    flags,
+		HeartbeatScheduler:              heartbeatScheduler,
+		LLMMaxRetries:                   llmMaxRetries,
 	})
 
 	srv := &http.Server{

@@ -17,6 +17,9 @@ type RegistryOptions struct {
 	DaemonWS *daemonws.Metrics
 	Version  string
 	Commit   string
+	// CardSessionObservability gates the experimental card-session diagnostic
+	// collector independently of the rest of the /metrics registry.
+	CardSessionObservability bool
 
 	// BusinessSampler, when non-nil, opts the registry into the
 	// scrape-time SQL sampler from PR4 (MUL-2947). It is intentionally
@@ -34,6 +37,7 @@ type Registry struct {
 	ChannelLease *ChannelLeaseMetrics
 	SeatCapacity *SeatCapacityMetrics
 	Wecom        *WecomMetrics
+	CardSession  *CardSessionMetrics
 	// Sampler is non-nil only when RegistryOptions.BusinessSampler was
 	// supplied with a valid Pool. Exposed so the cmd/server entrypoint
 	// can plumb the same instance into health checks if it ever wants to.
@@ -70,6 +74,12 @@ func NewRegistry(opts RegistryOptions) *Registry {
 	wecomMetrics := NewWecomMetrics()
 	reg.MustRegister(wecomMetrics.Collectors()...)
 
+	var cardSessionMetrics *CardSessionMetrics
+	if opts.CardSessionObservability {
+		cardSessionMetrics = NewCardSessionMetrics()
+		reg.MustRegister(cardSessionMetrics.Collectors()...)
+	}
+
 	if opts.Pool != nil {
 		reg.MustRegister(NewDBCollector(opts.Pool))
 	}
@@ -93,6 +103,7 @@ func NewRegistry(opts RegistryOptions) *Registry {
 		ChannelLease: channelLease,
 		SeatCapacity: seatCapacity,
 		Wecom:        wecomMetrics,
+		CardSession:  cardSessionMetrics,
 		Sampler:      sampler,
 	}
 }
