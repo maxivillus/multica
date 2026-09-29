@@ -7,10 +7,10 @@ import {
   CheckCircle2,
   CreditCard,
   ExternalLink,
+  Info,
   Loader2,
   Plus,
   RefreshCw,
-  ShieldCheck,
 } from "lucide-react";
 import { ApiError, errorCode } from "@multica/core/api";
 import { autopilotQuotaUsageOptions } from "@multica/core/autopilots";
@@ -19,13 +19,12 @@ import {
   useCreateWorkspaceSubscriptionPortal,
   usePreviewWorkspaceSeatPurchase,
   usePurchaseWorkspaceSeats,
-  workspaceSubscriptionEntitlementsOptions,
+  issueLimitUsageOptions,
   workspaceSubscriptionPricesOptions,
   workspaceSubscriptionSummaryOptions,
 } from "@multica/core/billing";
 import { useFeatureEnabled } from "@multica/core/config";
 import { BILLING_WORKSPACE_SUBSCRIPTIONS_FLAG } from "@multica/core/feature-flags";
-import { useCurrentMember } from "@multica/core/permissions";
 import { useCurrentWorkspace } from "@multica/core/paths";
 import type {
   PurchaseWorkspaceSeatsRequest,
@@ -59,6 +58,12 @@ import {
 } from "@multica/ui/components/ui/dialog";
 import { Input } from "@multica/ui/components/ui/input";
 import {
+  Popover,
+  PopoverContent,
+  PopoverDescription,
+  PopoverTrigger,
+} from "@multica/ui/components/ui/popover";
+import {
   Progress,
   ProgressLabel,
   ProgressValue,
@@ -74,41 +79,16 @@ import {
   SettingsTab,
 } from "./settings-layout";
 import {
-  canPurchaseWorkspaceSubscription,
   hasActiveWorkspaceSeatCapacity,
-  hasWorkspaceBillingRelationship,
   resolveAutopilotUsage,
 } from "./billing-state";
+import { formatStripeMinorAmount } from "./billing-format";
+
+export { formatStripeMinorAmount } from "./billing-format";
 
 const CHECKOUT_SYNC_TIMEOUT_MS = 30_000;
 const SEAT_PURCHASE_POLL_TIMEOUT_MS = 2 * 60_000;
 const SEAT_PURCHASE_PREVIEW_DEBOUNCE_MS = 800;
-
-const STRIPE_ZERO_DECIMAL_CURRENCIES = new Set([
-  "BIF",
-  "CLP",
-  "DJF",
-  "GNF",
-  "JPY",
-  "KMF",
-  "KRW",
-  "MGA",
-  "PYG",
-  "RWF",
-  "VND",
-  "VUV",
-  "XAF",
-  "XOF",
-  "XPF",
-]);
-const STRIPE_TWO_DECIMAL_COMPAT_CURRENCIES = new Set(["ISK", "UGX"]);
-const STRIPE_THREE_DECIMAL_CURRENCIES = new Set([
-  "BHD",
-  "JOD",
-  "KWD",
-  "OMR",
-  "TND",
-]);
 
 type WorkspaceBillingReturnResult = "success" | "cancel" | "portal";
 
@@ -147,49 +127,6 @@ function formatDateTime(value: string | null, locale: string): string | null {
     dateStyle: "medium",
     timeStyle: "short",
   }).format(date);
-}
-
-/**
- * Stripe API amounts use its own minor-unit contract: two decimals by default,
- * an explicit zero-decimal list, five three-decimal currencies, and ISK/UGX in
- * a backwards-compatible two-decimal representation. Intl localizes the
- * already-converted major amount; it must not decide the divisor.
- */
-export function formatStripeMinorAmount(
-  amount: number,
-  currency: string,
-  locale: string,
-): string | null {
-  if (!Number.isSafeInteger(amount) || amount < 0) return null;
-  const normalizedCurrency = currency.trim().toUpperCase();
-  if (!normalizedCurrency) return null;
-
-  try {
-    const fractionDigits = STRIPE_TWO_DECIMAL_COMPAT_CURRENCIES.has(
-      normalizedCurrency,
-    )
-      ? 2
-      : STRIPE_ZERO_DECIMAL_CURRENCIES.has(normalizedCurrency)
-        ? 0
-        : STRIPE_THREE_DECIMAL_CURRENCIES.has(normalizedCurrency)
-          ? 3
-          : 2;
-    const majorAmount = amount / 10 ** fractionDigits;
-    const showStripeFraction = !Number.isInteger(majorAmount);
-    const formatter = new Intl.NumberFormat(locale, {
-      style: "currency",
-      currency: normalizedCurrency,
-      ...(showStripeFraction
-        ? {
-            minimumFractionDigits: fractionDigits,
-            maximumFractionDigits: fractionDigits,
-          }
-        : {}),
-    });
-    return formatter.format(majorAmount);
-  } catch {
-    return null;
-  }
 }
 
 function planBadgeVariant(plan: string): "default" | "secondary" | "outline" {
@@ -238,9 +175,6 @@ function BillingTabContent() {
   const navigation = useNavigation();
   const workspace = useCurrentWorkspace();
   const wsId = workspace?.id ?? "";
-  const currentMember = useCurrentMember(wsId);
-  const canManage =
-    currentMember.role === "owner" || currentMember.role === "admin";
   const returnResultParam = parseReturnResult(
     navigation.searchParams.get("result"),
   );
@@ -361,17 +295,6 @@ function BillingTabContent() {
     return () => window.clearTimeout(timeout);
   }, [returnResult, wsId]);
 
-  const entitlementQuery = useQuery({
-    ...workspaceSubscriptionEntitlementsOptions(wsId),
-    refetchInterval: isSyncingCheckout ? 2_000 : false,
-  });
-  const entitlements = entitlementQuery.data;
-  const isCheckoutProConfirmed =
-    returnResult === "success" &&
-    returnObservedAt !== null &&
-    entitlements?.plan === "pro" &&
-    entitlementQuery.isFetchedAfterMount &&
-    entitlementQuery.dataUpdatedAt >= returnObservedAt;
   const summaryQuery = useQuery({
     ...workspaceSubscriptionSummaryOptions(wsId),
     // Checkout activation and seat additions both finish asynchronously in a
@@ -384,6 +307,13 @@ function BillingTabContent() {
         ? 2_000
         : false,
   });
+  const entitlements = summaryQuery.data?.entitlement;
+  const isCheckoutConfirmed =
+    returnResult === "success" &&
+    returnObservedAt !== null &&
+    summaryQuery.data?.availableActions.checkout === false &&
+    summaryQuery.isFetchedAfterMount &&
+    summaryQuery.dataUpdatedAt >= returnObservedAt;
   const activeSeatPurchaseRequestId =
     summaryQuery.data?.seatCapacity?.activePurchase?.requestId ?? null;
 
@@ -403,13 +333,14 @@ function BillingTabContent() {
     summaryQuery.isError ||
     (!summaryQuery.isPending && summaryQuery.data == null);
   const quotaUsageQuery = useQuery(autopilotQuotaUsageOptions(wsId));
+  const issueLimitUsageQuery = useQuery({
+    ...issueLimitUsageOptions(wsId),
+    enabled:
+      wsId.length > 0 &&
+      entitlements?.limits.issueCount.mode === "limited",
+  });
   const hasSeatCapacity = hasActiveWorkspaceSeatCapacity(summaryQuery.data);
-  const hasBillingRelationship = hasWorkspaceBillingRelationship(
-    summaryQuery.data,
-  );
-  const canUpgrade = entitlements
-    ? canPurchaseWorkspaceSubscription(entitlements)
-    : false;
+  const canUpgrade = summaryQuery.data?.availableActions.checkout === true;
   const pricesQuery = useQuery({
     ...workspaceSubscriptionPricesOptions(wsId),
     enabled: wsId.length > 0 && canUpgrade,
@@ -418,7 +349,6 @@ function BillingTabContent() {
   const portalMutation = useCreateWorkspaceSubscriptionPortal(wsId);
   const previewSeatPurchaseMutation = usePreviewWorkspaceSeatPurchase();
   const purchaseSeatsMutation = usePurchaseWorkspaceSeats(wsId);
-  const refetchEntitlements = entitlementQuery.refetch;
   const refetchSummary = summaryQuery.refetch;
   const previewSeatPurchase = previewSeatPurchaseMutation.mutateAsync;
 
@@ -455,8 +385,7 @@ function BillingTabContent() {
       !Number.isSafeInteger(additionalSeats) ||
       additionalSeats < 1 ||
       currentSeats === null ||
-      purchaseVersion === null ||
-      currentSeats + additionalSeats > 10_000
+      purchaseVersion === null
     ) {
       if (
         seatPreviewCapacityRetryRef.current?.inputKey === retryInputKey &&
@@ -568,25 +497,12 @@ function BillingTabContent() {
   ]);
 
   useEffect(() => {
-    if (isSyncingCheckout && isCheckoutProConfirmed) {
+    if (isSyncingCheckout && isCheckoutConfirmed) {
       setIsSyncingCheckout(false);
       setSyncTimedOut(false);
       checkoutIntentRef.current = null;
     }
-  }, [isCheckoutProConfirmed, isSyncingCheckout]);
-
-  useEffect(() => {
-    const graceUntil = summaryQuery.data?.graceUntil;
-    if (!graceUntil) return;
-    const graceUntilMs = new Date(graceUntil).getTime();
-    if (Number.isNaN(graceUntilMs)) return;
-    const delay = Math.max(0, graceUntilMs - Date.now()) + 100;
-    const timeout = window.setTimeout(() => {
-      void refetchEntitlements();
-      void refetchSummary();
-    }, Math.min(delay, 2_147_000_000));
-    return () => window.clearTimeout(timeout);
-  }, [refetchEntitlements, refetchSummary, summaryQuery.data?.graceUntil]);
+  }, [isCheckoutConfirmed, isSyncingCheckout]);
 
   const planLabel = (plan: string) => {
     switch (plan) {
@@ -625,6 +541,14 @@ function BillingTabContent() {
   };
 
   const reportActionError = (error: unknown, fallback: string) => {
+    const code = errorCode(error);
+    if (
+      code === "workspace_subscriptions_disabled" ||
+      code === "cloud_runtime_not_configured"
+    ) {
+      setActionError(t(($) => $.workspace.errors.not_enabled));
+      return;
+    }
     if (error instanceof ApiError && error.status === 503) {
       setActionError(t(($) => $.workspace.errors.temporarily_unavailable));
       return;
@@ -665,7 +589,7 @@ function BillingTabContent() {
       if (error instanceof ApiError && error.status === 409) {
         checkoutIntentRef.current = null;
         setActionError(t(($) => $.workspace.errors.already_subscribed));
-        await Promise.all([entitlementQuery.refetch(), summaryQuery.refetch()]);
+        await summaryQuery.refetch();
         return;
       }
       reportActionError(error, t(($) => $.workspace.errors.checkout_failed));
@@ -698,7 +622,7 @@ function BillingTabContent() {
         portalIntentKeyRef.current = null;
         setPortalUnavailable(true);
         setActionError(t(($) => $.workspace.errors.portal_unavailable));
-        await Promise.all([entitlementQuery.refetch(), summaryQuery.refetch()]);
+        await summaryQuery.refetch();
         return;
       }
       reportActionError(error, t(($) => $.workspace.errors.portal_failed));
@@ -759,7 +683,7 @@ function BillingTabContent() {
           count: response.resultingSeats,
         }),
       );
-      await Promise.all([entitlementQuery.refetch(), summaryQuery.refetch()]);
+      await summaryQuery.refetch();
     } catch (error) {
       if (error instanceof ApiError && error.status === 409) {
         const purchaseErrorCode = errorCode(error);
@@ -819,11 +743,10 @@ function BillingTabContent() {
     setSeatPreview(null);
   };
 
-  if (entitlementQuery.isPending) {
+  if (summaryQuery.isPending) {
     return (
       <SettingsTab
         title={t(($) => $.workspace.title)}
-        description={t(($) => $.workspace.description)}
       >
         <SettingsCard>
           <div
@@ -839,11 +762,10 @@ function BillingTabContent() {
     );
   }
 
-  if (entitlementQuery.isError || !entitlements) {
+  if (summaryQuery.isError || !entitlements) {
     return (
       <SettingsTab
         title={t(($) => $.workspace.title)}
-        description={t(($) => $.workspace.description)}
       >
         <Alert variant="destructive">
           <AlertCircle />
@@ -853,7 +775,7 @@ function BillingTabContent() {
             <Button
               className="mt-3 h-11"
               variant="outline"
-              onClick={() => void entitlementQuery.refetch()}
+              onClick={() => void summaryQuery.refetch()}
             >
               <RefreshCw />
               {t(($) => $.workspace.actions.retry)}
@@ -870,28 +792,13 @@ function BillingTabContent() {
   );
   const graceUntilValue = summaryQuery.data?.graceUntil ?? null;
   const graceUntil = formatDate(graceUntilValue, locale);
-  const graceUntilMs = graceUntilValue
-    ? new Date(graceUntilValue).getTime()
-    : Number.NaN;
-  const hasActiveProGrace =
-    entitlements.plan === "pro" &&
-    entitlements.status === "past_due" &&
-    Number.isFinite(graceUntilMs) &&
-    graceUntilMs > Date.now();
-  const canUseEntitlementUnlimited =
-    entitlements.plan === "pro" &&
-    (entitlements.status !== "past_due" || hasActiveProGrace) &&
-    (returnResult !== "success" || isCheckoutProConfirmed);
   const actualSeats = summaryQuery.data?.humanMembers ?? entitlements.seats;
   const seatCapacity = summaryQuery.data?.seatCapacity ?? null;
   const usedSeats = seatCapacity?.used ?? actualSeats;
   const billedSeats = seatCapacity?.purchased ?? null;
   const pendingSeatQuantity = seatCapacity?.pendingQuantity ?? null;
   const reservedSeats = seatCapacity?.reserved ?? 0;
-  const membersExceedPurchasedSeats =
-    hasSeatCapacity &&
-    billedSeats !== null &&
-    actualSeats > billedSeats;
+  const membersExceedPurchasedSeats = seatCapacity?.overcommitted === true;
   const availableSeats = seatCapacity?.available ?? null;
   const activeSeatPurchase = seatCapacity?.activePurchase ?? null;
   const activeSeatPurchaseExpiry = formatDateTime(
@@ -899,22 +806,25 @@ function BillingTabContent() {
     locale,
   );
   const canAddSeats =
-    canManage &&
-    hasSeatCapacity &&
-    (entitlements.status === "active" || entitlements.status === "trialing") &&
-    !summaryQuery.data?.cancelAtPeriodEnd &&
-    activeSeatPurchase === null;
+    summaryQuery.data?.availableActions.purchaseSeats === true;
   const quotaUsage = resolveAutopilotUsage(
     entitlements,
     quotaUsageQuery.data,
     quotaUsageQuery.isError,
-    canUseEntitlementUnlimited,
   );
   const quotaResetAt =
     quotaUsage.kind === "metered"
       ? formatDateTime(quotaUsage.resetAt, locale)
       : null;
   const numberFormatter = new Intl.NumberFormat(locale);
+  const issueCountLimit = entitlements.limits.issueCount;
+  const issueLimitUsage = issueLimitUsageQuery.data;
+  const issueLimitValue =
+    issueCountLimit.mode === "unlimited"
+      ? t(($) => $.workspace.limits.unlimited)
+      : issueLimitUsage?.limit === issueCountLimit.limit
+        ? `${numberFormatter.format(issueLimitUsage.used)} / ${numberFormatter.format(issueLimitUsage.limit)}`
+        : numberFormatter.format(issueCountLimit.limit);
   const isMutating =
     checkoutMutation.isPending ||
     portalMutation.isPending ||
@@ -927,18 +837,8 @@ function BillingTabContent() {
         locale,
       )
     : null;
-  const formattedEstimatedTotal =
-    selectedPrice && actualSeats > 0
-      ? formatStripeMinorAmount(
-        selectedPrice.unitAmount * actualSeats,
-        selectedPrice.currency,
-        locale,
-      )
-    : null;
   const hasDisplayableUnitPrice =
     selectedPrice?.intervalCount === 1 && formattedUnitPrice !== null;
-  const hasDisplayableEstimatedTotal =
-    hasDisplayableUnitPrice && formattedEstimatedTotal !== null;
   const canRetryPrice = !pricesQuery.isLoading && selectedPrice === null;
   const formattedSeatProration = seatPreview
     ? formatStripeMinorAmount(
@@ -958,7 +858,6 @@ function BillingTabContent() {
   return (
     <SettingsTab
       title={t(($) => $.workspace.title)}
-      description={t(($) => $.workspace.description)}
     >
       {returnResult === "cancel" ? (
         <Alert>
@@ -974,15 +873,12 @@ function BillingTabContent() {
         <Alert>
           <CheckCircle2 />
           <AlertTitle>{t(($) => $.workspace.return.portal_title)}</AlertTitle>
-          <AlertDescription>
-            {t(($) => $.workspace.return.portal_description)}
-          </AlertDescription>
         </Alert>
       ) : null}
 
       {returnResult === "success" ? (
         <Alert>
-          {isCheckoutProConfirmed ? (
+          {isCheckoutConfirmed ? (
             <CheckCircle2 />
           ) : (
             <Loader2
@@ -994,12 +890,12 @@ function BillingTabContent() {
             />
           )}
           <AlertTitle>
-            {isCheckoutProConfirmed
+            {isCheckoutConfirmed
               ? t(($) => $.workspace.return.active_title)
               : t(($) => $.workspace.return.syncing_title)}
           </AlertTitle>
           <AlertDescription>
-            {isCheckoutProConfirmed
+            {isCheckoutConfirmed
               ? t(($) => $.workspace.return.active_description)
               : syncTimedOut
                 ? t(($) => $.workspace.return.timeout_description)
@@ -1035,7 +931,7 @@ function BillingTabContent() {
           <AlertCircle />
           <AlertTitle>{t(($) => $.workspace.past_due.title)}</AlertTitle>
           <AlertDescription>
-            {hasActiveProGrace && graceUntil
+            {graceUntil
               ? t(($) => $.workspace.past_due.grace_description, {
                   date: graceUntil,
                 })
@@ -1104,19 +1000,6 @@ function BillingTabContent() {
           <AlertTitle>
             {t(($) => $.workspace.subscription_notice.canceled_title)}
           </AlertTitle>
-          <AlertDescription>
-            {t(($) => $.workspace.subscription_notice.canceled_description)}
-          </AlertDescription>
-        </Alert>
-      ) : null}
-
-      {!canManage && !currentMember.isLoading ? (
-        <Alert>
-          <ShieldCheck />
-          <AlertTitle>{t(($) => $.workspace.read_only.title)}</AlertTitle>
-          <AlertDescription>
-            {t(($) => $.workspace.read_only.description)}
-          </AlertDescription>
         </Alert>
       ) : null}
 
@@ -1132,7 +1015,6 @@ function BillingTabContent() {
         <SettingsCard>
           <SettingsRow
             label={t(($) => $.workspace.current.plan)}
-            description={t(($) => $.workspace.current.plan_description)}
           >
             <div className="flex flex-wrap items-center gap-2 sm:justify-end">
               <Badge variant={planBadgeVariant(entitlements.plan)}>
@@ -1156,9 +1038,6 @@ function BillingTabContent() {
           {summaryQuery.data?.billingInterval ? (
             <SettingsRow
               label={t(($) => $.workspace.current.billing_interval)}
-              description={t(
-                ($) => $.workspace.current.billing_interval_description,
-              )}
             >
               <span>
                 {summaryQuery.data.billingInterval === "month"
@@ -1170,7 +1049,6 @@ function BillingTabContent() {
           {summaryPeriodEnd ? (
             <SettingsRow
               label={t(($) => $.workspace.current.period_end)}
-              description={t(($) => $.workspace.current.period_end_description)}
             >
               <span className="tabular-nums">{summaryPeriodEnd}</span>
             </SettingsRow>
@@ -1229,16 +1107,6 @@ function BillingTabContent() {
                         price: formattedUnitPrice,
                       })}
                     </p>
-                    {hasDisplayableEstimatedTotal ? (
-                      <p className="text-caption leading-5 text-muted-foreground tabular-nums">
-                        {t(
-                          interval === "month"
-                            ? ($) => $.workspace.upgrade.estimated_monthly_total
-                            : ($) => $.workspace.upgrade.estimated_yearly_total,
-                          { price: formattedEstimatedTotal },
-                        )}
-                      </p>
-                    ) : null}
                   </div>
                 ) : null}
                 <p className="max-w-[65ch] text-caption leading-5 text-muted-foreground">
@@ -1275,22 +1143,20 @@ function BillingTabContent() {
                   </>
                 ) : null}
               </div>
-              {canManage ? (
-                <Button
-                  className="h-11 w-full sm:w-auto"
-                  disabled={isMutating}
-                  onClick={() => setCheckoutConfirmOpen(true)}
-                >
-                  <CreditCard />
-                  {t(($) => $.workspace.actions.upgrade)}
-                </Button>
-              ) : null}
+              <Button
+                className="h-11 w-full sm:w-auto"
+                disabled={isMutating}
+                onClick={() => setCheckoutConfirmOpen(true)}
+              >
+                <CreditCard />
+                {t(($) => $.workspace.actions.upgrade)}
+              </Button>
             </div>
           </SettingsCard>
         </SettingsSection>
       ) : null}
 
-      {hasBillingRelationship && canManage ? (
+      {summaryQuery.data?.availableActions.portal === true ? (
         <SettingsSection
           title={t(($) => $.workspace.management.title)}
           description={t(($) => $.workspace.management.description)}
@@ -1301,7 +1167,7 @@ function BillingTabContent() {
               description={
                 portalUnavailable
                   ? t(($) => $.workspace.management.portal_unavailable)
-                  : t(($) => $.workspace.management.portal_description)
+                  : undefined
               }
             >
               {!portalUnavailable ? (
@@ -1325,24 +1191,15 @@ function BillingTabContent() {
 
       <SettingsSection
         title={t(($) => $.workspace.limits.title)}
-        description={t(($) => $.workspace.limits.description)}
       >
         <SettingsCard>
           <SettingsRow
             label={t(($) => $.workspace.limits.issues)}
-            description={t(($) => $.workspace.limits.issues_description)}
           >
-            <span className="tabular-nums">
-              {entitlements.issueWindow === null
-                ? canUseEntitlementUnlimited
-                  ? t(($) => $.workspace.limits.unlimited)
-                  : t(($) => $.workspace.limits.unavailable)
-                : numberFormatter.format(entitlements.issueWindow)}
-            </span>
+            <span className="tabular-nums">{issueLimitValue}</span>
           </SettingsRow>
           <SettingsRow
             label={t(($) => $.workspace.limits.autopilots)}
-            description={t(($) => $.workspace.limits.autopilots_description)}
           >
             {quotaUsage.kind === "unlimited" ? (
               <span className="tabular-nums">
@@ -1393,10 +1250,11 @@ function BillingTabContent() {
               </div>
             ) : (
               <div className="flex flex-col gap-2 sm:items-end">
-                {entitlements.autopilotRuns !== null ? (
+                {entitlements.limits.autopilotRuns.mode === "limited" &&
+                entitlements.limits.autopilotRuns.limit !== null ? (
                   <span className="tabular-nums">
                     {t(($) => $.workspace.limits.per_month, {
-                      count: entitlements.autopilotRuns,
+                      count: entitlements.limits.autopilotRuns.limit,
                     })}
                   </span>
                 ) : null}
@@ -1526,7 +1384,6 @@ function BillingTabContent() {
           <SettingsCard>
             <SettingsRow
               label={t(($) => $.workspace.seats.human_members)}
-              description={t(($) => $.workspace.seats.human_members_description)}
             >
               <span className="tabular-nums">
                 {t(($) => $.workspace.seats.seat_count, {
@@ -1536,7 +1393,6 @@ function BillingTabContent() {
             </SettingsRow>
             <SettingsRow
               label={t(($) => $.workspace.seats.billed)}
-              description={t(($) => $.workspace.seats.billed_description)}
             >
               {summaryQuery.isPending ? (
                 <Skeleton
@@ -1596,8 +1452,29 @@ function BillingTabContent() {
               )}
             </SettingsRow>
             <SettingsRow
-              label={t(($) => $.workspace.seats.available)}
-              description={t(($) => $.workspace.seats.available_description)}
+              label={
+                <div className="flex items-center gap-1.5">
+                  <span>{t(($) => $.workspace.seats.available)}</span>
+                  <Popover>
+                    <PopoverTrigger
+                      render={
+                        <Button
+                          variant="ghost"
+                          size="icon-xs"
+                          aria-label={t(($) => $.workspace.seats.available_help)}
+                        >
+                          <Info className="size-3.5" />
+                        </Button>
+                      }
+                    />
+                    <PopoverContent align="start">
+                      <PopoverDescription>
+                        {t(($) => $.workspace.seats.available_description)}
+                      </PopoverDescription>
+                    </PopoverContent>
+                  </Popover>
+                </div>
+              }
             >
               {summaryQuery.isPending ? (
                 <Skeleton
@@ -1679,9 +1556,6 @@ function BillingTabContent() {
                 type="number"
                 inputMode="numeric"
                 min={1}
-                max={
-                  billedSeats === null ? 10_000 : 10_000 - billedSeats
-                }
                 step={1}
                 value={additionalSeatsInput}
                 disabled={purchaseSeatsMutation.isPending}

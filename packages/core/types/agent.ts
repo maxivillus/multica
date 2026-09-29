@@ -1,4 +1,5 @@
 import type { ChatSession } from "./chat";
+import type { Label } from "./label";
 
 export type AgentStatus = "idle" | "working" | "blocked" | "error" | "offline";
 
@@ -112,6 +113,7 @@ export const RUNTIME_PROFILE_PROTOCOL_FAMILIES = [
   "codex",
   "copilot",
   "opencode",
+  "codearts",
   "deveco",
   "openclaw",
   "hermes",
@@ -136,6 +138,12 @@ export const RUNTIME_PROFILE_PROTOCOL_FAMILIES = [
 export type RuntimeProtocolFamily =
   (typeof RUNTIME_PROFILE_PROTOCOL_FAMILIES)[number];
 
+export const RUNTIME_PROFILE_RUNTIME_TYPES = [
+  ...RUNTIME_PROFILE_PROTOCOL_FAMILIES,
+  "omp",
+] as const;
+export type RuntimeProfileType = (typeof RUNTIME_PROFILE_RUNTIME_TYPES)[number];
+
 // Profile visibility mirrors RuntimeVisibility's vocabulary but uses the
 // workspace/private axis the server documents for profiles.
 export type RuntimeProfileVisibility = "workspace" | "private";
@@ -145,6 +153,7 @@ export interface RuntimeProfile {
   workspace_id: string;
   display_name: string;
   protocol_family: RuntimeProtocolFamily;
+  runtime_type?: RuntimeProfileType;
   command_name: string;
   description: string | null;
   fixed_args: string[];
@@ -155,12 +164,14 @@ export interface RuntimeProfile {
   updated_at: string;
 }
 
-// POST body. `protocol_family` is required and immutable after creation.
+// POST body. runtime_type is the immutable compatibility target; the server
+// derives protocol_family. Older clients may still send protocol_family alone.
 // Optional fields are omitted entirely when unset (never sent as null/empty)
 // so the server applies its own defaults.
 export interface CreateRuntimeProfileRequest {
   display_name: string;
-  protocol_family: RuntimeProtocolFamily;
+  protocol_family?: RuntimeProtocolFamily;
+  runtime_type?: RuntimeProfileType;
   command_name: string;
   description?: string;
   fixed_args?: string[];
@@ -201,6 +212,10 @@ export interface AgentActivityBucket {
   bucket_at: string;
   task_count: number;
   failed_count: number;
+  // task_count = completed_count + failed_count + cancelled_count; the
+  // back-end always reports all three.
+  completed_count: number;
+  cancelled_count: number;
 }
 
 // 30-day total run count per agent, drives the Agents-list RUNS column.
@@ -274,7 +289,16 @@ export interface TaskAttribution {
   rerun_of_task_id?: string;
 }
 
+/** Point-in-time identity of the actor that cancelled a run. */
+export interface TaskCancellationActor {
+  /** Open wire value; current servers emit member, agent, or system. */
+  type: string;
+  id?: string;
+  name?: string;
+}
+
 export interface AgentTask {
+  wakeup_id?: string;
   id: string;
   agent_id: string;
   runtime_id: string;
@@ -291,6 +315,7 @@ export interface AgentTask {
     | "queued"
     | "dispatched"
     | "waiting_local_directory"
+    | "deferred"
     | "running"
     | "completed"
     | "failed"
@@ -311,6 +336,10 @@ export interface AgentTask {
   // coarse values; `string & {}` admits the rest without collapsing the
   // hints.
   failure_reason?: TaskFailureReason | (string & {}) | "";
+  /** The input comment was edited or deleted, invalidating this run. */
+  cancelled_by_comment_change?: boolean;
+  /** Present on cancellations recorded by a backend with actor provenance. */
+  cancelled_by?: TaskCancellationActor;
   created_at: string;
   /** Non-empty when the task was spawned from a chat session. */
   chat_session_id?: string;
@@ -337,6 +366,12 @@ export interface AgentTask {
    * trigger/coalesced union; an explicitly empty array is still authoritative.
    */
   delivered_comment_ids?: string[];
+  /** Exact run-scoped live-input capability negotiated at this task's start. */
+  supplement_capability?: string;
+  /** Ordinary historical comments explicitly bound to this run, in send order. */
+  supplement_comment_ids?: string[];
+  /** Server-side invocation verdict for the current member and this agent. */
+  can_supplement?: boolean;
   /**
    * Canonical short description of what triggered this task — snapshot
    * taken at creation time. For comment-triggered tasks it's the
@@ -347,16 +382,9 @@ export interface AgentTask {
    */
   trigger_summary?: string;
   /**
-   * Handoff instruction the assigner attached when starting this run (MUL-3375).
-   * Present only on assignment-triggered runs that carried a note; the execution
-   * log shows it inline as the trigger reason. Absent (legacy / no note) falls
-   * back to the generic "initial run" label.
-   */
-  handoff_note?: string;
-  /**
-   * Server-computed source discriminator used by the activity row to label
-   * tasks that have no linked issue (so e.g. quick-create tasks render
-   * with a meaningful title instead of falling through to "Untracked").
+   * Server-computed source discriminator used by task surfaces. Quick-create
+   * remains quick_create after its result issue is linked, so consumers can
+   * distinguish creation work from later direct runs on that issue.
    */
   kind?: "comment" | "autopilot" | "chat" | "quick_create" | "direct";
   /**
@@ -413,8 +441,8 @@ export interface AgentTask {
   attribution?: TaskAttribution;
   /**
    * This run's own token consumption, one entry per (provider, model) it used.
-   * Present on the issue execution-log endpoint only; the daemon claim path
-   * omits it.
+   * Present on issue execution logs and explicit agent-history accounting
+   * requests; normal UI history and daemon claims omit it.
    *
    * `undefined` (old backend, or a surface that doesn't hydrate it) and `[]`
    * (backend hydrated, this run has no recorded usage) both mean "no number to
@@ -472,11 +500,15 @@ export interface Agent {
   runtime_id: string;
   /** False exactly when the agent has no runtime. Older backends omit it. */
   runtime_bound?: boolean;
+  /** Privacy-safe coarse liveness for a runtime hidden from the runtime list. */
+  runtime_availability?: "online" | "unstable" | "offline";
   name: string;
   description: string;
   /** What this agent's owner wrote. For a system agent this holds only the
    *  workspace's own notes — the product half is `system_instructions`. */
   instructions: string;
+  /** Up to three agent-authored first-turn suggestions. Older servers omit it. */
+  conversation_starters?: AgentConversationStarter[];
   /** Set for product-defined agents (e.g. "mika"). Absent for user- and
    *  template-created agents. Identity for "maintained by Multica" checks —
    *  never the display name, which owners may change. */
@@ -588,6 +620,13 @@ export interface Agent {
   archived_by: string | null;
 }
 
+export interface AgentConversationStarter {
+  /** Short chip label shown in the empty state. */
+  label: string;
+  /** Full editable text copied into the composer when selected. */
+  prompt: string;
+}
+
 export interface DisabledRuntimeSkill {
   runtime_id: string;
   provider: string;
@@ -625,6 +664,7 @@ export interface CreateAgentRequest {
   name: string;
   description?: string;
   instructions?: string;
+  conversation_starters?: AgentConversationStarter[];
   avatar_url?: string;
   runtime_id: string;
   runtime_config?: Record<string, unknown>;
@@ -677,6 +717,7 @@ export interface StoredAgentDraft {
   name: string;
   description: string;
   instructions: string;
+  conversation_starters: AgentConversationStarter[];
   avatar_url: string | null;
   model: string;
   thinking_level: string;
@@ -719,6 +760,7 @@ export interface UpdateAgentRequest {
   name?: string;
   description?: string;
   instructions?: string;
+  conversation_starters?: AgentConversationStarter[];
   avatar_url?: string;
   runtime_id?: string;
   runtime_config?: Record<string, unknown>;
@@ -825,8 +867,10 @@ export interface SkillSummary {
   created_by: string | null;
   created_at: string;
   updated_at: string;
-	/** Present only when returned from an agent-scoped assignment endpoint. */
-	enabled?: boolean;
+  /** Present only when returned from an agent-scoped assignment endpoint. */
+  enabled?: boolean;
+  /** Present on workspace skill lists after a backend that bulk-attaches labels. */
+  labels?: Label[];
 }
 
 export interface Skill extends SkillSummary {
@@ -849,6 +893,19 @@ export interface CreateSkillRequest {
   content?: string;
   config?: Record<string, unknown>;
   files?: { path: string; content: string }[];
+}
+
+/** Structured body of POST /api/skills/import when uploading an archive. */
+export interface SkillImportResult {
+  status: "created" | "updated" | "conflict" | "skipped" | "failed";
+  reason?: string;
+  skill?: Skill;
+  existing_skill?: {
+    id: string;
+    name: string;
+    created_by?: string;
+    can_overwrite?: boolean;
+  };
 }
 
 export interface UpdateSkillRequest {
@@ -876,6 +933,11 @@ export interface IssueUsageSummary {
   uncosted_output_tokens?: number;
   uncosted_cache_read_tokens?: number;
   uncosted_cache_write_tokens?: number;
+  // Coverage fields are optional for compatibility with older backends.
+  // task_count remains the legacy count of runs represented by usage rows.
+  terminal_task_count?: number;
+  metered_task_count?: number;
+  unreported_task_count?: number;
   task_count: number;
 }
 
@@ -998,6 +1060,10 @@ export interface DashboardAgentRunTime {
   agent_id: string;
   total_seconds: number;
   task_count: number;
+  // Optional for compatibility with backends predating usage-coverage
+  // reporting. Consumers can still identify the fully-unreported case when
+  // this is absent by checking whether the agent has any usage rows.
+  metered_task_count?: number;
   failed_count: number;
   // Runs the user stopped mid-flight. Disjoint from `failed_count`, and
   // both are subsets of `task_count` — the succeeded count is the
@@ -1077,6 +1143,28 @@ export interface RuntimeModel {
   thinking?: RuntimeModelThinking;
   /** Runtime-native execution tiers advertised for this exact model. */
   service_tiers?: RuntimeModelServiceTier[];
+  /**
+   * Whether this runtime's installed Codex CLI accepts the request-only
+   * `default` sentinel for explicit standard routing. Missing means false so
+   * a new client stays safe when connected to an older daemon.
+   */
+  supports_explicit_standard_service_tier?: boolean;
+}
+
+/**
+ * A model the runtime named but will not run on that host — today only Claude
+ * Code, reporting one that needs a newer CLI than the installed one.
+ *
+ * These arrive in their own list and never inside `models`, which is what keeps
+ * an older client from offering one: it reads `models`, and they are not there.
+ * The picker shows them greyed out with `reason` so the gap reads as "your CLI
+ * is behind" rather than "Multica does not support this model" (MUL-6961).
+ */
+export interface RuntimeUnavailableModel {
+  id: string;
+  label: string;
+  /** The runtime's own remedy, e.g. "Update to 2.1.255+ to use Fable 5.1". */
+  reason?: string;
 }
 
 export interface RuntimeModelServiceTier {
@@ -1121,6 +1209,8 @@ export interface RuntimeModelListRequest {
   runtime_id: string;
   status: RuntimeModelListStatus;
   models?: RuntimeModel[];
+  /** Advisory rows the runtime cannot run; never selectable. */
+  unavailable_models?: RuntimeUnavailableModel[];
   supported: boolean;
   error?: string;
   created_at: string;
@@ -1141,6 +1231,13 @@ export interface RuntimeModelListRequest {
 // from "provider does not honour per-agent model selection".
 export interface RuntimeModelsResult {
   models: RuntimeModel[];
+  /**
+   * Rows the runtime named but cannot run. Kept out of `models` on purpose —
+   * see RuntimeUnavailableModel. Optional like `cached` beside it: the resolver
+   * always sets it, but a backend older than the field contributes nothing, so
+   * consumers read it defensively.
+   */
+  unavailableModels?: RuntimeUnavailableModel[];
   supported: boolean;
   /**
    * True when the server answered from its catalog cache rather than a live

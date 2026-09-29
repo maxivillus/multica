@@ -1,6 +1,6 @@
 // @vitest-environment jsdom
 
-import { afterEach, beforeEach, describe, expect, it } from "vitest";
+import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import {
   cleanup,
   fireEvent,
@@ -10,7 +10,10 @@ import {
 import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
 import { setApiInstance } from "@multica/core/api";
 import type { ApiClient } from "@multica/core/api/client";
-import { STATUS_ORDER } from "@multica/core/issues/config";
+import {
+  BUILT_IN_STATUS_CATEGORY,
+  BUILT_IN_STATUS_ORDER,
+} from "@multica/core/issues/config";
 import {
   type InboxPriorityFilterSupport,
   useInboxFilterStore,
@@ -19,14 +22,27 @@ import type { InboxItem, IssueStatusEntry } from "@multica/core/types";
 import { renderWithI18n } from "../../test/i18n";
 import { InboxFilterMenu } from "./inbox-filter-menu";
 
-function statusEntry(category: (typeof STATUS_ORDER)[number]): IssueStatusEntry {
+// The directory hook resolves the current workspace through the route, which
+// this leaf render has none of — stubbed the same way the sibling
+// inbox-detail-label suite stubs it.
+const ACTOR_NAMES: Record<string, string> = { alice: "Alice", bob: "Bob" };
+vi.mock("@multica/core/workspace/hooks", () => ({
+  useActorName: () => ({
+    getActorName: (type: string, id: string) =>
+      type === "system" ? "Multica" : (ACTOR_NAMES[id] ?? "Unknown"),
+    getActorInitials: () => "??",
+    getActorAvatarUrl: () => null,
+  }),
+}));
+
+function statusEntry(key: (typeof BUILT_IN_STATUS_ORDER)[number]): IssueStatusEntry {
   return {
-    id: `status-${category}`,
+    id: `status-${key}`,
     workspace_id: "ws-1",
-    key: category,
-    name: category,
+    key,
+    name: key,
     description: "",
-    category,
+    category: BUILT_IN_STATUS_CATEGORY[key],
     color: "#888888",
     is_system: true,
     position: 0,
@@ -40,6 +56,7 @@ function item(
   id: string,
   issueStatus: InboxItem["issue_status"],
   issuePriority: InboxItem["issue_priority"],
+  overrides: Partial<InboxItem> = {},
 ): InboxItem {
   return {
     id,
@@ -59,6 +76,7 @@ function item(
     archived: false,
     created_at: "2026-08-24T00:00:00Z",
     details: null,
+    ...overrides,
   };
 }
 
@@ -70,15 +88,22 @@ const ITEMS = [
 function renderMenu({
   items = ITEMS,
   priorityFilterSupport = "supported",
+  archived = false,
+  getArchivedInboxFacets = vi.fn(async () => ({ statuses: {}, priorities: {}, actors: {}, unreadCount: 0 })),
+  statusEntries = BUILT_IN_STATUS_ORDER.map(statusEntry),
 }: {
   items?: InboxItem[];
   priorityFilterSupport?: InboxPriorityFilterSupport;
+  archived?: boolean;
+  getArchivedInboxFacets?: ReturnType<typeof vi.fn>;
+  statusEntries?: IssueStatusEntry[];
 } = {}) {
   setApiInstance({
+    getArchivedInboxFacets,
     listIssueStatuses: async () => ({
-      statuses: STATUS_ORDER.map(statusEntry),
+      statuses: statusEntries,
       categories: [],
-      total: STATUS_ORDER.length,
+      total: statusEntries.length,
     }),
   } as unknown as ApiClient);
   const queryClient = new QueryClient({
@@ -90,12 +115,13 @@ function renderMenu({
         wsId="ws-1"
         items={items}
         priorityFilterSupport={priorityFilterSupport}
+        archived={archived}
       />
     </QueryClientProvider>,
   );
 }
 
-async function openSubmenu(name: "Status" | "Priority") {
+async function openSubmenu(name: "From" | "Status" | "Priority") {
   fireEvent.click(screen.getByRole("button", { name: "Filter inbox" }));
   const trigger = await screen.findByRole("menuitem", {
     name: new RegExp(`^${name}`),
@@ -113,6 +139,43 @@ afterEach(() => {
 });
 
 describe("InboxFilterMenu", () => {
+  it("keeps a selected retired status removable when absent from archive facets and pages", async () => {
+    useInboxFilterStore.getState().toggleStatusFilter("ws-1", "custom-retired");
+    renderMenu({
+      items: [], archived: true,
+      statusEntries: [...BUILT_IN_STATUS_ORDER.map(statusEntry), {
+        ...statusEntry("todo"), id: "retired", key: "custom-retired",
+        name: "Retired status", is_system: false, archived_at: "2026-09-01T00:00:00Z",
+      }],
+    });
+    fireEvent.click(screen.getByRole("button", { name: "1 active filter" }));
+    fireEvent.click(await screen.findByRole("menuitem", { name: /^Status/ }));
+    const selected = await screen.findByRole("menuitemcheckbox", { name: "Retired status" });
+    expect(selected).toHaveAttribute("aria-checked", "true");
+    fireEvent.click(selected);
+    expect(useInboxFilterStore.getState().filtersByWorkspace["ws-1"]?.statuses).toEqual([]);
+  });
+
+  it("keeps a selected priority removable when absent from archive facets and pages", async () => {
+    useInboxFilterStore.getState().togglePriorityFilter("ws-1", "high");
+    renderMenu({ items: [], archived: true });
+    fireEvent.click(screen.getByRole("button", { name: "1 active filter" }));
+    fireEvent.click(await screen.findByRole("menuitem", { name: /^Priority/ }));
+    const selected = await screen.findByRole("menuitemcheckbox", { name: "High" });
+    expect(selected).toHaveAttribute("aria-checked", "true");
+    fireEvent.click(selected);
+    expect(useInboxFilterStore.getState().filtersByWorkspace["ws-1"]?.priorities).toEqual([]);
+  });
+
+  it("loads full-archive facets only when opened, including an actor absent from loaded rows", async () => {
+    const getArchivedInboxFacets = vi.fn(async () => ({ statuses: { done: 251 }, priorities: { high: 251 }, actors: { "member:alice": 251 }, unreadCount: 0 }));
+    renderMenu({ items: [], archived: true, getArchivedInboxFacets });
+    expect(getArchivedInboxFacets).not.toHaveBeenCalled();
+    await openSubmenu("From");
+    expect(await screen.findByRole("menuitemcheckbox", { name: /Alice.*251/ })).toBeTruthy();
+    expect(getArchivedInboxFacets).toHaveBeenCalledTimes(1);
+  });
+
   it("selects a status and exposes the active count on the trigger", async () => {
     renderMenu();
     await openSubmenu("Status");
@@ -158,6 +221,68 @@ describe("InboxFilterMenu", () => {
     expect(
       useInboxFilterStore.getState().filtersByWorkspace["ws-1"],
     ).toBeUndefined();
+  });
+
+  it("offers only the actors the visible rows carry", async () => {
+    renderMenu({
+      items: [
+        item("from-alice", "todo", "high", {
+          actor_type: "member",
+          actor_id: "alice",
+        }),
+        item("from-bob", "done", "low", {
+          actor_type: "agent",
+          actor_id: "bob",
+        }),
+      ],
+    });
+
+    await openSubmenu("From");
+    const alice = await screen.findByRole("menuitemcheckbox", {
+      name: /Alice.*1 notification/,
+    });
+    expect(
+      screen.getByRole("menuitemcheckbox", { name: /Bob.*1 notification/ }),
+    ).toBeTruthy();
+
+    fireEvent.click(alice);
+
+    expect(
+      useInboxFilterStore.getState().filtersByWorkspace["ws-1"]?.actors,
+    ).toEqual(["member:alice"]);
+  });
+
+  it("hides the From submenu when no row carries an actor", async () => {
+    renderMenu();
+
+    fireEvent.click(screen.getByRole("button", { name: "Filter inbox" }));
+
+    expect(screen.queryByRole("menuitem", { name: /^From/ })).toBeNull();
+  });
+
+  it("toggles unread only and counts the unread rows behind it", async () => {
+    renderMenu({
+      items: [
+        item("unread", "todo", "high"),
+        item("read", "done", "low", { read: true }),
+      ],
+    });
+
+    fireEvent.click(screen.getByRole("button", { name: "Filter inbox" }));
+    const unread = await screen.findByRole("menuitemcheckbox", {
+      name: /Unread only.*1 notification/,
+    });
+
+    fireEvent.click(unread);
+
+    expect(
+      useInboxFilterStore.getState().filtersByWorkspace["ws-1"]?.unreadOnly,
+    ).toBe(true);
+    await waitFor(() =>
+      expect(
+        screen.getByRole("button", { name: "1 active filter" }),
+      ).toHaveTextContent("1"),
+    );
   });
 
   it("hides priority and clears its filter for a legacy response", async () => {

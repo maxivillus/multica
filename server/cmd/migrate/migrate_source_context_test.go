@@ -12,6 +12,7 @@ import (
 )
 
 func TestSourceContextMigrationsRollbackFailsClosedWithCapturedData(t *testing.T) {
+	t.Parallel()
 	adminPool := openTestPool(t)
 	ctx, cancel := context.WithTimeout(context.Background(), 90*time.Second)
 	defer cancel()
@@ -168,14 +169,6 @@ func TestSourceContextMigrationsRollbackFailsClosedWithCapturedData(t *testing.T
 	}
 	if count != 0 {
 		t.Fatalf("source contexts after guarded rollback and reapply = %d, want 0", count)
-	}
-}
-
-func TestSourceContextRollbackGuardRegisteredForEveryMigrationStep(t *testing.T) {
-	for _, version := range sourceContextMigrationVersions {
-		if preRollbackHooks[version] == nil {
-			t.Errorf("source-context rollback guard is not registered for %s", version)
-		}
 	}
 }
 

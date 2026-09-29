@@ -22,6 +22,7 @@ import (
 	"github.com/multica-ai/multica/server/internal/auth"
 	"github.com/multica-ai/multica/server/internal/cloudruntime"
 	"github.com/multica-ai/multica/server/internal/daemonws"
+	"github.com/multica-ai/multica/server/internal/dbreader"
 	"github.com/multica-ai/multica/server/internal/entitlement"
 	"github.com/multica-ai/multica/server/internal/events"
 	"github.com/multica-ai/multica/server/internal/integrations/channel/engine"
@@ -108,11 +109,11 @@ type Config struct {
 	// webhook limiter from being bypassed by a spoofed XFF on deployments
 	// without a header-stripping reverse proxy in front.
 	TrustedProxies []netip.Prefix
-	// CloudRuntimeFleetURL enables the SaaS-only remote Fleet adapter when set.
-	// Empty keeps self-hosted deployments explicit: cloud runtime endpoints
-	// return 503 instead of attempting to dial a hard-coded private service.
-	CloudRuntimeFleetURL     string
-	CloudRuntimeFleetTimeout time.Duration
+	// CloudURL enables the SaaS-only multica-cloud connection when set. Empty
+	// keeps self-hosted deployments explicit: Cloud endpoints return 403 instead
+	// of attempting to dial a hard-coded private service.
+	CloudURL                 string
+	CloudTimeout             time.Duration
 	AttachmentDownloadMode   string
 	AttachmentDownloadURLTTL time.Duration
 	// AttachmentFrameAncestors are trusted browser origins allowed to embed
@@ -134,6 +135,8 @@ type Config struct {
 	//   - LLMBaseURL       -> MULTICA_LLM_BASE_URL (OpenAI or any compatible gateway)
 	//   - LLMDefaultModel  -> MULTICA_LLM_DEFAULT_MODEL (used when a request omits `model`)
 	//   - LLMMaxRetries    -> MULTICA_LLM_MAX_RETRIES (transport retry budget)
+	//   - LLMDisableThinking -> MULTICA_LLM_DISABLE_THINKING (gateway hint to
+	//     turn model reasoning off; see llm.Config.DisableThinking)
 	LLMAPIKey       string
 	LLMBaseURL      string
 	LLMDefaultModel string
@@ -143,6 +146,10 @@ type Config struct {
 	// and cmd/server additionally fails the boot on an out-of-range value before
 	// one reaches this struct. See llm.Config.MaxRetries for the full semantics.
 	LLMMaxRetries *llm.RetryOverride
+	// LLMDisableThinking is the parsed MULTICA_LLM_DISABLE_THINKING switch.
+	// cmd/server validates the raw value before the boot continues, so a
+	// non-boolean never reaches this struct.
+	LLMDisableThinking bool
 	// ServerVersion is the build version of the running API binary (the same
 	// value main.go stamps via -X main.version and reports on /metrics).
 	// Surfaced through /api/config so self-hosted operators can confirm which
@@ -164,46 +171,64 @@ type WorkspaceSetRefreshNotifier interface {
 }
 
 // DaemonPendingWorkNotifier pushes a runtime-scoped "heartbeat now" hint to the
-// daemon so a queued heartbeat-carried request (model discovery) is picked up
-// immediately instead of on the daemon's next scheduled tick (MUL-5444).
+// daemon so a queued heartbeat-carried request (model discovery, capability
+// discovery, or local-skill import) is picked up immediately instead of on the
+// daemon's next scheduled tick (MUL-5444).
 // Satisfied by both *daemonws.Hub (single-node) and *daemonws.RelayNotifier
 // (multi-node, fans out through Redis).
 type DaemonPendingWorkNotifier interface {
 	NotifyPendingWork(runtimeID, kind string)
 }
 
+// DaemonTaskSupplementNotifier sends a content-free wakeup for one exact run.
+// The daemon still pulls and authenticates the durable supplement over HTTP.
+type DaemonTaskSupplementNotifier interface {
+	NotifyTaskSupplementAvailable(runtimeID, taskID string)
+}
+
+// RuntimeGoneNotifier invalidates a runtime that was deleted while its daemon
+// still has an authenticated WebSocket connection.
+type RuntimeGoneNotifier interface {
+	NotifyRuntimeGone(runtimeID string)
+}
+
+// RuntimeRecoveryNotifier republishes the daemon:register lifecycle refresh
+// after a heartbeat actually flipped an offline runtime row back online
+// (sweeper-race fallback, batch-receipt reconciliation). Recovery paths already
+// know the workspace, so publishing never needs a follow-up database lookup.
+type RuntimeRecoveryNotifier interface {
+	NotifyRuntimeRecovered(ctx context.Context, workspaceID string)
+}
+
 type Handler struct {
-	Queries   *db.Queries
-	DB        dbExecutor
-	TxStarter txStarter
-	// issueTableWindowCache is initialized only on the request-local Handler
-	// copy used by a repeatable-read table request. It lets facets reuse one
-	// visible-id snapshot without adding mutable state to the shared Handler.
-	issueTableWindowCache  *issueTableWindowCache
+	Queries                *db.Queries
+	ReadSelector           *dbreader.Selector
+	DB                     dbExecutor
+	TxStarter              txStarter
 	Hub                    *realtime.Hub
 	DaemonHub              *daemonws.Hub
 	DaemonProfileRefresh   RuntimeProfileRefreshNotifier
 	DaemonWorkspaceRefresh WorkspaceSetRefreshNotifier
+	DaemonRuntimeGone      RuntimeGoneNotifier
 	Bus                    *events.Bus
 	TaskService            *service.TaskService
 	PluginService          *service.PluginService
 	IssueService           *service.IssueService
 	AutopilotService       *service.AutopilotService
 	// Entitlements supplies workspace-scoped commercial gates. A nil provider
-	// preserves the self-hosted and pre-rollout behavior without extra reads.
+	// preserves self-hosted behavior without extra reads.
 	Entitlements entitlement.Provider
 	// SeatCapacity executes Cloud's pre-purchased human-seat protocol. Nil or
 	// disabled preserves self-hosted behavior.
-	SeatCapacity                   seatcapacity.Executor
-	SeatCapacityEnforcementEnabled bool
-	SeatCapacityLocker             seatcapacity.WorkspaceLocker
-	SeatCapacityWorker             *seatcapacity.Worker
-	EmailService                   *service.EmailService
-	UpdateStore                    UpdateStore
-	ModelListStore                 ModelListStore
-	LocalSkillListStore            LocalSkillListStore
-	LocalSkillImportStore          LocalSkillImportStore
-	FeatureFlags                   *featureflag.Service
+	SeatCapacity          seatcapacity.Executor
+	SeatCapacityLocker    seatcapacity.WorkspaceLocker
+	SeatCapacityWorker    *seatcapacity.Worker
+	EmailService          *service.EmailService
+	UpdateStore           UpdateStore
+	ModelListStore        ModelListStore
+	LocalSkillListStore   LocalSkillListStore
+	LocalSkillImportStore LocalSkillImportStore
+	FeatureFlags          *featureflag.Service
 	// IssueStatusCatalog reads the workspace status catalog. Defaults to
 	// Queries; a test can substitute a counting wrapper to assert HOW MANY
 	// catalog reads a request performs, which is the only property that
@@ -219,7 +244,8 @@ type Handler struct {
 	// heartbeat-carried requests (MUL-5444). Optional: when nil,
 	// requestDaemonPendingWork falls back to the local DaemonHub, which is the
 	// correct delivery scope for a single-node deployment.
-	DaemonPendingWork DaemonPendingWorkNotifier
+	DaemonPendingWork    DaemonPendingWorkNotifier
+	DaemonTaskSupplement DaemonTaskSupplementNotifier
 	// ModelCatalogCache serves the last known good model list for a runtime so
 	// the picker can render without waiting for a daemon round trip
 	// (stale-while-revalidate, MUL-5444). Nil-safe: every call site treats a nil
@@ -239,9 +265,11 @@ type Handler struct {
 	InvitationRateLimiters       InvitationRateLimiters
 	WebhookDeliveryWorker        *WebhookDeliveryWorker
 	CloudRuntime                 cloudRuntimeProxy
+	// Test-only HTTP override; nil uses the default client in production.
+	googleOAuthHTTPClient *http.Client
 	// Lark integration. All three are nil when the Lark master key
 	// (MULTICA_LARK_SECRET_KEY) is unset; the corresponding HTTP
-	// handlers return 503 in that case so a misconfigured self-host
+	// handlers return 403 in that case so a misconfigured self-host
 	// deployment surfaces a clear error instead of silently using a
 	// zero key. Wired in cmd/server/router.go after handler.New.
 	LarkInstallations *lark.InstallationService
@@ -262,7 +290,7 @@ type Handler struct {
 	// entry points.
 	LarkAPIClient lark.APIClient
 	// Composio integration (MUL-3720). Nil when COMPOSIO_API_KEY is unset;
-	// the composio HTTP handlers return 503 in that case. Wired in
+	// the composio HTTP handlers return 403 in that case. Wired in
 	// cmd/server/router.go after handler.New.
 	Composio *composio.Service
 	// ChannelSupervisor owns the per-installation supervisor goroutines
@@ -310,7 +338,7 @@ type Handler struct {
 	SlackHistory ChatChannelHistoryReader
 	// WecomStore is the read/write handle over channel_installation rows scoped
 	// to channel_type='wecom'. Nil disables the wecom Web-UI endpoints (they
-	// return 503) and prevents boot from wiring the smart-bot supervisor.
+	// return 403) and prevents boot from wiring the smart-bot supervisor.
 	WecomStore *wecom.Store
 	// WecomCredentials unseals a wecom installation's smart-bot secret for the
 	// WebSocket subscribe frame. Nil disables the wecom integration.
@@ -319,7 +347,7 @@ type Handler struct {
 	// "link your Multica account" prompt sent to first-time WeCom users
 	// (their aibot userid is a "T"-prefixed anonymized id with no relation
 	// to their real userid or email, so an explicit binding is required —
-	// see wecom/binding.go). Nil disables the redeem endpoint (returns 503)
+	// see wecom/binding.go). Nil disables the redeem endpoint (returns 403)
 	// and the OutboundReplier's binding-prompt path.
 	WecomBindingTokens WecomBindingRedeemer
 
@@ -371,7 +399,7 @@ type Handler struct {
 	LLM *llm.Client
 	// VCSSecretBox encrypts/decrypts per-workspace Git provider access tokens and
 	// webhook secrets at rest (Forgejo / Gitea / GitLab). Nil when
-	// MULTICA_VCS_SECRET_KEY is unset; the connect/webhook handlers return 503
+	// MULTICA_VCS_SECRET_KEY is unset; connect returns 403 and webhook returns 404
 	// in that case so a misconfigured self-host deployment surfaces a clear
 	// error rather than silently storing plaintext. Wired in
 	// cmd/server/router.go after New.
@@ -414,29 +442,35 @@ func New(queries *db.Queries, txStarter txStarter, hub *realtime.Hub, bus *event
 	}
 	var daemonProfileRefresh RuntimeProfileRefreshNotifier
 	var daemonWorkspaceRefresh WorkspaceSetRefreshNotifier
+	var daemonRuntimeGone RuntimeGoneNotifier
 	if daemonHub != nil {
 		daemonProfileRefresh = daemonHub
 		daemonWorkspaceRefresh = daemonHub
+		daemonRuntimeGone = daemonHub
 	}
 
 	llmClient := llm.New(llm.Config{
-		APIKey:       cfg.LLMAPIKey,
-		BaseURL:      cfg.LLMBaseURL,
-		DefaultModel: cfg.LLMDefaultModel,
-		MaxRetries:   cfg.LLMMaxRetries,
+		APIKey:          cfg.LLMAPIKey,
+		BaseURL:         cfg.LLMBaseURL,
+		DefaultModel:    cfg.LLMDefaultModel,
+		MaxRetries:      cfg.LLMMaxRetries,
+		DisableThinking: cfg.LLMDisableThinking,
 	})
 	// Report the effective retry policy so an operator can confirm from the
 	// boot log alone what a misbehaving upstream will cost, instead of inferring
 	// it from an env var whose semantics used to be unguessable (MUL-6364).
 	// Read off the client, not off cfg, so the line cannot drift from what the
 	// SDK actually enforces. Counts and an enum only — never the key or the base
-	// URL, since a self-hosted gateway URL routinely embeds a token.
+	// URL, since a self-hosted gateway URL routinely embeds a token. The
+	// disable_thinking field rides along so the effective request shape is on
+	// the same line.
 	llmRetry := llmClient.RetryBudget()
 	slog.Info("llm retry policy",
 		"max_retries", llmRetry.MaxRetries,
 		"source", llmRetry.Source,
 		"request_timeout", llmRetry.RequestTimeout,
 		"enabled", llmClient.Enabled(),
+		"disable_thinking", llmClient.DisableThinking(),
 	)
 
 	taskSvc := service.NewTaskService(queries, txStarter, hub, bus, daemonHub)
@@ -448,12 +482,14 @@ func New(queries *db.Queries, txStarter txStarter, hub *realtime.Hub, bus *event
 	taskSvc.QuickActions = llmClient
 	h := &Handler{
 		Queries:                      queries,
+		ReadSelector:                 dbreader.NewPrimaryOnly(queries),
 		DB:                           executor,
 		TxStarter:                    txStarter,
 		Hub:                          hub,
 		DaemonHub:                    daemonHub,
 		DaemonProfileRefresh:         daemonProfileRefresh,
 		DaemonWorkspaceRefresh:       daemonWorkspaceRefresh,
+		DaemonRuntimeGone:            daemonRuntimeGone,
 		Bus:                          bus,
 		TaskService:                  taskSvc,
 		PluginService:                service.NewPluginService(queries, txStarter),
@@ -475,13 +511,18 @@ func New(queries *db.Queries, txStarter txStarter, hub *realtime.Hub, bus *event
 		WebhookAbsoluteIPRateLimiter: NewMemoryWebhookAbsoluteIPRateLimiter(DefaultWebhookAbsoluteIPRateLimit()),
 		InvitationRateLimiters:       NewMemoryInvitationRateLimiters(DefaultInvitationRateLimits()),
 		CloudRuntime: cloudruntime.NewClient(cloudruntime.Config{
-			BaseURL: cfg.CloudRuntimeFleetURL,
-			Timeout: cfg.CloudRuntimeFleetTimeout,
+			BaseURL: cfg.CloudURL,
+			Timeout: cfg.CloudTimeout,
 		}),
 		LLM: llmClient,
 		cfg: cfg,
 	}
 	h.WebhookDeliveryWorker = NewWebhookDeliveryWorker(h)
+	// The default passthrough scheduler reports sweeper-race recoveries so the
+	// daemon:register refresh fires even without the production batched wiring.
+	if passthrough, ok := h.HeartbeatScheduler.(*PassthroughHeartbeatScheduler); ok {
+		passthrough.RecoveryNotifier = h
+	}
 
 	// GitHub API snapshot pipeline for PR cards (MUL-5265). Built
 	// unconditionally but inert (every trigger no-ops) when the App private key
@@ -546,6 +587,13 @@ func writeError(w http.ResponseWriter, status int, msg string) {
 // fallback for anything that has not been given a translation yet.
 func writeErrorCode(w http.ResponseWriter, status int, code, msg string) {
 	writeJSON(w, status, map[string]string{"error": msg, "code": code})
+}
+
+// writeFeatureDisabled reports a deliberate deployment or feature gate as a
+// non-retryable refusal. A disabled capability is not a transient service
+// failure: returning 503 would invite retries and pollute availability alerts.
+func writeFeatureDisabled(w http.ResponseWriter, code, msg string) {
+	writeErrorCode(w, http.StatusForbidden, code, msg)
 }
 
 func writeRevisionConflict(w http.ResponseWriter, resourceType string, resourceID pgtype.UUID, expected, actual int64) {
@@ -724,6 +772,25 @@ func (h *Handler) notifyDaemonWorkspacesChanged(userIDs ...string) {
 	}
 }
 
+// NotifyRuntimeGone emits the post-commit runtime invalidation signal. It is
+// exported so the runtime GC can use the same publisher as request handlers.
+func (h *Handler) NotifyRuntimeGone(runtimeID string) {
+	if h == nil || h.DaemonRuntimeGone == nil || runtimeID == "" {
+		return
+	}
+	h.DaemonRuntimeGone.NotifyRuntimeGone(runtimeID)
+}
+
+// NotifyRuntimeRecovered republishes the workspace-scoped daemon:register
+// lifecycle event after a heartbeat restored a runtime from offline. Runtime
+// details are intentionally omitted from the payload.
+func (h *Handler) NotifyRuntimeRecovered(_ context.Context, workspaceID string) {
+	if h == nil || workspaceID == "" {
+		return
+	}
+	h.PublishRuntimeRefresh(workspaceID, "system", "", "heartbeat_recovery")
+}
+
 // publishTask is publish() plus a TaskID hint so the realtime layer can route
 // the event to the per-task scope rather than the whole workspace.
 func (h *Handler) publishTask(eventType, workspaceID, actorType, actorID, taskID string, payload any) {
@@ -780,21 +847,25 @@ func requestUserID(r *http.Request) string {
 // stripped by the agent process. This is the path MUL-2600 relies on to
 // reject agent-process traffic on owner-only endpoints.
 //
-// Fallback signal (legacy CLI / member-token paths): the request MUST
-// carry both X-Agent-ID and a valid X-Task-ID, and the task must belong
-// to the claimed agent. Otherwise we fall back to "member".
+// Fallback signal: the request MUST carry both X-Agent-ID and a valid
+// X-Task-ID, and the task must belong to the claimed agent. Otherwise we
+// fall back to "member".
 //
-// X-Agent-ID alone is not trusted: any workspace member can guess or observe
-// an agent's UUID, and a member-supplied X-Agent-ID would otherwise let that
-// member impersonate the agent and bypass the private-agent gate (#2359
-// review). The daemon always pairs the two headers, so requiring both has
-// no effect on legitimate agent callers but closes the impersonation path.
+// This fallback is NOT a security boundary and must not be read as one. Both
+// ids are observable by any workspace member (GET /api/issues/{id}/task-runs
+// returns the pair), so requiring both proves nothing on its own — the older
+// comment here claimed it "closes the impersonation path", and it did not.
+// What closes it is the Auth / DaemonAuth middleware stripping both headers
+// from every client, leaving the mat_ branch as the only writer (MUL-3428).
+// The fallback survives that strip only for in-process callers and handler
+// unit tests, which set the headers directly.
 //
 // Returns ("agent", agentID) on success, ("member", userID) otherwise.
 func (h *Handler) resolveActor(r *http.Request, userID, workspaceID string) (actorType, actorID string) {
 	if r.Header.Get("X-Actor-Source") == "task_token" {
-		// Server-set header — auth middleware also forced X-Agent-ID
-		// from the token row. Trust it directly without re-querying.
+		// Server-set header — the auth middleware stripped whatever the
+		// client sent and re-stamped X-Agent-ID from the token row. Trust
+		// it directly without re-querying.
 		return "agent", r.Header.Get("X-Agent-ID")
 	}
 	agentID := r.Header.Get("X-Agent-ID")
@@ -987,9 +1058,6 @@ func (h *Handler) loadIssueForUser(w http.ResponseWriter, r *http.Request, issue
 	// silently returns false for non-identifier strings, falling through to
 	// the UUID path below.
 	if issue, ok := h.resolveIssueByIdentifier(r.Context(), issueID, workspaceID); ok {
-		if !h.authorizeIssueWindow(w, r, issue.ID, issue.WorkspaceID, "direct") {
-			return db.Issue{}, false
-		}
 		return issue, true
 	}
 
@@ -1011,9 +1079,6 @@ func (h *Handler) loadIssueForUser(w http.ResponseWriter, r *http.Request, issue
 	})
 	if err != nil {
 		writeError(w, http.StatusNotFound, "issue not found")
-		return db.Issue{}, false
-	}
-	if !h.authorizeIssueWindow(w, r, issue.ID, issue.WorkspaceID, "direct") {
 		return db.Issue{}, false
 	}
 	return issue, true
@@ -1185,9 +1250,6 @@ func (h *Handler) loadInboxItemForUser(w http.ResponseWriter, r *http.Request, i
 
 	if item.RecipientType != "member" || uuidToString(item.RecipientID) != userID {
 		writeError(w, http.StatusNotFound, "inbox item not found")
-		return db.InboxItem{}, false
-	}
-	if item.IssueID.Valid && !h.authorizeIssueWindow(w, r, item.IssueID, item.WorkspaceID, "inbox") {
 		return db.InboxItem{}, false
 	}
 	return item, true

@@ -197,6 +197,8 @@ export function KeyboardShortcutsTab() {
         <SettingsCard>
           <FixedShortcutRow label={t(($) => $.shortcuts.fixed.open_settings)} shortcut={createShortcutChord(",", { primary: true })} />
           <FixedShortcutRow label={t(($) => $.shortcuts.fixed.close_tab)} shortcut={createShortcutChord("W", { primary: true })} />
+          <FixedShortcutRow label={t(($) => $.shortcuts.fixed.select_tab_1_to_8)} shortcut={createShortcutChord("1–8", { primary: true })} />
+          <FixedShortcutRow label={t(($) => $.shortcuts.fixed.select_last_tab)} shortcut={createShortcutChord("9", { primary: true })} />
           <FixedShortcutRow label={t(($) => $.shortcuts.fixed.zoom_in)} shortcut={createShortcutChord("Plus", { primary: true })} />
           <FixedShortcutRow label={t(($) => $.shortcuts.fixed.zoom_out)} shortcut={createShortcutChord("Minus", { primary: true })} />
           <FixedShortcutRow label={t(($) => $.shortcuts.fixed.reset_zoom)} shortcut={createShortcutChord("0", { primary: true })} />
@@ -261,7 +263,10 @@ function ShortcutRow({
 }) {
   const { t } = useT("settings");
   const label = t(($) => $.shortcuts.actions[action.id].label);
-  const description = t(($) => $.shortcuts.actions[action.id].description);
+  // Keep descriptions in the search index, but only show non-obvious behavior.
+  const description = ["openSearch", "toggleRightSidebar", "archiveInboxItem", "send"].includes(action.id)
+    ? t(($) => $.shortcuts.actions[action.id].description)
+    : undefined;
   const errorText = error?.kind === "reserved"
     ? t(($) => $.shortcuts.reserved_error)
     : error?.kind === "send"

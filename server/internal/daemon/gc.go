@@ -3,16 +3,19 @@ package daemon
 import (
 	"context"
 	"errors"
+	"fmt"
 	"net/http"
 	"os"
 	"os/exec"
 	"path/filepath"
+	"sort"
 	"strings"
 	"time"
 
 	"github.com/multica-ai/multica/server/internal/daemon/execenv"
 	"github.com/multica-ai/multica/server/internal/daemon/processtree"
 	"github.com/multica-ai/multica/server/internal/daemon/repocache"
+	"github.com/multica-ai/multica/server/internal/issuestatus"
 )
 
 // reposDirName is the bare-repo cache directory inside the workspaces root.
@@ -69,12 +72,13 @@ type gcStats struct {
 	// hermesMemoryStoresReclaimed is counted separately from storesReclaimed:
 	// the two stores hold different things on different TTLs, so folding them
 	// into one number would make either figure unreadable for an operator.
-	hermesMemoryStoresReclaimed  int            // per-agent Hermes memory stores reclaimed past their TTL
-	hermesSessionStoresReclaimed int            // per-conversation Hermes session stores reclaimed past their TTL
-	repoCachesReclaimed          int            // bare repo caches under .repos evicted past their TTL
-	taskTempDirsReclaimed        int            // per-task temp dirs under the temp base reclaimed after their owning execution ended
-	bytesReclaimed               int64          // total bytes freed in this cycle
-	byPattern                    map[string]int // configured basename or managed path label -> reclaim count
+	hermesMemoryStoresReclaimed   int            // per-agent Hermes memory stores reclaimed past their TTL
+	hermesSessionStoresReclaimed  int            // per-conversation Hermes session stores reclaimed past their TTL
+	repoCachesReclaimed           int            // bare repo caches under .repos evicted past their TTL
+	taskTempDirsReclaimed         int            // per-task temp dirs under the temp base reclaimed after their owning execution ended
+	taskRootIndexEntriesReclaimed int            // abandoned stable-root records and unpublished entries reclaimed past the orphan TTL
+	bytesReclaimed                int64          // total bytes freed in this cycle
+	byPattern                     map[string]int // configured basename or managed path label -> reclaim count
 }
 
 // runGC performs a single GC scan across all workspace directories.
@@ -104,6 +108,26 @@ func (d *Daemon) runGC(ctx context.Context) {
 		wsDir := filepath.Join(root, wsEntry.Name())
 		d.gcWorkspace(ctx, wsDir, stats)
 	}
+
+	// Stable-root records are published before the physical env root so a
+	// re-dispatch cannot choose a different readable path. If preparation never
+	// reaches ClaimEnvRoot, no task directory exists for the normal GC walk to
+	// reclaim. Bound those records separately, but only after the orphan grace
+	// period and an authoritative terminal/not-found task check.
+	rootRecordsRemoved, rootRecordsErr := execenv.PruneTaskRootIndex(root, d.cfg.GCOrphanTTL, time.Now(), func(_ string, taskID string) bool {
+		if ctx.Err() != nil || d.client == nil {
+			return false
+		}
+		status, statusErr := d.client.GetTaskGCCheck(ctx, taskID)
+		if statusErr != nil {
+			return isAccessNotFound(statusErr)
+		}
+		return isAgentTaskTerminal(status.Status)
+	})
+	if rootRecordsErr != nil {
+		d.logger.Warn("gc: prune task root index failed", "error", rootRecordsErr)
+	}
+	stats.taskRootIndexEntriesReclaimed += rootRecordsRemoved
 
 	// Prune stale worktree references from all bare repo caches, then evict the
 	// caches nothing needs anymore. These live outside any workspace directory
@@ -150,7 +174,7 @@ func (d *Daemon) runGC(ctx context.Context) {
 		}
 	}
 
-	if stats.cleaned > 0 || stats.orphaned > 0 || stats.artifactDirs > 0 || stats.storesReclaimed > 0 || stats.hermesMemoryStoresReclaimed > 0 || stats.hermesSessionStoresReclaimed > 0 || stats.repoCachesReclaimed > 0 || stats.taskTempDirsReclaimed > 0 {
+	if stats.cleaned > 0 || stats.orphaned > 0 || stats.artifactDirs > 0 || stats.storesReclaimed > 0 || stats.hermesMemoryStoresReclaimed > 0 || stats.hermesSessionStoresReclaimed > 0 || stats.repoCachesReclaimed > 0 || stats.taskTempDirsReclaimed > 0 || stats.taskRootIndexEntriesReclaimed > 0 {
 		d.logger.Info("gc: cycle complete",
 			"cleaned", stats.cleaned,
 			"orphaned", stats.orphaned,
@@ -162,6 +186,7 @@ func (d *Daemon) runGC(ctx context.Context) {
 			"hermes_session_stores_reclaimed", stats.hermesSessionStoresReclaimed,
 			"repo_caches_reclaimed", stats.repoCachesReclaimed,
 			"task_temp_dirs_reclaimed", stats.taskTempDirsReclaimed,
+			"task_root_index_entries_reclaimed", stats.taskRootIndexEntriesReclaimed,
 			"bytes_reclaimed", stats.bytesReclaimed,
 			"by_pattern", stats.byPattern,
 		)
@@ -177,7 +202,7 @@ func (d *Daemon) gcWorkspace(ctx context.Context, wsDir string, stats *gcStats) 
 	}
 
 	cleanedHere := 0
-	issueCandidates := make([]issueGCCandidate, 0, len(taskEntries))
+	issueCandidatesByWorkspace := make(map[string][]issueGCCandidate)
 	for _, entry := range taskEntries {
 		if ctx.Err() != nil {
 			return
@@ -192,13 +217,25 @@ func (d *Daemon) gcWorkspace(ctx context.Context, wsDir string, stats *gcStats) 
 		}
 		meta, metaErr := execenv.ReadGCMeta(taskDir)
 		if metaErr == nil && meta.Kind == execenv.GCKindIssue && strings.TrimSpace(meta.IssueID) != "" {
-			issueCandidates = append(issueCandidates, issueGCCandidate{taskDir: taskDir, meta: meta})
-			continue
+			if workspaceID := strings.TrimSpace(meta.WorkspaceID); workspaceID != "" {
+				issueCandidatesByWorkspace[workspaceID] = append(
+					issueCandidatesByWorkspace[workspaceID],
+					issueGCCandidate{taskDir: taskDir, meta: meta},
+				)
+				continue
+			}
 		}
 		action := d.shouldCleanTaskDir(ctx, taskDir)
 		cleanedHere += d.applyGCAction(taskDir, action, stats)
 	}
-	cleanedHere += d.gcWorkspaceIssues(ctx, filepath.Base(wsDir), issueCandidates, stats)
+	workspaceIDs := make([]string, 0, len(issueCandidatesByWorkspace))
+	for workspaceID := range issueCandidatesByWorkspace {
+		workspaceIDs = append(workspaceIDs, workspaceID)
+	}
+	sort.Strings(workspaceIDs)
+	for _, workspaceID := range workspaceIDs {
+		cleanedHere += d.gcWorkspaceIssues(ctx, workspaceID, issueCandidatesByWorkspace[workspaceID], stats)
+	}
 
 	// Remove the workspace directory itself if it's now empty.
 	if cleanedHere > 0 {
@@ -285,21 +322,41 @@ func (d *Daemon) gcWorkspaceIssues(ctx context.Context, workspaceID string, cand
 // reconciliation request is in flight.
 func (d *Daemon) applyGCAction(taskDir string, action gcAction, stats *gcStats) int {
 	if action != gcActionSkip {
+		if _, err := d.gcTaskDirOwner(taskDir); err != nil {
+			d.logger.Warn("gc: refusing to mutate unowned task directory", "dir", taskDir, "error", err)
+			stats.skipped++
+			return 0
+		}
 		release, ok := d.reserveEnvRootForGC(taskDir)
 		if !ok {
 			stats.skipped++
 			return 0
 		}
 		defer release()
+		// Re-read provenance after taking the exclusion lock so a concurrent
+		// reset cannot change ownership between validation and mutation.
+		if _, err := d.gcTaskDirOwner(taskDir); err != nil {
+			d.logger.Warn("gc: refusing to mutate task directory after ownership changed", "dir", taskDir, "error", err)
+			stats.skipped++
+			return 0
+		}
 	}
 	switch action {
 	case gcActionClean:
-		bytes := d.cleanTaskDir(taskDir)
+		bytes, removed := d.cleanTaskDir(taskDir)
+		if !removed {
+			stats.skipped++
+			return 0
+		}
 		stats.cleaned++
 		stats.bytesReclaimed += bytes
 		return 1
 	case gcActionOrphan:
-		bytes := d.cleanTaskDir(taskDir)
+		bytes, removed := d.cleanTaskDir(taskDir)
+		if !removed {
+			stats.skipped++
+			return 0
+		}
 		stats.orphaned++
 		stats.bytesReclaimed += bytes
 		return 1
@@ -358,6 +415,10 @@ func (d *Daemon) shouldCleanTaskDir(ctx context.Context, taskDir string) gcActio
 
 	meta, err := execenv.ReadGCMeta(taskDir)
 	if err != nil {
+		if _, ownerErr := d.gcTaskDirOwner(taskDir); ownerErr != nil {
+			d.logger.Warn("gc: skipping directory without valid task ownership", "dir", taskDir, "error", ownerErr)
+			return gcActionSkip
+		}
 		return d.orphanByMTime(taskDir, "no meta")
 	}
 
@@ -512,6 +573,7 @@ func (d *Daemon) gcDecisionIssue(ctx context.Context, taskDir string, meta *exec
 		ID:        meta.IssueID,
 		Found:     true,
 		Status:    status.Status,
+		Category:  status.Category,
 		UpdatedAt: status.UpdatedAt,
 	})
 }
@@ -521,11 +583,9 @@ func (d *Daemon) gcDecisionIssueResult(taskDir string, meta *execenv.GCMeta, res
 		return d.orphanByMTime(taskDir, "issue not accessible")
 	}
 
-	// result.Status is a CATEGORY, normalized server-side, so this literal
-	// comparison covers custom statuses too — an issue on a `done`-category
-	// custom status is terminal here. (MUL-6243)
-	if (result.Status == "done" || result.Status == "cancelled") &&
-		time.Since(result.UpdatedAt) > d.cfg.GCTTL {
+	terminal, recognized := issueGCLifecycle(result)
+
+	if terminal && time.Since(result.UpdatedAt) > d.cfg.GCTTL {
 		d.logger.Info("gc: eligible for cleanup",
 			"dir", filepath.Base(taskDir),
 			"kind", "issue",
@@ -547,7 +607,7 @@ func (d *Daemon) gcDecisionIssueResult(taskDir string, meta *execenv.GCMeta, res
 	if d.cfg.GCCompletedTaskTTL > 0 &&
 		!meta.LocalDirectory &&
 		!meta.CompletedAt.IsZero() &&
-		isKnownIssueStatus(result.Status) &&
+		recognized &&
 		time.Since(meta.CompletedAt) > d.cfg.GCCompletedTaskTTL {
 		d.logger.Info("gc: completed task eligible for full cleanup",
 			"dir", filepath.Base(taskDir),
@@ -592,17 +652,39 @@ func (d *Daemon) gcDecisionIssueResult(taskDir string, meta *execenv.GCMeta, res
 	return gcActionSkip
 }
 
-// isKnownIssueStatus mirrors the issue status constraint enforced by the
-// server. Full task cleanup must fail closed when an older daemon receives a
-// future status or a malformed response from the GC check endpoint.
+// issueGCLifecycle answers the only two questions GC asks about a parent issue:
+// is it terminal, and was the answer well-formed? Everything else about a
+// status — parked, in review, blocked — is execution policy the daemon has no
+// business reading.
 //
-// The 7 names below stay correct after custom statuses (MUL-6243) because the
-// gc-check endpoints answer with the status's CATEGORY, not the stored key —
-// see BatchIssueGCCheck / GetIssueGCCheck, which resolve through
-// issuestatus.Effective. Do not teach this function about custom statuses: an
-// installed daemon has no catalog to resolve them against, and daemons
-// predating the feature must keep making correct decisions against an upgraded
-// server. Pinned by TestIssueGCChecksReportCategoryNotRawCustomStatus.
+// `category` is the real answer and wins whenever it is one of the four: those
+// values cover a workspace's custom statuses too, so a `closed`-category custom
+// status is terminal here without this binary knowing the key exists.
+//
+// A missing or unrecognized category — a server predating MUL-7364, a
+// malformed response, a lifecycle value newer than this daemon — falls back to
+// the legacy seven-value `status` enum, which the server keeps populated for
+// exactly this reason and which fails closed on its own. Full cleanup is
+// irreversible, so a lookup that did not really answer must not read as one.
+func issueGCLifecycle(result IssueGCCheckResult) (terminal, recognized bool) {
+	if issuestatus.IsCategory(result.Category) {
+		return result.Category == issuestatus.CategoryDone || result.Category == issuestatus.CategoryClosed, true
+	}
+	return result.Status == issuestatus.Done || result.Status == issuestatus.Cancelled,
+		isKnownIssueStatus(result.Status)
+}
+
+// isKnownIssueStatus is the pre-MUL-7364 fallback vocabulary: the seven
+// built-in status keys, which is all the `status` field of a gc-check response
+// may ever contain.
+//
+// Do not teach it about custom statuses or about the four lifecycle categories.
+// An installed daemon has no catalog to resolve a custom key against, so the
+// server projects every status back onto these seven for this field
+// (issueGCWire in handler/daemon.go) precisely so daemons predating custom
+// statuses keep making correct decisions against an upgraded server. A daemon
+// that wants the lifecycle reads `category` instead — see issueGCLifecycle.
+// Pinned by TestIssueGCChecksReportWireStatusNotRawCustomStatus.
 func isKnownIssueStatus(status string) bool {
 	switch status {
 	case "backlog", "todo", "in_progress", "in_review", "done", "blocked", "cancelled":
@@ -779,17 +861,60 @@ func isAgentTaskTerminal(status string) bool {
 	}
 }
 
-// cleanTaskDir removes a task directory, logs the reclaimed bytes, and returns
-// that count for the cycle summary. A failed removal reports zero reclaimed.
-func (d *Daemon) cleanTaskDir(taskDir string) int64 {
-	bytes := dirSize(taskDir)
+// gcTaskDirOwner returns authoritative provenance only when both the marker
+// and its position under WorkspacesRoot agree. Missing GC metadata is not
+// ownership proof: partially prepared roots have .task_owner, while arbitrary
+// user directories do not.
+func (d *Daemon) gcTaskDirOwner(taskDir string) (*execenv.EnvRootOwner, error) {
+	owner, err := execenv.ReadEnvRootOwner(taskDir)
+	if err != nil {
+		return nil, fmt.Errorf("read task owner: %w", err)
+	}
+	if owner == nil {
+		return nil, errors.New("task owner is missing")
+	}
+	validated := *owner
+	if validated.WorkspaceID == "" && validated.TaskID != "" {
+		// Legacy owner markers contain only the task ID. Completion metadata can
+		// supply the missing workspace identity without weakening the hard
+		// requirement that a Prepare-time owner marker exists.
+		meta, metaErr := execenv.ReadGCMeta(taskDir)
+		if metaErr != nil || strings.TrimSpace(meta.WorkspaceID) == "" {
+			return nil, errors.New("legacy task owner has no workspace identity or valid GC metadata")
+		}
+		validated.WorkspaceID = strings.TrimSpace(meta.WorkspaceID)
+	}
+	if err := execenv.ValidateEnvRootOwnerPath(d.cfg.WorkspacesRoot, taskDir, validated); err != nil {
+		return nil, err
+	}
+	return &validated, nil
+}
+
+// cleanTaskDir removes a proven daemon-owned task directory, logs the
+// reclaimed bytes, and returns that count for the cycle summary. A failed or
+// refused removal reports removed=false.
+func (d *Daemon) cleanTaskDir(taskDir string) (bytes int64, removed bool) {
+	// Measure first, prove ownership second. dirSize walks the entire tree,
+	// which on a large task directory takes long enough for the validated
+	// directory to be replaced underneath us — checking before that walk would
+	// hand RemoveAll a path last proven ours tens of seconds earlier. This is
+	// the defense-in-depth check, so it sits immediately before the removal.
+	bytes = dirSize(taskDir)
+	owner, ownerErr := d.gcTaskDirOwner(taskDir)
+	if ownerErr != nil {
+		d.logger.Warn("gc: refusing to remove unowned task directory", "dir", taskDir, "error", ownerErr)
+		return 0, false
+	}
 	if err := os.RemoveAll(taskDir); err != nil {
 		d.logger.Warn("gc: remove task dir failed", "dir", taskDir, "error", err)
-		return 0
+		return 0, false
 	} else {
 		d.logger.Info("gc: removed", "dir", taskDir, "bytes_reclaimed", bytes)
 	}
-	return bytes
+	if err := execenv.RemoveRootDirRecord(d.cfg.WorkspacesRoot, taskDir, *owner); err != nil {
+		d.logger.Warn("gc: remove stable task root record failed", "dir", taskDir, "error", err)
+	}
+	return bytes, true
 }
 
 // linkedDirModes are the mode bits that mark a directory entry as a link to

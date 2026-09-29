@@ -273,9 +273,13 @@ function SourceBackfillDialogBody({
       onComplete();
     } catch (err) {
       setBusy(false);
-      toast.error(err instanceof Error ? err.message : "Failed to save");
+      toast.error(
+        err instanceof Error
+          ? err.message
+          : t(($) => $.source_backfill.save_failed_toast),
+      );
     }
-  }, [canSubmit, answers.source, answers.source_other, onComplete]);
+  }, [canSubmit, answers.source, answers.source_other, onComplete, t]);
 
   const skip = useCallback(async () => {
     if (busy) return;
@@ -293,9 +297,13 @@ function SourceBackfillDialogBody({
       onComplete();
     } catch (err) {
       setBusy(false);
-      toast.error(err instanceof Error ? err.message : "Failed to save");
+      toast.error(
+        err instanceof Error
+          ? err.message
+          : t(($) => $.source_backfill.save_failed_toast),
+      );
     }
-  }, [busy, onComplete]);
+  }, [busy, onComplete, t]);
 
   return (
     <DialogContent className="sm:max-w-2xl p-0 gap-0 overflow-hidden">
@@ -348,9 +356,7 @@ function SourceBackfillDialogBody({
           aria-live="polite"
           className="mr-auto text-caption text-muted-foreground"
         >
-          {canSubmit
-            ? t(($) => $.source_backfill.hint_ready)
-            : t(($) => $.step_question.hint_pick)}
+          {t(($) => $.step_question.hint_pick)}
         </span>
         <div className="flex items-center gap-2">
           <Button variant="secondary" disabled={busy} onClick={skip}>

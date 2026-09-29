@@ -7,6 +7,7 @@ import {
   aggregateByDate,
   aggregateByWeek,
   aggregateCostByModel,
+  cacheHitRatePercent,
   collectUnmappedModels,
   computeCostInWindow,
   estimateCost,
@@ -32,6 +33,21 @@ const zeroUsage = {
   cache_read_tokens: 0,
   cache_write_tokens: 0,
 };
+
+describe("cacheHitRatePercent", () => {
+  it("includes cache writes in the input-side denominator", () => {
+    expect(cacheHitRatePercent(0, 72, 28)).toBe(72);
+  });
+
+  it("does not round an incomplete hit rate up to 100%", () => {
+    expect(cacheHitRatePercent(45, 9_955, 0)).toBe(99);
+    expect(cacheHitRatePercent(0, 10_000, 0)).toBe(100);
+  });
+
+  it("returns null when there are no input-side tokens", () => {
+    expect(cacheHitRatePercent(0, 0, 0)).toBeNull();
+  });
+});
 
 describe("isSelfHealingRuntime", () => {
   function makeRuntime(overrides: Partial<AgentRuntime>): AgentRuntime {
@@ -146,6 +162,20 @@ describe("estimateCost", () => {
     expect(cost).toBeCloseTo(10 + 50 + 1 + 12.5, 5);
   });
 
+  it("prices Claude Fable 5.1 at the Mythos-class tier with quarter-rate cache reads", () => {
+    // Same $10 / $50 and $12.50 cache write as Fable 5, but cache reads are
+    // 0.025x input ($0.25) rather than the usual 0.1x.
+    const cost = estimateCost({
+      ...zeroUsage,
+      model: "claude-fable-5-1",
+      input_tokens: 1_000_000,
+      output_tokens: 1_000_000,
+      cache_read_tokens: 1_000_000,
+      cache_write_tokens: 1_000_000,
+    });
+    expect(cost).toBeCloseTo(10 + 50 + 0.25 + 12.5, 5);
+  });
+
   it("prices Claude Sonnet 5 at Anthropic's intro $2 / $10 tier", () => {
     const cost = estimateCost({
       ...zeroUsage,
@@ -235,6 +265,30 @@ describe("estimateCost", () => {
     }
   });
 
+  it("prices Opus 5.5 at its own 4/20 tier with 0.05x cache reads, not Opus 5's", () => {
+    // Opus 5.5 is cheaper than Opus 5 ($4 / $20, $5 cache write) and prices
+    // cache reads at 0.05x input ($0.20) instead of the usual 0.1x. Copilot
+    // reports it dotted, so every spelling must reach the 5.5 row.
+    for (const model of [
+      "claude-opus-5-5",
+      "claude-opus-5-5[1m]",
+      "claude-opus-5.5",
+      "anthropic/claude-opus-5-5",
+    ]) {
+      expect(
+        estimateCost({
+          ...zeroUsage,
+          model,
+          input_tokens: 1_000_000,
+          output_tokens: 1_000_000,
+          cache_read_tokens: 1_000_000,
+          cache_write_tokens: 1_000_000,
+        }),
+      ).toBeCloseTo(4 + 20 + 0.2 + 5, 5);
+      expect(isModelPriced(model)).toBe(true);
+    }
+  });
+
   it("prices each dotted Codex catalog SKU at its own tier, not gpt-5", () => {
     // Every dotted minor version is priced independently. The resolver does
     // exact-match-after-date-strip (no startsWith fallback), so each row
@@ -270,6 +324,7 @@ describe("estimateCost", () => {
     // can't hide behind an input-only assertion. `total` is 1M of each of the
     // four categories priced at its own rate.
     const cases = [
+      { model: "gpt-6-astra", input: 10, cacheRead: 1, cacheWrite: 12.5, output: 50, total: 73.5 },
       { model: "gpt-5.6-sol", input: 5, cacheRead: 0.5, cacheWrite: 6.25, output: 30, total: 41.75 },
       { model: "gpt-5.6-terra", input: 2.5, cacheRead: 0.25, cacheWrite: 3.125, output: 15, total: 20.875 },
       { model: "gpt-5.6-luna", input: 1, cacheRead: 0.1, cacheWrite: 1.25, output: 6, total: 8.35 },
@@ -326,6 +381,8 @@ describe("estimateCost", () => {
     // literal-dot alias in server/internal/metrics/pricing.go (MUL-4347).
     expect(isModelPriced("gpt-5-6-luna")).toBe(false);
     expect(isModelPriced("gpt-5-6-sol")).toBe(false);
+    expect(isModelPriced("gpt-6-astra")).toBe(true);
+    expect(isModelPriced("gpt-6-astra-pro")).toBe(false);
     expect(
       estimateCost({
         ...zeroUsage,
@@ -333,6 +390,106 @@ describe("estimateCost", () => {
         input_tokens: 1_000_000,
       }),
     ).toBe(0);
+  });
+
+  it("strips `provider:model` routing prefixes (Hermes custom providers) before resolving", () => {
+    // Regression: canonicalCandidates only stripped `/` prefixes, so Hermes
+    // ids like `alibaba-coding-plan:qwen3.8-max` and `custom:ark-code-latest`
+    // never resolved and stayed uncosted. `:` must be stripped like `/`.
+    const cost = estimateCost({
+      ...zeroUsage,
+      provider: "hermes",
+      model: "alibaba-coding-plan:qwen3.8-max",
+      input_tokens: 1_000_000,
+      output_tokens: 1_000_000,
+      cache_read_tokens: 1_000_000,
+      cache_write_tokens: 1_000_000,
+    });
+    // 1M × $2 + 1M × $6 + 1M × $0.17 + 1M × $2.50 = $10.67.
+    expect(cost).toBeCloseTo(10.67, 5);
+    // `ark-code-latest` is a rolling Volcengine alias, not a stable model
+    // identity, so it is deliberately unmapped after the prefix strip.
+    expect(isModelPriced("custom:ark-code-latest", "hermes")).toBe(false);
+    expect(isModelPriced("kimi-coding:kimi-k3", "hermes")).toBe(true);
+  });
+
+  it("prices the Qwen / Kimi models added from models.dev", () => {
+    expect(
+      estimateCost({
+        ...zeroUsage,
+        model: "qwen3.7-plus",
+        input_tokens: 1_000_000,
+        output_tokens: 1_000_000,
+      }),
+    ).toBeCloseTo(2.0, 5); // $0.40 + $1.60 (International ≤256K tier)
+    expect(
+      estimateCost({
+        ...zeroUsage,
+        model: "kimi-code/k3",
+        provider: "kimi",
+        input_tokens: 1_000_000,
+        output_tokens: 1_000_000,
+      }),
+    ).toBeCloseTo(18, 5); // kimi/k3 → $3 + $15
+    expect(
+      estimateCost({
+        ...zeroUsage,
+        model: "qwen3.6-flash",
+        input_tokens: 1_000_000,
+        output_tokens: 1_000_000,
+      }),
+    ).toBeCloseTo(1.75, 5); // $0.25 + $1.50 (International ≤256K tier)
+    // `ark-code-latest` is a rolling Volcengine alias (target switched in
+    // the console, possibly across model families), not a stable model
+    // identity — it stays unmapped like grok-composer-*.
+    expect(isModelPriced("ark-code-latest")).toBe(false);
+  });
+
+  it("keeps subscription-only and preview SKUs distinct from their GA siblings", () => {
+    // qwen3.8-max-preview is subscription-priced at 0; it must NOT inherit
+    // qwen3.8-max's $2/$6 tier, and `qwen3.8-max-preview[1m]` must resolve
+    // to the preview row after the context-tag strip.
+    expect(
+      estimateCost({
+        ...zeroUsage,
+        model: "qwen3.8-max-preview[1m]",
+        input_tokens: 1_000_000,
+      }),
+    ).toBe(0);
+    expect(
+      estimateCost({
+        ...zeroUsage,
+        model: "qwen3.8-max",
+        input_tokens: 1_000_000,
+      }),
+    ).toBeCloseTo(2, 5);
+  });
+
+  it("iteratively strips nested routing prefixes (custom:anthropic/claude-opus-4.7)", () => {
+    // Regression for the review blocker: stripProvider used to peel a single
+    // `/` or `:` layer, so a Hermes-style `custom:anthropic/claude-opus-4.7`
+    // stopped at `anthropic/claude-opus-4.7` and missed the table while the
+    // backend substring rules matched it. Iterative peeling must resolve it
+    // to the Opus tier: 1M × $5 + 1M × $25 = $30.
+    const cost = estimateCost({
+      ...zeroUsage,
+      provider: "hermes",
+      model: "custom:anthropic/claude-opus-4.7",
+      input_tokens: 1_000_000,
+      output_tokens: 1_000_000,
+    });
+    expect(cost).toBeCloseTo(30, 5);
+    expect(isModelPriced("custom:anthropic/claude-opus-4.7", "hermes")).toBe(true);
+  });
+
+  it("keeps unknown suffixed Qwen variants unmapped (anchored aliases)", () => {
+    // Regression for the review blocker: the backend alias regexes were
+    // unanchored substrings, so `qwen3.7-plus-extra` / `qwen3.8-max-preview-extra`
+    // silently borrowed a tier. The frontend exact matcher must agree and
+    // leave them unmapped so both sides surface the same diagnostics.
+    expect(isModelPriced("qwen3.7-plus-extra")).toBe(false);
+    expect(isModelPriced("qwen3.6-flash-extra")).toBe(false);
+    expect(isModelPriced("qwen3.8-max-preview-extra")).toBe(false);
   });
 
   it("returns 0 for a genuinely unknown model so the UI can flag it", () => {
@@ -786,6 +943,7 @@ describe("isModelPriced", () => {
   it("recognises both Claude and Codex/GPT families", () => {
     expect(isModelPriced("claude-sonnet-5")).toBe(true);
     expect(isModelPriced("claude-fable-5")).toBe(true);
+    expect(isModelPriced("claude-fable-5-1")).toBe(true);
     expect(isModelPriced("claude-sonnet-4-6")).toBe(true);
     expect(isModelPriced("gpt-5-codex")).toBe(true);
     expect(isModelPriced("gpt-5-mini")).toBe(true);
@@ -799,6 +957,7 @@ describe("isModelPriced", () => {
     // hit the same catalog row, otherwise Copilot-routed usage gets bucketed
     // as "unmapped" and the user has to type the price in by hand.
     expect(isModelPriced("claude-sonnet-5")).toBe(true);
+    expect(isModelPriced("claude-fable-5.1")).toBe(true);
     expect(isModelPriced("claude-haiku-4.5")).toBe(true);
     expect(isModelPriced("claude-sonnet-4.5")).toBe(true);
     expect(isModelPriced("claude-sonnet-4.6")).toBe(true);
@@ -812,6 +971,7 @@ describe("isModelPriced", () => {
     // The provider prefix is routing metadata, not part of the SKU.
     expect(isModelPriced("anthropic/claude-sonnet-5")).toBe(true);
     expect(isModelPriced("anthropic/claude-fable-5")).toBe(true);
+    expect(isModelPriced("anthropic/claude-fable-5-1")).toBe(true);
     expect(isModelPriced("anthropic/claude-opus-4.7")).toBe(true);
     expect(isModelPriced("anthropic/claude-sonnet-4-6")).toBe(true);
   });

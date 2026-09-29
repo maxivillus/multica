@@ -84,6 +84,7 @@ import { FileUploadButton } from "@multica/ui/components/common/file-upload-butt
 import { useT } from "../i18n";
 import { matchesPinyin } from "../editor/extensions/pinyin-match";
 import { SourceContextPreviewCard, useSourceContextFailureMessage } from "./source-context-preview";
+import { useIssueLimitUpgradePrompt } from "./use-issue-limit-upgrade-prompt";
 
 type ActorSelection =
   | { type: "agent"; id: string }
@@ -135,6 +136,7 @@ export function AgentCreatePanel({
     : undefined;
   const onSourceContextExpandedChange = data?.source_context_on_expanded_change as ((expanded: boolean) => void) | undefined;
   const sourceContextFailureMessage = useSourceContextFailureMessage();
+  const showIssueLimitUpgradePrompt = useIssueLimitUpgradePrompt();
   const userId = useAuthStore((s) => s.user?.id);
   const { data: members = [] } = useQuery(memberListOptions(wsId));
   const { data: agents = [] } = useQuery(agentListOptions(wsId));
@@ -336,6 +338,16 @@ export function AgentCreatePanel({
         : undefined,
     [runtimes, selectedAgent?.runtime_id],
   );
+  // We can only pre-check a version we can actually see. A non-admin member's
+  // runtime list (ListVisibleAgentRuntimes) omits other members' private
+  // machines, so a selected agent bound to such a runtime yields no row here.
+  // That absence is "unknown version", NOT "daemon reported no version": the
+  // two must not collapse, or the member gets the misleading "upgrade your
+  // daemon" wall for a runtime that is in fact new enough (#7633). When we
+  // can't pre-check, defer to the server's authoritative gate
+  // (checkQuickCreateDaemonVersion, which reads the row by id regardless of
+  // role) instead of failing closed in the UI.
+  const canPrecheckVersion = selectedAgent?.runtime_id != null && selectedRuntime != null;
   const runtimeCliVersion = readRuntimeCliVersion(selectedRuntime?.metadata);
   const baseVersionCheck = useMemo(
     () => checkQuickCreateCliVersion(runtimeCliVersion),
@@ -348,8 +360,9 @@ export function AgentCreatePanel({
   const usesExplicitFields = priority !== "none" || dueDate !== null;
   const versionCheck = usesExplicitFields ? fieldVersionCheck : baseVersionCheck;
   const versionBlocked =
-    baseVersionCheck.state !== "ok" ||
-    (usesExplicitFields && fieldVersionCheck.state !== "ok");
+    canPrecheckVersion &&
+    (baseVersionCheck.state !== "ok" ||
+      (usesExplicitFields && fieldVersionCheck.state !== "ok"));
 
   const initialPrompt = draft.agent.prompt || (data?.prompt as string) || "";
   // The editor is uncontrolled — we read the latest markdown via the ref at
@@ -465,6 +478,10 @@ export function AgentCreatePanel({
             current_version?: string;
             min_version?: string;
           };
+          if (body.code === "issue_limit_reached") {
+            showIssueLimitUpgradePrompt();
+            return false;
+          }
           if (body.code === "agent_unavailable") {
             setError(body.reason || t(($) => $.create_issue.agent.error_agent_unavailable_fallback));
             return false;
@@ -581,7 +598,7 @@ export function AgentCreatePanel({
     onSwitchMode?.(Object.keys(carry).length > 0 ? carry : null);
   };
 
-  // Field visibility lives in Settings → Issue. Persist the prompt draft
+  // Field visibility lives in Settings → Preferences → Issue creation. Persist the prompt draft
   // before leaving so what the user typed survives the round-trip, then
   // close — the dialog would otherwise linger over the settings page.
   const openFieldSettings = (e: React.MouseEvent) => {
@@ -803,7 +820,7 @@ export function AgentCreatePanel({
               <DropdownMenuItem
                 render={
                   <AppLink
-                    href={`${workspacePaths.settings()}?tab=issue`}
+                    href={`${workspacePaths.settings()}?tab=preferences&section=issue`}
                     onClick={openFieldSettings}
                   />
                 }

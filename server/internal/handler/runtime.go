@@ -14,6 +14,8 @@ import (
 	"github.com/go-chi/chi/v5"
 	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgtype"
+	obsmetrics "github.com/multica-ai/multica/server/internal/metrics"
+	"github.com/multica-ai/multica/server/internal/service"
 	"github.com/multica-ai/multica/server/internal/util"
 	"github.com/multica-ai/multica/server/pkg/agent"
 	db "github.com/multica-ai/multica/server/pkg/db/generated"
@@ -109,18 +111,8 @@ type RuntimeUsageResponse struct {
 // same tool).
 func (h *Handler) GetRuntimeUsage(w http.ResponseWriter, r *http.Request) {
 	runtimeID := chi.URLParam(r, "runtimeId")
-	runtimeUUID, ok := parseUUIDOrBadRequest(w, runtimeID, "runtime_id")
+	rt, _, ok := h.requireRuntimeReadAccess(w, r, obsmetrics.RuntimeLookupSourceRuntimeAPI, runtimeID)
 	if !ok {
-		return
-	}
-
-	rt, err := h.Queries.GetAgentRuntime(r.Context(), runtimeUUID)
-	if err != nil {
-		writeError(w, http.StatusNotFound, "runtime not found")
-		return
-	}
-
-	if _, ok := h.requireWorkspaceMember(w, r, uuidToString(rt.WorkspaceID), "runtime not found"); !ok {
 		return
 	}
 
@@ -173,18 +165,8 @@ func (h *Handler) listRuntimeUsage(ctx context.Context, runtimeID pgtype.UUID, t
 // GetRuntimeTaskActivity returns hourly task activity distribution for a runtime.
 func (h *Handler) GetRuntimeTaskActivity(w http.ResponseWriter, r *http.Request) {
 	runtimeID := chi.URLParam(r, "runtimeId")
-	runtimeUUID, ok := parseUUIDOrBadRequest(w, runtimeID, "runtime_id")
+	rt, _, ok := h.requireRuntimeReadAccess(w, r, obsmetrics.RuntimeLookupSourceRuntimeAPI, runtimeID)
 	if !ok {
-		return
-	}
-
-	rt, err := h.Queries.GetAgentRuntime(r.Context(), runtimeUUID)
-	if err != nil {
-		writeError(w, http.StatusNotFound, "runtime not found")
-		return
-	}
-
-	if _, ok := h.requireWorkspaceMember(w, r, uuidToString(rt.WorkspaceID), "runtime not found"); !ok {
 		return
 	}
 
@@ -241,18 +223,8 @@ type RuntimeUsageByAgentResponse struct {
 // since the cutoff window. Drives the runtime-detail "Cost by agent" tab.
 func (h *Handler) GetRuntimeUsageByAgent(w http.ResponseWriter, r *http.Request) {
 	runtimeID := chi.URLParam(r, "runtimeId")
-	runtimeUUID, ok := parseUUIDOrBadRequest(w, runtimeID, "runtime_id")
+	rt, _, ok := h.requireRuntimeReadAccess(w, r, obsmetrics.RuntimeLookupSourceRuntimeAPI, runtimeID)
 	if !ok {
-		return
-	}
-
-	rt, err := h.Queries.GetAgentRuntime(r.Context(), runtimeUUID)
-	if err != nil {
-		writeError(w, http.StatusNotFound, "runtime not found")
-		return
-	}
-
-	if _, ok := h.requireWorkspaceMember(w, r, uuidToString(rt.WorkspaceID), "runtime not found"); !ok {
 		return
 	}
 
@@ -323,18 +295,8 @@ type RuntimeUsageByHourResponse struct {
 // `?tz=` param or the authenticated user's stored user.timezone.
 func (h *Handler) GetRuntimeUsageByHour(w http.ResponseWriter, r *http.Request) {
 	runtimeID := chi.URLParam(r, "runtimeId")
-	runtimeUUID, ok := parseUUIDOrBadRequest(w, runtimeID, "runtime_id")
+	rt, _, ok := h.requireRuntimeReadAccess(w, r, obsmetrics.RuntimeLookupSourceRuntimeAPI, runtimeID)
 	if !ok {
-		return
-	}
-
-	rt, err := h.Queries.GetAgentRuntime(r.Context(), runtimeUUID)
-	if err != nil {
-		writeError(w, http.StatusNotFound, "runtime not found")
-		return
-	}
-
-	if _, ok := h.requireWorkspaceMember(w, r, uuidToString(rt.WorkspaceID), "runtime not found"); !ok {
 		return
 	}
 
@@ -531,7 +493,7 @@ func (h *Handler) UpdateAgentRuntime(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	rt, err := h.Queries.GetAgentRuntime(r.Context(), runtimeUUID)
+	rt, err := h.getAgentRuntime(r.Context(), obsmetrics.RuntimeLookupSourceRuntimeAPI, runtimeUUID)
 	if err != nil {
 		writeError(w, http.StatusNotFound, "runtime not found")
 		return
@@ -670,20 +632,233 @@ func canEditRuntime(member db.Member, rt db.AgentRuntime) bool {
 	return rt.OwnerID.Valid && uuidToString(rt.OwnerID) == uuidToString(member.UserID)
 }
 
-func (h *Handler) runtimeHasLiveProfile(ctx context.Context, rt db.AgentRuntime) (bool, error) {
-	if !rt.ProfileID.Valid {
-		return false, nil
+// getAgentRuntime reads one agent_runtime row by id and attributes the read to
+// source, which labels multica_agent_runtime_lookup_total (MUL-6884). Pick the
+// obsmetrics.RuntimeLookupSource* constant that names the product behaviour
+// driving the read, not the file the call happens to live in: a poll loop
+// counted as generic API traffic is exactly the confusion the metric exists to
+// remove.
+func (h *Handler) getAgentRuntime(ctx context.Context, source string, id pgtype.UUID) (db.AgentRuntime, error) {
+	return h.runtimeLookup(source).Get(ctx, id)
+}
+
+// getAgentRuntimes is the batch sibling of getAgentRuntime: one query for many
+// ids, attributed to source the same way (MUL-6788). It returns the rows keyed
+// by canonical UUID string and surfaces the read error so batch callers fail
+// closed instead of treating a failed read as "no rows exist".
+func (h *Handler) getAgentRuntimes(ctx context.Context, source string, ids []pgtype.UUID) (map[string]db.AgentRuntime, error) {
+	return h.runtimeLookup(source).GetMany(ctx, ids)
+}
+
+// runtimeLookup is the same reader, unexecuted, for handlers that hand it to a
+// shared readiness helper instead of reading the row themselves.
+func (h *Handler) runtimeLookup(source string) service.RuntimeLookup {
+	return service.RuntimeLookup{Queries: h.Queries, Metrics: h.Metrics, Source: source}
+}
+
+// requireRuntimeReadAccess protects runtime data and machine-triggering
+// capabilities. Governance access is deliberately separate: workspace owners
+// and admins may list, rename, or delete another member's private runtime,
+// but a private machine is readable or usable only by its owner. Returning
+// 404 for that case prevents a known runtime ID from becoming an oracle.
+//
+// source names the product behaviour behind the read for
+// multica_agent_runtime_lookup_total (MUL-6884). It matters here more than
+// anywhere else: this one gate serves both a rarely-opened usage tab and
+// several 500ms browser poll loops, and counting them together would hide the
+// polling the metric exists to measure.
+func (h *Handler) requireRuntimeReadAccess(w http.ResponseWriter, r *http.Request, source, runtimeID string) (db.AgentRuntime, db.Member, bool) {
+	runtimeUUID, ok := parseUUIDOrBadRequest(w, runtimeID, "runtime_id")
+	if !ok {
+		return db.AgentRuntime{}, db.Member{}, false
 	}
-	if _, err := h.Queries.GetRuntimeProfileForWorkspace(ctx, db.GetRuntimeProfileForWorkspaceParams{
+
+	rt, err := h.getAgentRuntime(r.Context(), source, runtimeUUID)
+	if err != nil {
+		writeError(w, http.StatusNotFound, "runtime not found")
+		return db.AgentRuntime{}, db.Member{}, false
+	}
+
+	member, ok := h.requireWorkspaceMember(w, r, uuidToString(rt.WorkspaceID), "runtime not found")
+	if !ok || !canUseRuntimeForAgent(member, rt) {
+		if ok {
+			writeError(w, http.StatusNotFound, "runtime not found")
+		}
+		return db.AgentRuntime{}, db.Member{}, false
+	}
+
+	return rt, member, true
+}
+
+// runtimeLiveProfile returns the custom runtime profile that owns rt, if that
+// profile still exists in the same workspace. A profile-backed instance whose
+// profile is gone is an orphan and stays directly deletable (MUL-4158).
+//
+// The profile row itself — not just "one exists" — is what the caller needs:
+// the refusal it writes names the profile, so the user can tell which shared
+// definition they would be reaching for if they followed the old advice.
+func (h *Handler) runtimeLiveProfile(ctx context.Context, rt db.AgentRuntime) (db.RuntimeProfile, bool, error) {
+	if !rt.ProfileID.Valid {
+		return db.RuntimeProfile{}, false, nil
+	}
+	profile, err := h.Queries.GetRuntimeProfileForWorkspace(ctx, db.GetRuntimeProfileForWorkspaceParams{
 		ID:          rt.ProfileID,
 		WorkspaceID: rt.WorkspaceID,
-	}); err != nil {
+	})
+	if err != nil {
 		if errors.Is(err, pgx.ErrNoRows) {
-			return false, nil
+			return db.RuntimeProfile{}, false, nil
 		}
-		return false, err
+		return db.RuntimeProfile{}, false, err
 	}
-	return true, nil
+	return profile, true, nil
+}
+
+// profileInstanceDeleteRefusal explains why this one runtime row cannot be
+// deleted on its own, and — the part that matters — what the user should
+// actually do instead.
+//
+// The previous wording said only "delete its runtime profile instead", which
+// is actively harmful advice for the case that produces this error most often
+// (GH #8456, #6671): a retired machine's leftover row inside a profile that
+// other, healthy machines still use. Following it means reaching for a
+// workspace-wide delete that takes those machines' runtimes with it, and that
+// a bound agent will refuse anyway. So the refusal now leads with the outcome
+// the user wants — an offline row is reclaimed automatically — and states the
+// blast radius of the profile delete rather than recommending it.
+//
+// blockers are the non-archived user agents bound to rt, matching the predicate
+// retention GC applies; known is false when that read failed. They decide two
+// things. Whether the promise of automatic cleanup is one this server can keep
+// at all — GC skips a runtime that still has a bound agent — and, when it is
+// not, which of those blockers the user can actually do anything about. Mika is
+// a user-kind agent that can be neither archived nor moved, so "reassign or
+// archive them" is not a universal instruction here either.
+func profileInstanceDeleteRefusal(rt db.AgentRuntime, profile db.RuntimeProfile, blockers profileInstanceBlockers) map[string]any {
+	known := blockers.known
+	ttlDays := service.OfflineRuntimeTTLDays()
+	name := rt.Name
+	if rt.CustomName.Valid && strings.TrimSpace(rt.CustomName.String) != "" {
+		name = rt.CustomName.String
+	}
+
+	lead := fmt.Sprintf(
+		"cannot delete %q on its own: it is registered from the custom runtime profile %q.",
+		name, profile.DisplayName,
+	)
+	scope := "Deleting the profile instead would remove this runtime on every machine that registered it, not just this one."
+
+	parts := []string{lead}
+	switch {
+	case rt.Status == "online":
+		parts = append(parts, fmt.Sprintf(
+			"It is still online, so its daemon would register it again. Stop that daemon first; Multica then removes the runtime automatically after %d days offline, once no agent is bound to it and nothing is still running on it.",
+			ttlDays,
+		))
+	case !known:
+		// Blocker set unavailable; promise only what holds regardless of it.
+		parts = append(parts, fmt.Sprintf(
+			"It is offline, and Multica removes offline runtimes automatically after %d days, once no agent is bound to them and nothing is still running on them.",
+			ttlDays,
+		))
+	case len(blockers.agents) > 0 || blockers.undrainedTasks > 0:
+		// GC needs BOTH gone. Naming only the agents would send a user who
+		// clears them straight back here a week later, still waiting on a task
+		// nothing told them about — a deferred run left behind when its agent
+		// was rebound elsewhere is the ordinary way this happens.
+		var holds []string
+		if n := len(blockers.agents); n > 0 {
+			holds = append(holds, fmt.Sprintf("%d agent(s) are still bound to it", n))
+		}
+		if n := blockers.undrainedTasks; n > 0 {
+			holds = append(holds, fmt.Sprintf("%d unfinished task(s) belong to it or to agents bound to it", n))
+		}
+		parts = append(parts, fmt.Sprintf(
+			"It is offline, but %s, which holds it in place; Multica removes the runtime automatically after %d days offline once that is cleared.",
+			strings.Join(holds, " and "), ttlDays,
+		))
+		parts = append(parts, blockingAgentRemedies(blockingAgentClassesFromAgents(blockers.agents), blockingAgentScopeInstance)...)
+		if blockers.undrainedTasks > 0 {
+			parts = append(parts, "Let those tasks finish, or cancel them — one can be running on a different machine if its agent was moved there.")
+		}
+	default:
+		parts = append(parts, fmt.Sprintf(
+			"It is offline with no agents bound and nothing still running on it, so Multica removes it automatically after %d days offline — this row will be reclaimed without any action from you.",
+			ttlDays,
+		))
+	}
+	parts = append(parts, scope)
+
+	msg := strings.Join(parts, " ")
+
+	resp := map[string]any{
+		"error": msg,
+		"code":  "runtime_profile_instance_delete_unsupported",
+		// Structured companions to the sentence above so a client can render
+		// its own localized copy instead of echoing the English (see
+		// writeErrorCode's rationale). The sentence stays the fallback.
+		"profile_id":              uuidToString(profile.ID),
+		"profile_name":            profile.DisplayName,
+		"runtime_status":          rt.Status,
+		"last_seen_at":            timestampToPtr(rt.LastSeenAt),
+		"auto_cleanup_after_days": ttlDays,
+	}
+	if known {
+		resp["active_agent_count"] = len(blockers.agents)
+		resp["undrained_task_count"] = blockers.undrainedTasks
+	}
+	return resp
+}
+
+// profileInstanceBlockers is everything retention GC checks before it will
+// reclaim an offline runtime, which is more than its candidate query asks for:
+// the candidate scan wants no non-archived user agent and no runtime-owned task
+// with completed_at NULL, and then gcRuntime re-checks the drain across every
+// user agent bound to the runtime, archived ones included. Reporting any subset
+// of that promises a cleanup the sweeper then skips.
+type profileInstanceBlockers struct {
+	agents         []db.Agent
+	undrainedTasks int64
+	known          bool
+}
+
+// profileInstanceRefusalBlockers reads what would stop retention GC from
+// reclaiming this runtime. A read failure is not worth failing the request
+// over: it only costs the refusal its most specific sentence, so report it as
+// unknown and let the caller fall back to the cautious wording.
+//
+// Already bounded — a single runtime's bound agents, unlike a profile's, are
+// capped by what one machine can host.
+func (h *Handler) profileInstanceRefusalBlockers(ctx context.Context, runtimeID pgtype.UUID) profileInstanceBlockers {
+	agents, err := h.Queries.ListActiveAgentsByRuntime(ctx, runtimeID)
+	if err != nil {
+		slog.Warn("profile instance refusal: active agent lookup failed",
+			"runtime_id", uuidToString(runtimeID), "error", err)
+		return profileInstanceBlockers{}
+	}
+	// The same drain gate gcRuntime applies, and deliberately not just the
+	// candidate query's runtime-owned predicate: gcRuntime widens it to every
+	// user agent bound to this runtime, archived included, and skips the delete
+	// when any of them still owns a non-terminal task. That task can sit on a
+	// different machine — an agent moved away leaves its deferred run behind —
+	// so a check scoped to this runtime's own rows reports a row as reclaimable
+	// that the sweeper will pass over every hour.
+	agentIDs, err := h.Queries.ListUserAgentIDsByRuntime(ctx, runtimeID)
+	if err != nil {
+		slog.Warn("profile instance refusal: bound agent id lookup failed",
+			"runtime_id", uuidToString(runtimeID), "error", err)
+		return profileInstanceBlockers{}
+	}
+	tasks, err := h.Queries.CountUndrainedTasksByRuntimeOrAgent(ctx, db.CountUndrainedTasksByRuntimeOrAgentParams{
+		RuntimeIds: []pgtype.UUID{runtimeID},
+		AgentIds:   agentIDs,
+	})
+	if err != nil {
+		slog.Warn("profile instance refusal: undrained task lookup failed",
+			"runtime_id", uuidToString(runtimeID), "error", err)
+		return profileInstanceBlockers{}
+	}
+	return profileInstanceBlockers{agents: agents, undrainedTasks: tasks, known: true}
 }
 
 // canUseRuntimeForAgent reports whether a workspace member is allowed to
@@ -726,21 +901,33 @@ func canSetRuntimeVisibility(member db.Member, rt db.AgentRuntime) bool {
 
 func (h *Handler) ListAgentRuntimes(w http.ResponseWriter, r *http.Request) {
 	workspaceID := h.resolveWorkspaceID(r)
+	userID, ok := requireUserID(w, r)
+	if !ok {
+		return
+	}
+	member, ok := h.requireWorkspaceMember(w, r, workspaceID, "workspace not found")
+	if !ok {
+		return
+	}
 
 	var runtimes []db.AgentRuntime
 	var err error
 
 	if ownerFilter := r.URL.Query().Get("owner"); ownerFilter == "me" {
-		userID, ok := requireUserID(w, r)
-		if !ok {
-			return
-		}
 		runtimes, err = h.Queries.ListAgentRuntimesByOwner(r.Context(), db.ListAgentRuntimesByOwnerParams{
 			WorkspaceID: parseUUID(workspaceID),
 			OwnerID:     parseUUID(userID),
 		})
-	} else {
+	} else if roleAllowed(member.Role, "owner", "admin") {
+		// Governance visibility preserves the existing owner/admin contract:
+		// admins can find a private runtime to rename or delete it, but the
+		// per-runtime read gate still denies data and machine access.
 		runtimes, err = h.Queries.ListAgentRuntimes(r.Context(), parseUUID(workspaceID))
+	} else {
+		runtimes, err = h.Queries.ListVisibleAgentRuntimes(r.Context(), db.ListVisibleAgentRuntimesParams{
+			WorkspaceID: parseUUID(workspaceID),
+			OwnerID:     parseUUID(userID),
+		})
 	}
 
 	if err != nil {
@@ -764,130 +951,10 @@ func (h *Handler) ListAgentRuntimes(w http.ResponseWriter, r *http.Request) {
 // confirm dialog without an extra round-trip. The confirmed variant lives at
 // POST /api/runtimes/:id/unbind-agents-and-delete (UnbindAgentsAndDeleteRuntime
 // below) and runs the multi-write teardown inside a single transaction.
-// errRuntimeNotDrained means the runtime still owned a non-terminal task after
-// the teardown's own cancel pass. That should be impossible — it only happens if
-// a new non-terminal task status was added without extending
-// CancelAgentTasksByRuntimeOrAgent — so the teardown refuses rather than
-// deleting the rows or tripping the agent_task_queue_active_requires_runtime
-// CHECK with an opaque 500.
-var errRuntimeNotDrained = errors.New("runtime still has non-terminal tasks")
-
-// runtimeTeardownResult reports what the shared teardown changed so the caller
-// can broadcast it after the transaction commits.
-type runtimeTeardownResult struct {
-	UnboundAgents    []db.Agent
-	CancelledTasks   []db.AgentTaskQueue
-	PausedAutopilots []db.Autopilot
-}
-
-// unbindRuntimeForDelete is the teardown every runtime-delete path runs inside
-// its transaction, immediately before deleting the agent_runtime row (MUL-5559).
-//
-// It replaces the old archive-then-hard-delete of the runtime's agents. An agent
-// is a persistent business object — identity, instructions, skills, chats,
-// labels, channel installations, autopilot config — while a runtime is
-// replaceable execution capacity, so retiring a machine unbinds its agents
-// instead of destroying them. Unbound (runtime_id IS NULL) is a normal state,
-// orthogonal to archived: service.AgentReadiness already refuses to give work to
-// an agent with no runtime, and every trigger entry point reports
-// agent_runtime_required.
-//
-// Order matters:
-//
-//  1. Unbind the user agents. Archived ones included: an agent archived earlier
-//     is just as much the user's data. System agents are excluded — they are
-//     invisible infrastructure with no rebind affordance, so they are deleted in
-//     step 5 as before.
-//  2. Pause active Autopilots assigned directly to those agents or to squads
-//     they lead. The automation config stays intact and the persisted reason
-//     explains that rebinding the Agent is the recovery path.
-//  3. Cancel the non-terminal tasks of this runtime AND of the agents we just
-//     unbound. The agent-side match is load-bearing: agent.runtime_id can move
-//     without rewriting agent_task_queue.runtime_id, so a task an unbound agent
-//     left pinned to another runtime would otherwise stay claimable while its
-//     owner is no longer allowed to run.
-//  4. Assert the runtime is drained (see errRuntimeNotDrained).
-//  5. Detach the task history. Without this, deleting the runtime row would
-//     cascade agent_task_queue away — and task_message / task_usage /
-//     task_token with it — so the agents would survive with no record of what
-//     they ever did.
-//  6. Hard-delete the system agents, clearing first the rows whose cleanup has
-//     no FK to follow (invocation targets, channel installations, chat pins,
-//     labels, chat draft restores).
-func unbindRuntimeForDelete(ctx context.Context, qtx *db.Queries, runtimeID pgtype.UUID) (runtimeTeardownResult, error) {
-	var out runtimeTeardownResult
-
-	unbound, err := qtx.UnbindUserAgentsFromRuntime(ctx, runtimeID)
-	if err != nil {
-		return out, fmt.Errorf("unbind agents: %w", err)
-	}
-	out.UnboundAgents = unbound
-
-	unboundIDs := make([]pgtype.UUID, len(unbound))
-	for i, a := range unbound {
-		unboundIDs[i] = a.ID
-	}
-	paused, err := qtx.PauseAutopilotsByUnboundAgents(ctx, unboundIDs)
-	if err != nil {
-		return out, fmt.Errorf("pause autopilots: %w", err)
-	}
-	out.PausedAutopilots = paused
-
-	cancelled, err := qtx.CancelAgentTasksByRuntimeOrAgent(ctx, db.CancelAgentTasksByRuntimeOrAgentParams{
-		RuntimeIds: []pgtype.UUID{runtimeID},
-		AgentIds:   unboundIDs,
-	})
-	if err != nil {
-		return out, fmt.Errorf("cancel tasks: %w", err)
-	}
-	out.CancelledTasks = cancelled
-
-	undrained, err := qtx.CountUndrainedTasksByRuntimeOrAgent(ctx, db.CountUndrainedTasksByRuntimeOrAgentParams{
-		RuntimeIds: []pgtype.UUID{runtimeID},
-		AgentIds:   unboundIDs,
-	})
-	if err != nil {
-		return out, fmt.Errorf("count undrained tasks: %w", err)
-	}
-	if undrained > 0 {
-		return out, fmt.Errorf("%w: %d", errRuntimeNotDrained, undrained)
-	}
-	if _, err := qtx.UnbindTasksFromRuntime(ctx, runtimeID); err != nil {
-		return out, fmt.Errorf("unbind task history: %w", err)
-	}
-
-	// agent_invocation_target has no agent_id FK (MUL-3963).
-	if err := qtx.DeleteAgentInvocationTargetsBySystemRuntimeAgents(ctx, runtimeID); err != nil {
-		return out, fmt.Errorf("clean up agent invocation targets: %w", err)
-	}
-	// channel_* has no workspace/agent FK (MUL-3515 §4); an orphaned
-	// installation would keep occupying its bot's (channel_type, app_id)
-	// routing slot and make that bot un-rebindable (#4810).
-	if err := qtx.DeleteChannelInstallationsBySystemRuntimeAgents(ctx, runtimeID); err != nil {
-		return out, fmt.Errorf("clean up channel installations: %w", err)
-	}
-	if err := qtx.DeleteChatPinnedAgentsBySystemRuntimeAgents(ctx, runtimeID); err != nil {
-		return out, fmt.Errorf("clean up chat pins: %w", err)
-	}
-	// agent_to_label has no agent_id FK.
-	if err := qtx.DeleteAgentLabelAssignmentsBySystemRuntimeAgents(ctx, runtimeID); err != nil {
-		return out, fmt.Errorf("clean up agent label assignments: %w", err)
-	}
-	// chat_session cascades from agent and chat_draft_restore has no FK to
-	// follow it (#5219), so prune the restores before the agent rows go.
-	if err := pruneRuntimeSystemAgentChatDraftRestores(ctx, qtx, runtimeID); err != nil {
-		return out, fmt.Errorf("clean up chat draft restores: %w", err)
-	}
-	if err := qtx.DeleteSystemAgentsByRuntime(ctx, runtimeID); err != nil {
-		return out, fmt.Errorf("clean up system agents: %w", err)
-	}
-	return out, nil
-}
-
-// publishRuntimeTeardown fans out a committed teardown. Ordering matches the
-// other revocation paths: task:cancelled, then per-agent and Autopilot updates,
-// then the runtime-list refresh.
-func (h *Handler) publishRuntimeTeardown(ctx context.Context, res runtimeTeardownResult, wsID, userID string) {
+// PublishRuntimeTeardown fans out a committed teardown. The caller controls
+// actor metadata and whether to append a runtime-list refresh so automatic GC
+// can deduplicate that refresh once per workspace and batch.
+func (h *Handler) PublishRuntimeTeardown(ctx context.Context, res service.RuntimeTeardownResult, wsID, actorType, actorID, action string, publishRuntimeRefresh bool) {
 	if h.TaskService != nil && len(res.CancelledTasks) > 0 {
 		// The teardown deletes the runtime's system agents, and a system agent's
 		// chat sessions go with it, so the workspace of a cancelled chat task is
@@ -898,18 +965,27 @@ func (h *Handler) publishRuntimeTeardown(ctx context.Context, res runtimeTeardow
 		// agent:status is the generic "this agent changed" broadcast the agent
 		// update path already uses; subscribers refresh the row and see
 		// runtime_bound=false. No agent:archived here — nothing was archived.
-		h.publish(protocol.EventAgentStatus, wsID, "member", userID, map[string]any{
+		h.publish(protocol.EventAgentStatus, wsID, actorType, actorID, map[string]any{
 			"agent": broadcastAgentResponse(h.agentToResponse(a)),
 		})
 	}
 	for _, a := range res.PausedAutopilots {
-		h.publish(protocol.EventAutopilotUpdated, wsID, "member", userID, map[string]any{
+		h.publish(protocol.EventAutopilotUpdated, wsID, actorType, actorID, map[string]any{
 			"autopilot": autopilotToResponse(a, nil),
 		})
 	}
-	h.publish(protocol.EventDaemonRegister, wsID, "member", userID, map[string]any{
-		"action": "delete",
-	})
+	if publishRuntimeRefresh {
+		h.PublishRuntimeRefresh(wsID, actorType, actorID, action)
+	}
+}
+
+// PublishRuntimeRefresh asks connected clients to refetch runtime state.
+func (h *Handler) PublishRuntimeRefresh(wsID, actorType, actorID, action string) {
+	h.publish(protocol.EventDaemonRegister, wsID, actorType, actorID, map[string]any{"action": action})
+}
+
+func (h *Handler) publishRuntimeTeardown(ctx context.Context, res service.RuntimeTeardownResult, wsID, userID string) {
+	h.PublishRuntimeTeardown(ctx, res, wsID, "member", userID, "delete", true)
 }
 
 func (h *Handler) DeleteAgentRuntime(w http.ResponseWriter, r *http.Request) {
@@ -919,7 +995,7 @@ func (h *Handler) DeleteAgentRuntime(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	rt, err := h.Queries.GetAgentRuntime(r.Context(), runtimeUUID)
+	rt, err := h.getAgentRuntime(r.Context(), obsmetrics.RuntimeLookupSourceRuntimeAPI, runtimeUUID)
 	if err != nil {
 		writeError(w, http.StatusNotFound, "runtime not found")
 		return
@@ -938,16 +1014,14 @@ func (h *Handler) DeleteAgentRuntime(w http.ResponseWriter, r *http.Request) {
 	}
 	userID := uuidToString(member.UserID)
 
-	hasLiveProfile, err := h.runtimeHasLiveProfile(r.Context(), rt)
+	profile, hasLiveProfile, err := h.runtimeLiveProfile(r.Context(), rt)
 	if err != nil {
 		writeError(w, http.StatusInternalServerError, "failed to check runtime profile")
 		return
 	}
 	if hasLiveProfile {
-		writeJSON(w, http.StatusConflict, map[string]any{
-			"error": "cannot delete a custom runtime instance directly; delete its runtime profile instead.",
-			"code":  "runtime_profile_instance_delete_unsupported",
-		})
+		blockers := h.profileInstanceRefusalBlockers(r.Context(), rt.ID)
+		writeJSON(w, http.StatusConflict, profileInstanceDeleteRefusal(rt, profile, blockers))
 		return
 	}
 	if rt.ProfileID.Valid {
@@ -1009,14 +1083,23 @@ func (h *Handler) DeleteAgentRuntime(w http.ResponseWriter, r *http.Request) {
 	// their task history, cancel what was still active, remove only the system
 	// agents. There is no active agent here by definition, but archived ones and
 	// their history can still be bound to this runtime.
-	teardown, err := unbindRuntimeForDelete(r.Context(), qtx, rt.ID)
+	teardown, err := service.TeardownRuntime(r.Context(), qtx, rt.ID, service.RuntimeTeardownOptions{CancelNonTerminalTasks: true})
 	if err != nil {
-		if errors.Is(err, errRuntimeNotDrained) {
+		if errors.Is(err, service.ErrRuntimeNotDrained) {
 			slog.Error("runtime delete aborted: tasks not drained",
 				"runtime_id", uuidToString(rt.ID), "error", err)
 			writeJSON(w, http.StatusConflict, map[string]any{
 				"error": "the runtime still has tasks in flight; retry in a moment.",
 				"code":  "runtime_delete_not_drained",
+			})
+			return
+		}
+		if errors.Is(err, service.ErrRuntimeWorkspaceMismatch) {
+			slog.Error("runtime delete aborted: agent workspace mismatch",
+				"runtime_id", uuidToString(rt.ID), "error", err)
+			writeJSON(w, http.StatusConflict, map[string]any{
+				"error": "the runtime has an invalid cross-workspace agent binding.",
+				"code":  "runtime_delete_workspace_mismatch",
 			})
 			return
 		}
@@ -1033,6 +1116,7 @@ func (h *Handler) DeleteAgentRuntime(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusInternalServerError, "failed to delete runtime")
 		return
 	}
+	h.NotifyRuntimeGone(uuidToString(rt.ID))
 
 	slog.Info("runtime deleted",
 		"runtime_id", uuidToString(rt.ID),
@@ -1131,7 +1215,7 @@ func (h *Handler) UnbindAgentsAndDeleteRuntime(w http.ResponseWriter, r *http.Re
 		return
 	}
 
-	rt, err := h.Queries.GetAgentRuntime(r.Context(), runtimeUUID)
+	rt, err := h.getAgentRuntime(r.Context(), obsmetrics.RuntimeLookupSourceRuntimeAPI, runtimeUUID)
 	if err != nil {
 		writeError(w, http.StatusNotFound, "runtime not found")
 		return
@@ -1148,16 +1232,14 @@ func (h *Handler) UnbindAgentsAndDeleteRuntime(w http.ResponseWriter, r *http.Re
 	}
 	userID := uuidToString(member.UserID)
 
-	hasLiveProfile, err := h.runtimeHasLiveProfile(r.Context(), rt)
+	profile, hasLiveProfile, err := h.runtimeLiveProfile(r.Context(), rt)
 	if err != nil {
 		writeError(w, http.StatusInternalServerError, "failed to check runtime profile")
 		return
 	}
 	if hasLiveProfile {
-		writeJSON(w, http.StatusConflict, map[string]any{
-			"error": "cannot delete a custom runtime instance directly; delete its runtime profile instead.",
-			"code":  "runtime_profile_instance_delete_unsupported",
-		})
+		blockers := h.profileInstanceRefusalBlockers(r.Context(), rt.ID)
+		writeJSON(w, http.StatusConflict, profileInstanceDeleteRefusal(rt, profile, blockers))
 		return
 	}
 	if rt.ProfileID.Valid {
@@ -1220,9 +1302,9 @@ func (h *Handler) UnbindAgentsAndDeleteRuntime(w http.ResponseWriter, r *http.Re
 	// agent (active and archived) plus their task history, cancel what was
 	// running or queued, and hard-delete only the system agents. Nothing the
 	// user configured is destroyed — the agents just need a new runtime.
-	teardown, err := unbindRuntimeForDelete(r.Context(), qtx, rt.ID)
+	teardown, err := service.TeardownRuntime(r.Context(), qtx, rt.ID, service.RuntimeTeardownOptions{CancelNonTerminalTasks: true})
 	if err != nil {
-		if errors.Is(err, errRuntimeNotDrained) {
+		if errors.Is(err, service.ErrRuntimeNotDrained) {
 			slog.Error("runtime delete aborted: tasks not drained",
 				"runtime_id", uuidToString(rt.ID), "error", err)
 			writeJSON(w, http.StatusConflict, map[string]any{
@@ -1246,6 +1328,7 @@ func (h *Handler) UnbindAgentsAndDeleteRuntime(w http.ResponseWriter, r *http.Re
 		writeError(w, http.StatusInternalServerError, "failed to commit transaction")
 		return
 	}
+	h.NotifyRuntimeGone(uuidToString(rt.ID))
 
 	h.publishRuntimeTeardown(r.Context(), teardown, wsID, userID)
 

@@ -60,6 +60,7 @@ export type WSEventType =
   | "chat:done"
   | "chat:quick_actions"
   | "chat:cancel_finalized"
+  | "chat:session_created"
   | "chat:session_read"
   | "chat:session_deleted"
   | "chat:session_updated"
@@ -116,6 +117,10 @@ export interface IssueUpdatedPayload {
   assignee_changed?: boolean;
   status_changed?: boolean;
   project_changed?: boolean;
+  // Both ends of a duplicate-mark change (MUL-7349). The mark is not on Issue,
+  // so these tell the realtime layer whose duplicate relations to refresh.
+  duplicate_of_issue_id?: string | null;
+  prev_duplicate_of_issue_id?: string | null;
 }
 
 export interface IssueDeletedPayload {
@@ -284,6 +289,8 @@ export interface ActivityCreatedPayload {
 }
 
 export interface TaskMessagePayload {
+  /** Opaque tool-call identity, scoped to one backend execution. */
+  call_id?: string;
   task_id: string;
   issue_id: string;
   chat_session_id?: string;
@@ -293,6 +300,18 @@ export interface TaskMessagePayload {
   content?: string;
   input?: Record<string, unknown>;
   output?: string;
+  /**
+   * Whether `output` is the whole tool output that ran (`tool_result` only).
+   *
+   * Tri-state on purpose. `undefined` means no daemon ever measured this
+   * record — messages stored before the flag existed, and messages from an
+   * older installed daemon — and must be presented as unknown, never as
+   * complete: the original length is gone and cannot be reconstructed.
+   * `true` means the remainder was never uploaded and no amount of expanding
+   * or scrolling recovers it, which is what separates it from a client-side
+   * display clip.
+   */
+  output_truncated?: boolean;
   created_at?: string;
 }
 
@@ -522,6 +541,20 @@ export interface InvitationRevokedPayload {
   invitee_email: string;
 }
 
+export interface ChatSessionCreatedPayload {
+  workspace_id: string;
+  chat_session_id: string;
+  agent_id: string;
+  creator_id: string;
+  title: string;
+  channel_source: {
+    channel_type: string;
+    installation_id: string;
+    route_revision: number;
+  };
+  is_current_channel_route: boolean;
+}
+
 /**
  * Maps every WSEventType to its payload interface. Events whose payload
  * shape isn't formally typed (server emits an object the client doesn't
@@ -586,6 +619,7 @@ export interface WSEventPayloadMap {
   "chat:done": ChatDonePayload;
   "chat:quick_actions": ChatQuickActionsPayload;
   "chat:cancel_finalized": ChatCancelFinalizedPayload;
+  "chat:session_created": ChatSessionCreatedPayload;
   "chat:session_read": ChatSessionReadPayload;
   "chat:session_deleted": ChatSessionDeletedPayload;
   "chat:session_updated": unknown;

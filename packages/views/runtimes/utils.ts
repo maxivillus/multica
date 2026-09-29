@@ -140,6 +140,27 @@ export function formatTokens(n: number): string {
   return `${Number(scaled.toFixed(1))}${unit.suffix}`;
 }
 
+/**
+ * Whole-number prompt-cache hit rate across mutually exclusive input buckets.
+ * Callers must sum each bucket before calling so the result is a ratio of sums,
+ * never an average of per-row percentages. Output tokens are not input-side
+ * traffic and therefore do not belong in the denominator.
+ *
+ * Returns null when no input-side usage was reported. Round ordinary values to
+ * the nearest percent, but reserve 100% for a genuinely complete cache hit.
+ */
+export function cacheHitRatePercent(
+  inputTokens: number,
+  cacheReadTokens: number,
+  cacheWriteTokens: number,
+): number | null {
+  const inputSideTokens = inputTokens + cacheReadTokens + cacheWriteTokens;
+  if (inputSideTokens <= 0) return null;
+
+  const percent = (cacheReadTokens / inputSideTokens) * 100;
+  return percent === 100 ? 100 : Math.min(Math.round(percent), 99);
+}
+
 // Cents below $100, whole dollars above — two decimals on a four-figure spend
 // is noise, and dropping them below $100 would round most single runs to $0.
 export function formatUsd(n: number): string {
@@ -195,10 +216,14 @@ const MODEL_PRICING: Record<
   // -- Anthropic: current generation. Sonnet 5 uses Anthropic's published
   //    intro launch rate ($2 / $10 through 2026-08-31). This static map has
   //    no future-dated pricing support yet, so update the row when the
-  //    post-intro $3 / $15 rate takes effect. Fable 5 is a Mythos-class SKU
-  //    at 10/50; Opus 4.5 through Opus 5 stay on the lower 5/25 Opus tier. --
+  //    post-intro $3 / $15 rate takes effect. Fable 5 and 5.1 are Mythos-class
+  //    SKUs at 10/50 (5.1 prices cache reads at 0.025x input, a quarter of the
+  //    usual 0.1x); Opus 4.5 through Opus 5 stay on the lower 5/25 Opus tier,
+  //    and Opus 5.5 drops to 4/20 (cache reads at 0.05x input). --
   "claude-sonnet-5":     { input: 2,    output: 10,   cacheRead: 0.20, cacheWrite: 2.50 },
+  "claude-fable-5-1":   { input: 10,   output: 50,   cacheRead: 0.25, cacheWrite: 12.50 },
   "claude-fable-5":     { input: 10,   output: 50,   cacheRead: 1.00, cacheWrite: 12.50 },
+  "claude-opus-5-5":    { input: 4,    output: 20,   cacheRead: 0.20, cacheWrite: 5.00 },
   "claude-opus-5":      { input: 5,    output: 25,   cacheRead: 0.50, cacheWrite: 6.25 },
   "claude-haiku-4-5":   { input: 1,    output: 5,    cacheRead: 0.10, cacheWrite: 1.25 },
   "claude-sonnet-4-5":  { input: 3,    output: 15,   cacheRead: 0.30, cacheWrite: 3.75 },
@@ -221,12 +246,13 @@ const MODEL_PRICING: Record<
   // -- OpenAI: dotted-minor Codex catalog SKUs. Each generation is priced
   //    independently — no fallback to `gpt-5`. Entries track
   //    `server/pkg/agent/models.go` (Codex provider list).
-  //    gpt-5.6 (sol/terra/luna) uses OpenAI's official announcement rates.
+  //    gpt-6-astra and gpt-5.6 (sol/terra/luna) use OpenAI's official rates.
   //    5.6+ is the first OpenAI generation to bill cache writes separately:
   //    cacheRead = 0.1x input (90% cached-input discount), cacheWrite = 1.25x
   //    input (see the header note above). Codex usage doesn't yet report
   //    cache-write tokens, so cacheWrite isn't exercised today, but the rate
   //    is kept correct for when it is.
+  "gpt-6-astra":        { input: 10,   output: 50,   cacheRead: 1.00,  cacheWrite: 12.50 },
   "gpt-5.6-sol":        { input: 5,    output: 30,   cacheRead: 0.50,  cacheWrite: 6.25 },
   "gpt-5.6-terra":      { input: 2.50, output: 15,   cacheRead: 0.25,  cacheWrite: 3.125 },
   "gpt-5.6-luna":       { input: 1,    output: 6,    cacheRead: 0.10,  cacheWrite: 1.25 },
@@ -267,6 +293,13 @@ const MODEL_PRICING: Record<
   //    Only K2.6 is on the official price sheet today; earlier K2 variants
   //    are intentionally omitted until Moonshot publishes their rates. --
   "kimi-k2.6":          { input: 0.95, output: 4.00, cacheRead: 0.16,   cacheWrite: 0.95 },
+  // Kimi K3 (platform.kimi.ai/docs/pricing/chat-k3 via models.dev
+  // providers/moonshotai/models/kimi-k3.toml). Moonshot bills no separate
+  // cache write, so cacheWrite mirrors input (same convention as kimi-k2.6).
+  "kimi-k3":            { input: 3.0,  output: 15.0,  cacheRead: 0.30,   cacheWrite: 3.0 },
+  // Kimi Code CLI reports the same model as `kimi-code/k3`; provider-qualified
+  // because `k3` is a generic id (see the provider-qualified keys note above).
+  "kimi/k3":            { input: 3.0,  output: 15.0,  cacheRead: 0.30,   cacheWrite: 3.0 },
 
   // -- Zhipu z.ai (docs.z.ai/guides/overview/pricing). Free flash tiers
   //    are priced at 0 so they resolve cleanly instead of falling through
@@ -283,6 +316,36 @@ const MODEL_PRICING: Record<
   "glm-4.5-air":        { input: 0.2,  output: 1.1,  cacheRead: 0.03,   cacheWrite: 0.2 },
   "glm-4.5-airx":       { input: 1.1,  output: 4.5,  cacheRead: 0.22,   cacheWrite: 1.1 },
   "glm-4.5-flash":      { input: 0,    output: 0,    cacheRead: 0,      cacheWrite: 0 },
+
+  // -- Alibaba Qwen (International ≤256K tier; official sources:
+  //    alibabacloud.com/help/model-studio pricing sheet and
+  //    qwencloud.com/models/<model> pages, accessed 2026-08-12).
+  //    qwen3.7-plus: input $0.40 / output $1.60; qwen3.6-flash: input
+  //    $0.25 / output $1.50. Cache prices: Explicit Cache Creation = 1.25×
+  //    input (qwen3.7-plus $0.50, qwen3.6-flash $0.3125); Explicit Cache
+  //    Read = 10% of input (qwen3.7-plus $0.04, qwen3.6-flash $0.025).
+  // qwen3.8-max is priced at the published pay-as-you-go rate
+  // (qwencloud.com/models/qwen3.8-max: Input $2, Output $6, Implicit
+  // Cache $0.25, Creation $2.5, Explicit Cache Read $0.17; also listed on
+  // alibabacloud.com/help model-pricing) so the dashboard shows the
+  // absolute cost even though the runtime reaches it through an Alibaba
+  // Token/Coding Plan subscription. qwen3.8-max-preview stays at 0:
+  //    it is only served through the subscription (token-plan.cn-beijing.
+  //    maas.aliyuncs.com), which does not bill per token — 0 resolves
+  //    cleanly instead of tripping the unmapped diagnostic (same convention
+  //    as the free GLM flash tiers below). --
+  "qwen3.7-plus":       { input: 0.40,  output: 1.60,  cacheRead: 0.04,   cacheWrite: 0.50 },
+  "qwen3.6-flash":      { input: 0.25,  output: 1.50,  cacheRead: 0.025,  cacheWrite: 0.3125 },
+  "qwen3.8-max":        { input: 2.00,  output: 6.00,  cacheRead: 0.17,   cacheWrite: 2.5 },
+  "qwen3.8-max-preview":{ input: 0,      output: 0,     cacheRead: 0,      cacheWrite: 0 },
+
+  // -- Volcengine Ark (ark.cn-beijing.volces.com). `ark-code-latest` is a
+  //    rolling alias whose target the Volcengine console can switch between
+  //    model families, so it is not a stable model identity. Daemons report
+  //    the alias itself, not the resolved model, so there is no reliable
+  //    rate to attach — it deliberately stays unmapped (same philosophy as
+  //    xAI's `grok-composer-*`, see below), surfacing in the pricing dialog
+  //    instead of inheriting a guessed rate. --
 
   // -- xAI Grok (docs.x.ai/developers/pricing). Rates below are the
   //    short-context tier, and are now only a FALLBACK for Grok: xAI reports
@@ -462,8 +525,25 @@ function canonicalCandidates(model: string): string[] {
   const stripDate = (s: string) =>
     s.replace(/-(20\d{2}-\d{2}-\d{2}|20\d{6}|latest)$/, "");
   const stripProvider = (s: string) => {
-    const i = s.indexOf("/");
-    return i > 0 && /^[a-z][a-z0-9_-]*$/i.test(s.slice(0, i)) ? s.slice(i + 1) : s;
+    // Routing prefixes come in two flavours: `vendor/model` (opencode-style)
+    // and `provider:model` (Hermes custom providers), and can nest
+    // (`custom:anthropic/claude-opus-4.7` is a provider-prefixed id whose
+    // model segment is itself provider-prefixed). Iteratively strip the
+    // earliest `/` or `:` separator while the preceding segment looks like a
+    // routing layer (`^[a-z][a-z0-9_-]*$`), until nothing valid remains to
+    // strip. The raw string is always the first candidate (see `push(raw)`
+    // below), so provider-qualified table keys like `cursor/composer-2.5`
+    // still resolve before any stripping happens — iterative peeling only
+    // ever adds previously-missed nested forms.
+    let out = s;
+    for (;;) {
+      const i = out.indexOf("/");
+      const j = out.indexOf(":");
+      const sep = i === -1 ? j : j === -1 ? i : Math.min(i, j);
+      if (sep <= 0 || !/^[a-z][a-z0-9_-]*$/i.test(out.slice(0, sep))) break;
+      out = out.slice(sep + 1);
+    }
+    return out;
   };
   // Only Anthropic IDs are dot↔dash equivalent. OpenAI separators are
   // semantic, so we leave `gpt-5.4` etc. alone.
