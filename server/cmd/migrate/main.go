@@ -443,6 +443,13 @@ func refuseChannelChatRouteHistoryRollbackWith(ctx context.Context, query rowQue
 }
 
 var upMigrationConditions = map[string]migrationCondition{
+	// The fork previously used numeric prefixes 420–422 for card-session
+	// migrations. The schema ledger stores full migration names, so apply the
+	// renumbered migrations on fresh databases but preserve their existing DDL
+	// when an older fork ledger already records the corresponding version.
+	"548_card_sessions":                 skipIfMigrationRecorded("420_card_sessions"),
+	"549_card_session_token_stats":      skipIfMigrationRecorded("421_card_session_token_stats"),
+	"550_card_session_cancel_retention": skipIfMigrationRecorded("422_card_session_cancel_retention"),
 	// Preserve applied history; pending 469 is superseded by the bounded expand
 	// migration. SaaS backfills separately; self-host converges in 491.
 	"469_issue_status_lifecycle_categories": skipMigration("superseded by 478 expansion and 491 convergence (MUL-7365)"),
@@ -469,6 +476,12 @@ var upMigrationConditions = map[string]migrationCondition{
 // Migration 463 independently restores the optional issue-description bigram;
 // migration 464's portable trigram rollback is unconditional.
 var downMigrationConditions = map[string]migrationCondition{
+	// A skipped legacy migration must also remain intact during rollback: the
+	// new ledger rows are removed, while the old fork's schema and ledger rows
+	// stay at their original versions.
+	"548_card_sessions":                     skipIfMigrationRecorded("420_card_sessions"),
+	"549_card_session_token_stats":          skipIfMigrationRecorded("421_card_session_token_stats"),
+	"550_card_session_cancel_retention":     skipIfMigrationRecorded("422_card_session_cancel_retention"),
 	"454_drop_comment_content_bigm_index":   whenOperatorClassAvailable(pgBigmOperatorClass),
 	"455_drop_comment_content_trgm_index":   whenOperatorClassUnavailable(pgBigmOperatorClass),
 	"463_drop_issue_description_bigm_index": whenOperatorClassAvailable(pgBigmOperatorClass),
@@ -514,6 +527,23 @@ func conditionsForDirection(direction string) map[string]migrationCondition {
 func skipMigration(reason string) migrationCondition {
 	return func(context.Context, *pgxpool.Conn) (bool, string, error) {
 		return false, reason, nil
+	}
+}
+
+func skipIfMigrationRecorded(legacyVersion string) migrationCondition {
+	return func(ctx context.Context, conn *pgxpool.Conn) (bool, string, error) {
+		var legacyApplied bool
+		if err := conn.QueryRow(ctx, `
+			SELECT EXISTS (
+				SELECT 1 FROM schema_migrations WHERE version = $1
+			)
+		`, legacyVersion).Scan(&legacyApplied); err != nil {
+			return false, "", fmt.Errorf("check legacy migration %q: %w", legacyVersion, err)
+		}
+		if legacyApplied {
+			return false, "legacy migration " + legacyVersion + " is already recorded", nil
+		}
+		return true, "", nil
 	}
 }
 
