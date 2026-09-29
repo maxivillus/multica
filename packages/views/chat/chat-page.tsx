@@ -283,7 +283,12 @@ export function ChatPage() {
           quickActionsPendingMessageId={quickActionsPending?.message_id ?? null}
         />
       ) : (
-        <EmptyState agent={c.activeAgent} />
+        <EmptyState
+          agent={c.activeAgent}
+          hasSessions={c.sessions.length > 0}
+          onPickPrompt={c.prefillConversationStarter}
+          customizeHref={c.customizeConversationStartersHref}
+        />
       )}
 
       {c.isAgentAccessRevoked ? (
@@ -314,6 +319,8 @@ export function ChatPage() {
       <ChatInput
         onSend={c.handleSend}
         restoreDraftRequest={c.restoreDraftRequest}
+        conversationStarterRequest={c.conversationStarterRequest}
+        onConversationStarterApplied={c.handleConversationStarterApplied}
         onRestoreDraftApplied={c.handleRestoreDraftApplied}
         uploadEnabled={c.uploadEnabled && !c.isAgentAccessRevoked}
         onStop={c.handleStop}
@@ -385,7 +392,7 @@ export function ChatPage() {
     >
       <ResizablePanel
         id="list"
-        defaultSize={320}
+        defaultSize={260}
         minSize={240}
         maxSize={480}
         groupResizeBehavior="preserve-pixel-size"

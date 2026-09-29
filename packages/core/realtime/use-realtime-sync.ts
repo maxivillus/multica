@@ -33,6 +33,7 @@ import { telegramKeys } from "../telegram/queries";
 import {
   onIssueCreated,
   onIssueUpdated,
+  onIssueDuplicateMarkChanged,
   onIssueDeleted,
   onIssueLabelsChanged,
   onIssuePropertiesChanged,
@@ -45,7 +46,6 @@ import {
   invalidateUpdatedAtSortedIssueLists,
 } from "../issues/cache-coordinator";
 import { onInboxNew, onInboxInvalidate, onInboxIssueStatusChanged, onInboxIssueDeleted, onInboxSummaryInvalidate } from "../inbox/ws-updaters";
-import { inboxKeys } from "../inbox/queries";
 import {
   notificationPreferenceOptions,
   notificationPreferenceKeys,
@@ -116,6 +116,7 @@ import type {
   ChatPendingTask,
   ChatMessagesPage,
   ChatSession,
+  ChatSessionCreatedPayload,
   InvitationCreatedPayload,
 } from "../types";
 
@@ -125,11 +126,10 @@ const chatWsLogger = createLogger("chat.ws");
  * Window over which incoming `task:message` frames are batched into a single
  * timeline cache write (MUL-6396).
  *
- * A fixed window, armed on the first frame and not reset by later ones, so a
- * sustained stream still lands every 100ms rather than being deferred until
- * the stream pauses. Short enough that streamed text still reads as live;
- * long enough that a run emitting several frames per second costs one merge
- * and one render instead of one per frame.
+ * The first frame after an idle window lands immediately; that is the
+ * user-visible leading edge. It also arms a fixed 100ms window for subsequent
+ * frames, not reset by later ones, so a sustained stream still costs at most
+ * one additional merge/render per window instead of one per frame.
  */
 const TASK_MESSAGE_FLUSH_MS = 100;
 
@@ -563,10 +563,10 @@ export async function handleInboxNew(
   item: InboxItem,
 ): Promise<void> {
   const sourceWsId = item.workspace_id;
-  if (sourceWsId) onInboxNew(qc, sourceWsId, item);
+  if (sourceWsId) void onInboxNew(qc, sourceWsId, item);
   // A new item in ANY workspace can light the workspace-switcher dot, so
   // refresh the cross-workspace summary regardless of the active workspace.
-  onInboxSummaryInvalidate(qc);
+  void onInboxSummaryInvalidate(qc);
   // Fire a native OS notification only when the app isn't focused. When
   // the user is already looking at Multica, the inbox sidebar's unread
   // styling is enough — no need to interrupt with a banner. `desktopAPI`
@@ -642,7 +642,10 @@ function invalidateWorkspaceScopedQueries(qc: QueryClient): void {
   const wsId = getCurrentWsId();
   if (wsId) {
     qc.invalidateQueries({ queryKey: issueKeys.all(wsId) });
-    qc.invalidateQueries({ queryKey: inboxKeys.all(wsId) });
+    // Through the inbox's own entry point, not a plain invalidate: a reconnect
+    // can land during the list's first load, and a plain invalidate would be
+    // answered by the request already on the wire (see refreshInboxQuery).
+    void onInboxInvalidate(qc, wsId);
     qc.invalidateQueries({ queryKey: workspaceKeys.agents(wsId) });
     qc.invalidateQueries({ queryKey: workspaceKeys.members(wsId) });
     qc.invalidateQueries({ queryKey: workspaceKeys.squads(wsId) });
@@ -665,7 +668,7 @@ function invalidateWorkspaceScopedQueries(qc: QueryClient): void {
   }
   // Cross-workspace, so outside the wsId guard: a reconnect may have missed
   // inbox events from any workspace, so re-pull the switcher-dot summary.
-  onInboxSummaryInvalidate(qc);
+  void onInboxSummaryInvalidate(qc);
   // Per-issue caches are keyed without wsId, so the issueKeys.all(wsId)
   // prefix above does not reach them. They rely entirely on WS events for
   // freshness (staleTime: Infinity), so events missed while disconnected
@@ -751,14 +754,14 @@ export function useRealtimeSync(
     const refreshMap: Record<string, () => void> = {
       inbox: () => {
         const wsId = getCurrentWsId();
-        if (wsId) onInboxInvalidate(qc, wsId);
+        if (wsId) void onInboxInvalidate(qc, wsId);
         // inbox:read / inbox:archived / inbox:unarchived / batch events arrive
         // here. They can originate from a workspace other than the active one
         // (personal events fan out to all the user's connections), so always
         // refresh the cross-workspace summary — its dot must clear when another
         // workspace's items are read/archived, and light again when an unread
         // item is restored from the archive.
-        onInboxSummaryInvalidate(qc);
+        void onInboxSummaryInvalidate(qc);
       },
       agent: () => {
         const wsId = getCurrentWsId();
@@ -790,7 +793,15 @@ export function useRealtimeSync(
       },
       project: () => {
         const wsId = getCurrentWsId();
-        if (wsId) qc.invalidateQueries({ queryKey: projectKeys.all(wsId) });
+        if (wsId) {
+          qc.invalidateQueries({ queryKey: projectKeys.all(wsId) });
+          // The issue table can filter on a project's status, so a
+          // project create/update/delete changes which issues a filtered
+          // window holds. The payload carries no previous status to compare
+          // against, and project writes are rare, so refresh the table
+          // queries unconditionally rather than guess.
+          qc.invalidateQueries({ queryKey: issueKeys.tableAll(wsId) });
+        }
       },
       squad: () => {
         const wsId = getCurrentWsId();
@@ -826,7 +837,18 @@ export function useRealtimeSync(
       // client. (MUL-6458)
       issue_status: () => {
         const wsId = getCurrentWsId();
-        if (wsId) qc.invalidateQueries({ queryKey: issueStatusKeys.all(wsId) });
+        if (wsId) {
+          qc.invalidateQueries({ queryKey: issueStatusKeys.all(wsId) });
+          // Status-group order is server-owned and depends on catalog positions.
+          // Rows/facets and unrelated groupings do not change on catalog edits.
+          qc.invalidateQueries({
+            queryKey: [...issueKeys.tableAll(wsId), "groups"],
+            predicate: (query) => {
+              const group = query.queryKey[5];
+              return !!group && typeof group === "object" && "kind" in group && group.kind === "status";
+            },
+          });
+        }
       },
       pin: () => {
         const wsId = getCurrentWsId();
@@ -837,6 +859,10 @@ export function useRealtimeSync(
         const wsId = getCurrentWsId();
         if (wsId) {
           qc.invalidateQueries({ queryKey: runtimeKeys.all(wsId) });
+          // Shared agents may carry a redacted runtime liveness projection;
+          // refetch it when a daemon changes state even if its private runtime
+          // is absent from this member's runtime list.
+          qc.invalidateQueries({ queryKey: workspaceKeys.agents(wsId) });
           // Runtime online/offline transitions move the derived status
           // for every agent that hosts on this runtime, which shifts the
           // working/idle/offline pill on the squad page.
@@ -964,7 +990,7 @@ export function useRealtimeSync(
       "daemon:heartbeat",
       // Chat events are handled explicitly below; do not double-invalidate.
       "chat:message", "chat:done", "chat:quick_actions", "chat:cancel_finalized", "chat:session_read",
-      "chat:session_deleted", "chat:session_updated",
+      "chat:session_created", "chat:session_deleted", "chat:session_updated",
       // task:message stays out of the prefix path because it fires per
       // streamed message during a long run — invalidating the snapshot on
       // every message would flood the network. Specific chat handlers below
@@ -1000,6 +1026,13 @@ export function useRealtimeSync(
           statusChanged: payload.status_changed,
           projectChanged: payload.project_changed,
         });
+        onIssueDuplicateMarkChanged(
+          qc,
+          wsId,
+          issue.id,
+          payload.duplicate_of_issue_id,
+          payload.prev_duplicate_of_issue_id,
+        );
         if (issue.status) {
           onInboxIssueStatusChanged(qc, wsId, issue.id, issue.status);
         }
@@ -1019,7 +1052,7 @@ export function useRealtimeSync(
       const wsId = getCurrentWsId();
       if (wsId) {
         onIssueDeleted(qc, wsId, issue_id);
-        onInboxIssueDeleted(qc, wsId, issue_id);
+        void onInboxIssueDeleted(qc, wsId, issue_id);
       }
     });
 
@@ -1295,20 +1328,40 @@ export function useRealtimeSync(
       );
     });
 
-    // invitation:accepted / declined / revoked — refresh invitation lists
-    const unsubInvitationAccepted = ws.on("invitation:accepted", () => {
-      const currentWsId = getCurrentWsId();
-      if (currentWsId) {
-        qc.invalidateQueries({ queryKey: workspaceKeys.invitations(currentWsId) });
-        qc.invalidateQueries({ queryKey: workspaceKeys.members(currentWsId) });
-      }
-    });
-    const unsubInvitationDeclined = ws.on("invitation:declined", () => {
-      const currentWsId = getCurrentWsId();
-      if (currentWsId) {
-        qc.invalidateQueries({ queryKey: workspaceKeys.invitations(currentWsId) });
-      }
-    });
+    // invitation:accepted / declined / revoked — refresh invitation lists.
+    // The workspace broadcast reaches every online member, so the admin lists
+    // refresh unconditionally. The account-level pending list is gated on the
+    // acting user: only the invitee who concluded the invite (possibly from
+    // another surface or device) needs their stale pending row dropped —
+    // staleTime is Infinity, so nothing refetches it on its own. Without the
+    // gate every accept/decline fanout refetches the list once per online
+    // member. The actor rides the frame envelope (ws-client hands it to the
+    // handler as its second argument), not the event payload.
+    const unsubInvitationAccepted = ws.on(
+      "invitation:accepted",
+      (_payload, actorId) => {
+        const currentWsId = getCurrentWsId();
+        if (currentWsId) {
+          qc.invalidateQueries({ queryKey: workspaceKeys.invitations(currentWsId) });
+          qc.invalidateQueries({ queryKey: workspaceKeys.members(currentWsId) });
+        }
+        if (actorId === authStore.getState().user?.id) {
+          qc.invalidateQueries({ queryKey: workspaceKeys.myInvitations() });
+        }
+      },
+    );
+    const unsubInvitationDeclined = ws.on(
+      "invitation:declined",
+      (_payload, actorId) => {
+        const currentWsId = getCurrentWsId();
+        if (currentWsId) {
+          qc.invalidateQueries({ queryKey: workspaceKeys.invitations(currentWsId) });
+        }
+        if (actorId === authStore.getState().user?.id) {
+          qc.invalidateQueries({ queryKey: workspaceKeys.myInvitations() });
+        }
+      },
+    );
     const unsubInvitationRevoked = ws.on("invitation:revoked", () => {
       qc.invalidateQueries({ queryKey: workspaceKeys.myInvitations() });
     });
@@ -1342,27 +1395,29 @@ export function useRealtimeSync(
     const taskMessageBatches = new Map<string, TaskMessagePayload[]>();
     let taskMessageFlushTimer: ReturnType<typeof setTimeout> | null = null;
 
+    const writeTaskMessageBatch = (taskId: string, batch: TaskMessagePayload[]) => {
+      // Re-check, because a queued batch may be up to one window old and
+      // `setQueryData` does NOT postpone garbage collection — query-core arms
+      // that timer when the last observer leaves and never again on write.
+      // Closing a transcript while its run keeps streaming therefore has the
+      // entry disappear mid-window, and writing then REBUILDS it holding only
+      // this batch. With the app-wide `staleTime: Infinity` the next open
+      // would read that stub as fresh and never fetch, so everything before it
+      // would be missing until the window is reloaded. Dropping the batch
+      // instead costs nothing: the rows are persisted, so the next open fetches
+      // the whole timeline.
+      if (!isTaskMessageTimelineHeld(qc, taskId)) return;
+      qc.setQueryData<TaskMessagePayload[]>(
+        chatKeys.taskMessages(taskId),
+        (old = []) => mergeTaskMessagesBySeq(old, batch),
+      );
+    };
+
     const flushTaskMessages = () => {
       taskMessageFlushTimer = null;
 
       for (const [taskId, batch] of taskMessageBatches) {
-        // Re-check, because holding was last verified up to a window ago and
-        // `setQueryData` does NOT postpone garbage collection — query-core arms
-        // that timer when the last observer leaves and never again on write.
-        // Closing a transcript while its run keeps streaming therefore has the
-        // entry disappear mid-window, and writing then REBUILDS it holding only
-        // this batch. With the app-wide `staleTime: Infinity` the next open
-        // would read that stub as fresh and never fetch, so everything before
-        // it would be missing until the window is reloaded. Dropping the batch
-        // instead costs nothing: the rows are persisted, so the next open
-        // fetches the whole timeline.
-        if (!isTaskMessageTimelineHeld(qc, taskId)) {
-          continue;
-        }
-        qc.setQueryData<TaskMessagePayload[]>(
-          chatKeys.taskMessages(taskId),
-          (old = []) => mergeTaskMessagesBySeq(old, batch),
-        );
+        writeTaskMessageBatch(taskId, batch);
       }
       taskMessageBatches.clear();
     };
@@ -1373,14 +1428,17 @@ export function useRealtimeSync(
       // hot path for every run in the workspace, not just the visible ones.
       if (!isTaskMessageTimelineHeld(qc, payload.task_id)) return;
 
-      const batch = taskMessageBatches.get(payload.task_id);
-      if (batch) batch.push(payload);
-      else taskMessageBatches.set(payload.task_id, [payload]);
-
-      // Fixed window, not a resetting debounce: a continuous stream must still
-      // flush every TASK_MESSAGE_FLUSH_MS instead of being starved until a gap.
+      // Leading edge: render the first frame after an idle window now. The
+      // timer is still armed so the remainder of a burst is coalesced and a
+      // continuous stream cannot render more than once per fixed window after
+      // this one immediate write.
       if (!taskMessageFlushTimer) {
+        writeTaskMessageBatch(payload.task_id, [payload]);
         taskMessageFlushTimer = setTimeout(flushTaskMessages, TASK_MESSAGE_FLUSH_MS);
+      } else {
+        const batch = taskMessageBatches.get(payload.task_id);
+        if (batch) batch.push(payload);
+        else taskMessageBatches.set(payload.task_id, [payload]);
       }
 
       chatWsLogger.debug("task:message (global)", {
@@ -1644,6 +1702,13 @@ export function useRealtimeSync(
       invalidateSessionLists();
     });
 
+    const unsubChatSessionCreated = ws.on("chat:session_created", (p) => {
+      const payload = p as ChatSessionCreatedPayload;
+      chatWsLogger.info("chat:session_created (global)", payload);
+      if (payload.workspace_id !== getCurrentWsId()) return;
+      invalidateSessionLists();
+    });
+
     // chat:session_updated fires after the creator renames, pins, or archives
     // a session in any tab/device. Patch the cached row inline so the dropdown
     // and badges reflect the change without a full sessions-list refetch — see
@@ -1724,6 +1789,7 @@ export function useRealtimeSync(
       unsubTaskCompleted();
       unsubTaskFailed();
       unsubChatSessionRead();
+      unsubChatSessionCreated();
       unsubChatSessionDeleted();
       unsubChatSessionUpdated();
       if (taskMessageFlushTimer) clearTimeout(taskMessageFlushTimer);

@@ -75,6 +75,25 @@ type AppConfig struct {
 	// them, and only one of the two guesses is safe.
 	LocalWorktreeSupported bool `json:"local_worktree_supported"`
 
+	// AgentConversationStartersSupported tells independently deployed clients
+	// that agent create/update persists conversation_starters. Older handlers
+	// ignored the unknown JSON field and still returned success, so clients
+	// must fail closed when this declaration is absent.
+	AgentConversationStartersSupported bool `json:"agent_conversation_starters_supported"`
+
+	// IssueCreatePropertiesSupported tells independently deployed clients that
+	// POST /api/issues validates and persists the optional properties bag.
+	// Older handlers silently ignore unknown fields, so clients with values must
+	// fail closed when this declaration is absent.
+	IssueCreatePropertiesSupported bool `json:"issue_create_properties_supported"`
+
+	// CommentDeleteKeepRepliesSupported tells clients that deleting a comment
+	// removes only that comment and keeps its replies (#8296), and that
+	// DELETE /api/comments/{id}/keep-replies exists. Older servers deleted the
+	// replies too and omit this, so clients must promise nothing about
+	// replies unless it is declared.
+	CommentDeleteKeepRepliesSupported bool `json:"comment_delete_keep_replies_supported"`
+
 	// ServerVersion is the running API build version, so self-hosted
 	// operators can confirm what's deployed and include it in bug reports.
 	// Only emitted on self-hosted deployments — omitted on the managed cloud,
@@ -91,10 +110,13 @@ func (h *Handler) GetConfig(w http.ResponseWriter, r *http.Request) {
 	config := AppConfig{
 		// A property of this build, not of the deployment: if this code is
 		// running, the save gate is running with it.
-		LocalWorktreeSupported:    true,
-		AllowSignup:               os.Getenv("ALLOW_SIGNUP") != "false",
-		GoogleClientID:            os.Getenv("GOOGLE_CLIENT_ID"),
-		WorkspaceCreationDisabled: os.Getenv("DISABLE_WORKSPACE_CREATION") == "true",
+		LocalWorktreeSupported:             true,
+		AgentConversationStartersSupported: true,
+		IssueCreatePropertiesSupported:     true,
+		CommentDeleteKeepRepliesSupported:  true,
+		AllowSignup:                        os.Getenv("ALLOW_SIGNUP") != "false",
+		GoogleClientID:                     os.Getenv("GOOGLE_CLIENT_ID"),
+		WorkspaceCreationDisabled:          os.Getenv("DISABLE_WORKSPACE_CREATION") == "true",
 	}
 	if h.Storage != nil {
 		config.CdnDomain = h.Storage.CdnDomain()

@@ -225,6 +225,7 @@ func TestAutopilotSubscriberSave_LosesToConcurrentRevoke(t *testing.T) {
 				t.Fatalf("begin revoke tx: %v", err)
 			}
 			defer revokeTx.Rollback(context.Background())
+			holderPID := holderBackendPID(t, ctx, revokeTx)
 			qtx := testHandler.Queries.WithTx(revokeTx)
 
 			if err := qtx.LockSubscriberWrites(ctx, db.LockSubscriberWritesParams{
@@ -257,10 +258,15 @@ func TestAutopilotSubscriberSave_LosesToConcurrentRevoke(t *testing.T) {
 				done <- result{status: status, body: body, autopilotID: autopilotID}
 			}()
 
-			select {
-			case got := <-done:
-				t.Fatalf("autopilot %s completed (status %d: %s) while revoke held the subscriber lock", tc.name, got.status, got.body)
-			case <-time.After(400 * time.Millisecond):
+			// Parked on the revoke transaction itself, not merely slow: a fixed
+			// window cost 400ms per case and could not tell the two apart.
+			if !waitForWaiterBlockedBy(t, holderPID, 10*time.Second) {
+				select {
+				case got := <-done:
+					t.Fatalf("autopilot %s completed (status %d: %s) while revoke held the subscriber lock", tc.name, got.status, got.body)
+				default:
+					t.Fatalf("autopilot %s never blocked on revoke's subscriber lock (pid %d)", tc.name, holderPID)
+				}
 			}
 
 			if err := revokeTx.Commit(context.Background()); err != nil {
@@ -634,7 +640,7 @@ func TestAutopilotDispatchFansOutSubscribersToIssue(t *testing.T) {
 	if err != nil {
 		t.Fatalf("GetAutopilot: %v", err)
 	}
-	run, err := testHandler.AutopilotService.DispatchAutopilot(ctx, ap, pgtype.UUID{}, "manual", nil)
+	run, _, err := testHandler.AutopilotService.DispatchAutopilotManual(ctx, ap, pgtype.UUID{}, nil, parseUUID(testUserID))
 	if err != nil {
 		t.Fatalf("DispatchAutopilot: %v", err)
 	}
@@ -707,7 +713,7 @@ func TestAutopilotDispatchNotifiesSubscribersOnCreate(t *testing.T) {
 	if err != nil {
 		t.Fatalf("GetAutopilot: %v", err)
 	}
-	run, err := testHandler.AutopilotService.DispatchAutopilot(ctx, ap, pgtype.UUID{}, "manual", nil)
+	run, _, err := testHandler.AutopilotService.DispatchAutopilotManual(ctx, ap, pgtype.UUID{}, nil, parseUUID(testUserID))
 	if err != nil {
 		t.Fatalf("DispatchAutopilot: %v", err)
 	}
@@ -789,7 +795,7 @@ func TestAutopilotDispatchSkipsInboxWhenNoSubscribers(t *testing.T) {
 	if err != nil {
 		t.Fatalf("GetAutopilot: %v", err)
 	}
-	run, err := testHandler.AutopilotService.DispatchAutopilot(ctx, ap, pgtype.UUID{}, "manual", nil)
+	run, _, err := testHandler.AutopilotService.DispatchAutopilotManual(ctx, ap, pgtype.UUID{}, nil, parseUUID(testUserID))
 	if err != nil {
 		t.Fatalf("DispatchAutopilot: %v", err)
 	}

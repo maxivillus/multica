@@ -12,21 +12,15 @@ import (
 )
 
 type RegistryOptions struct {
-	Pool     *pgxpool.Pool
-	Realtime *realtime.Metrics
-	DaemonWS *daemonws.Metrics
-	Version  string
-	Commit   string
+	Pool        *pgxpool.Pool
+	ReplicaPool *pgxpool.Pool
+	Realtime    *realtime.Metrics
+	DaemonWS    *daemonws.Metrics
+	Version     string
+	Commit      string
 	// CardSessionObservability gates the experimental card-session diagnostic
 	// collector independently of the rest of the /metrics registry.
 	CardSessionObservability bool
-
-	// BusinessSampler, when non-nil, opts the registry into the
-	// scrape-time SQL sampler from PR4 (MUL-2947). It is intentionally
-	// separate from Pool so existing tests (and any deployment without
-	// METRICS_ADDR) cannot accidentally start hitting the database on
-	// every /metrics scrape.
-	BusinessSampler *BusinessSamplerOptions
 }
 
 type Registry struct {
@@ -35,13 +29,9 @@ type Registry struct {
 	Business     *BusinessMetrics
 	ChannelMedia *ChannelMediaReconcilerMetrics
 	ChannelLease *ChannelLeaseMetrics
-	SeatCapacity *SeatCapacityMetrics
 	Wecom        *WecomMetrics
 	CardSession  *CardSessionMetrics
-	// Sampler is non-nil only when RegistryOptions.BusinessSampler was
-	// supplied with a valid Pool. Exposed so the cmd/server entrypoint
-	// can plumb the same instance into health checks if it ever wants to.
-	Sampler *BusinessSamplerCollector
+	DBRouting    *DBRoutingMetrics
 }
 
 func NewRegistry(opts RegistryOptions) *Registry {
@@ -68,11 +58,10 @@ func NewRegistry(opts RegistryOptions) *Registry {
 	channelLease := NewChannelLeaseMetrics()
 	reg.MustRegister(channelLease.Collectors()...)
 
-	seatCapacity := NewSeatCapacityMetrics()
-	reg.MustRegister(seatCapacity.Collectors()...)
-
 	wecomMetrics := NewWecomMetrics()
 	reg.MustRegister(wecomMetrics.Collectors()...)
+	dbRoutingMetrics := NewDBRoutingMetrics()
+	reg.MustRegister(dbRoutingMetrics.Collectors()...)
 
 	var cardSessionMetrics *CardSessionMetrics
 	if opts.CardSessionObservability {
@@ -81,7 +70,7 @@ func NewRegistry(opts RegistryOptions) *Registry {
 	}
 
 	if opts.Pool != nil {
-		reg.MustRegister(NewDBCollector(opts.Pool))
+		reg.MustRegister(NewDBCollector(opts.Pool, opts.ReplicaPool))
 	}
 	if opts.Realtime != nil {
 		reg.MustRegister(NewRealtimeCollector(opts.Realtime))
@@ -90,21 +79,15 @@ func NewRegistry(opts RegistryOptions) *Registry {
 		reg.MustRegister(NewDaemonWSCollector(opts.DaemonWS))
 	}
 
-	sampler := NewBusinessSamplerCollector(opts.BusinessSampler)
-	if sampler != nil {
-		reg.MustRegister(sampler.Collectors()...)
-	}
-
 	return &Registry{
 		Gatherer:     reg,
 		HTTP:         httpMetrics,
 		Business:     businessMetrics,
 		ChannelMedia: channelMedia,
 		ChannelLease: channelLease,
-		SeatCapacity: seatCapacity,
 		Wecom:        wecomMetrics,
 		CardSession:  cardSessionMetrics,
-		Sampler:      sampler,
+		DBRouting:    dbRoutingMetrics,
 	}
 }
 

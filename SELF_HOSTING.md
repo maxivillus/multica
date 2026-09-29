@@ -12,6 +12,16 @@ Deploy Multica on your own infrastructure in minutes.
 
 Each user who runs AI agents locally also installs the **`multica` CLI** and runs the **agent daemon** on their own machine.
 
+## Anonymous Deployment Telemetry
+
+The self-hosted API server sends one first-party, deployment-level anonymous snapshot per UTC day to the fixed Multica endpoint `https://telemetry.multica.ai/v1/telemetry/events`. This helps maintainers understand which release versions are in use, deployment-size ranges, and aggregate run volume. The endpoint is compiled into the server and cannot be redirected through configuration.
+
+The snapshot contains only the release version; bucketed counts of workspaces, distinct human members, active agents, and daemons seen in the previous 24 hours; and aggregate counts of runs started, completed, failed, and cancelled in that window. It does not include names, email addresses or domains, IP addresses, business IDs, host/device details, repository or organization details, model/plugin data, prompts or output, comments or chats, paths, token/cost data, credentials, errors, stacks, or logs. This telemetry is not used for billing, licensing, authentication, or security decisions.
+
+Telemetry is enabled by default. To stop both collection and network delivery, set `DO_NOT_TRACK=1` or `DO_NOT_TRACK=true` on the API server and recreate/restart the backend. The deployment identity remains in PostgreSQL, so enabling it again does not create a new identity. `ANALYTICS_DISABLED` controls the separate PostHog integration and does not disable this first-party telemetry.
+
+When cloning a production database for staging or testing, clear the clone's `instance_telemetry_state` table before starting its API server (or set `DO_NOT_TRACK=true`); otherwise both deployments share one identity and their same-day snapshots can silently deduplicate each other.
+
 ## Quick Install (Recommended)
 
 Two commands to set up everything — server, CLI, and configuration.
@@ -117,6 +127,7 @@ You also need at least one AI agent CLI installed:
 - [GitHub Copilot CLI](https://docs.github.com/en/copilot) (`copilot` on PATH)
 - [OpenClaw](https://github.com/openclaw/openclaw) (`openclaw` on PATH)
 - [OpenCode](https://github.com/anomalyco/opencode) (`opencode` on PATH)
+- [Huawei Cloud CodeArts](https://support.huaweicloud.com/qs-codeartssnap/codeartsagent_qs_0004.html) (`codearts` on PATH)
 - [Hermes](https://github.com/NousResearch/hermes) (`hermes` on PATH)
 - [Pi](https://pi.dev/) (`pi` on PATH)
 - [Cursor Agent](https://cursor.com/) (`cursor-agent` on PATH)
@@ -252,6 +263,8 @@ When developing from a checkout, use the local chart path instead:
 helm install multica deploy/helm/multica -n multica
 ```
 
+If the backend has to reach services whose certificates come from an internal CA, such as a self-hosted Gitea, set `backend.extraCACerts.configMap`. See [Advanced Configuration → Private CA Certificates](SELF_HOSTING_ADVANCED.md#private-ca-certificates-optional).
+
 Watch the pods come up:
 
 ```bash
@@ -377,7 +390,12 @@ The Usage / Runtime dashboards read from a derived `task_usage_hourly` table pop
 
 Multiple backend replicas are safe: each replica ticks every 30 seconds and tries to claim the current 5-minute UTC plan, but the unique key `(job_name, scope_kind, scope_id, plan_time)` means only one wins each plan. Inspect steady-state operation:
 
-> **Exception — WeCom (企业微信) smart bot must run single-replica.** Unlike Slack and Lark, whose outbound is stateless HTTP that any replica can perform, the WeCom smart bot's only outbound path is an in-process WebSocket long connection. Agent replies and inbox pushes are delivered only by the replica currently holding a given bot's connection lease. If you run more than one backend replica with WeCom enabled (`MULTICA_WECOM_SECRET_KEY` set), responses produced on a replica that does not hold the lease are silently dropped and the WeCom user sees nothing. Until cross-replica outbound routing lands, run the WeCom-enabled backend as a single replica. Everything else (including the rollup scheduler above) is multi-replica safe.
+> **WeCom (企业微信) smart bot and replica count.** Unlike Slack and Lark, whose outbound is stateless HTTP that any replica can perform, the WeCom smart bot's only outbound path is an in-process WebSocket long connection, held by the replica that owns that bot's lease. What happens to a reply produced on a *different* replica depends on the realtime relay:
+>
+> - **Sharded or dual relay mode (`REDIS_URL` set, the default with Redis):** the reply or inbox push is forwarded to the lease holder over the relay and delivered. Multi-replica WeCom is supported in this mode.
+> - **Legacy relay mode, or no Redis:** the reply is dropped and the WeCom user sees nothing. Run the WeCom-enabled backend as a single replica in this configuration.
+>
+> In **every** mode there is one residual window: a reply produced while *no* replica holds a live connection to that bot — all of them mid-reconnect — is not delivered. It is **counted**: the replica that routed it checks afterwards whether any replica ever claimed the delivery, and increments `multica_wecom_outbound_dropped_total{reason="no_live_connection"}` when none did, so the window can be measured on a deployment rather than guessed at. If a rare lost reply during reconnects is unacceptable, a single replica remains the most conservative deployment. Everything else (including the rollup scheduler above) is multi-replica safe.
 
 ```sql
 SELECT plan_time, status, attempt, runner_id,

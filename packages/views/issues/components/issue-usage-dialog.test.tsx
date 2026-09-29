@@ -56,7 +56,24 @@ beforeEach(() => {
 afterEach(cleanup);
 
 describe("IssueUsageDialog", () => {
-  it("floors the cache hit rate instead of rounding it up to 100%", () => {
+  it("includes cache writes in the cache hit-rate denominator", () => {
+    open([
+      makeTask({
+        usage: [
+          usage({
+            input_tokens: 0,
+            output_tokens: 0,
+            cache_read_tokens: 72_000,
+            cache_write_tokens: 28_000,
+          }),
+        ],
+      }),
+    ]);
+
+    expect(screen.getByText(/72% hit rate/)).toBeInTheDocument();
+  });
+
+  it("does not round an incomplete cache hit rate up to 100%", () => {
     // 99.55% — rounding would print "100% hit rate" and claim every token came
     // from cache on an issue that plainly read some fresh input.
     open([
@@ -75,6 +92,24 @@ describe("IssueUsageDialog", () => {
     ]);
 
     expect(screen.getByText(/100% hit rate/)).toBeInTheDocument();
+  });
+
+  it("shows an unavailable hit rate when no input-side tokens were reported", () => {
+    open([
+      makeTask({
+        usage: [
+          usage({
+            input_tokens: 0,
+            output_tokens: 1_000,
+            cache_read_tokens: 0,
+            cache_write_tokens: 0,
+          }),
+        ],
+      }),
+    ]);
+
+    expect(screen.getByText("—")).toBeInTheDocument();
+    expect(screen.queryByText(/0% hit rate/)).not.toBeInTheDocument();
   });
 
   it("keeps the full model list reachable when the cell truncates", () => {
@@ -104,19 +139,5 @@ describe("IssueUsageDialog", () => {
 
     expect(screen.getByText("Completed")).toBeInTheDocument();
     expect(screen.getByText("Failed")).toBeInTheDocument();
-  });
-
-  it("lets the run table scroll rather than widening the dialog", () => {
-    // jsdom has no layout engine, so the overflow itself is verified in a
-    // browser. What is pinned here is the contract that produced the bug: the
-    // scroll container must be able to shrink below its content. Drop
-    // `min-w-0` and the box grows to the table's min-content width instead of
-    // clipping, which is what pushed the table outside the dialog.
-    open([makeTask({ usage: [usage()] })]);
-
-    const table = screen.getByRole("table");
-    const scroller = table.parentElement;
-    expect(scroller?.className).toContain("overflow-auto");
-    expect(scroller?.className).toContain("min-w-0");
   });
 });

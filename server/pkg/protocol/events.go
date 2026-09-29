@@ -85,6 +85,7 @@ const (
 	// draft restore (#5219). Channel outbounds (Slack/Lark) deliberately do
 	// not subscribe to it — cancellation stays silent on external channels.
 	EventChatCancelFinalized = "chat:cancel_finalized"
+	EventChatSessionCreated  = "chat:session_created"
 	EventChatSessionRead     = "chat:session_read"
 	EventChatSessionDeleted  = "chat:session_deleted"
 	EventChatSessionUpdated  = "chat:session_updated"
@@ -142,17 +143,19 @@ const (
 	EventSquadDeleted = "squad:deleted"
 
 	// Daemon events
-	EventDaemonHeartbeat              = "daemon:heartbeat"
-	EventDaemonHeartbeatAck           = "daemon:heartbeat_ack"
-	EventDaemonRegister               = "daemon:register"
-	EventDaemonTaskAvailable          = "daemon:task_available"
-	EventDaemonRuntimeProfilesChanged = "daemon:runtime_profiles_changed"
-	EventDaemonWorkspacesChanged      = "daemon:workspaces_changed"
+	EventDaemonHeartbeat               = "daemon:heartbeat"
+	EventDaemonHeartbeatAck            = "daemon:heartbeat_ack"
+	EventDaemonRegister                = "daemon:register"
+	EventDaemonTaskAvailable           = "daemon:task_available"
+	EventDaemonTaskSupplementAvailable = "daemon:task_supplement_available"
+	EventDaemonRuntimeProfilesChanged  = "daemon:runtime_profiles_changed"
+	EventDaemonWorkspacesChanged       = "daemon:workspaces_changed"
 	// EventDaemonPendingWork is a runtime-scoped hint that a heartbeat-carried
-	// request (today: model-list discovery) is queued for that runtime. Without
-	// it the daemon only learns about the request on its next scheduled
-	// heartbeat, which adds up to one HeartbeatInterval (15s by default) of
-	// dead wait to an interactive UI flow (MUL-5444). The hint carries no work
+	// request (model discovery, capability discovery, or local-skill import) is
+	// queued for that runtime. Without it the daemon only learns about the
+	// request on its next scheduled heartbeat, adding up to one HeartbeatInterval
+	// (15s by default) of dead wait to an interactive UI flow (MUL-5444). The
+	// hint carries no work
 	// itself: the daemon still pulls the request through the normal heartbeat
 	// claim, so a lost or duplicated hint is harmless.
 	EventDaemonPendingWork = "daemon:pending_work"

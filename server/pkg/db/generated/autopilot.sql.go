@@ -300,7 +300,7 @@ SELECT
     $11,
     COALESCE($12::uuid, gen_random_uuid())
 WHERE lock_task_owner_rows($1, NULL, $2)
-RETURNING id, agent_id, issue_id, status, priority, dispatched_at, started_at, completed_at, result, error, created_at, context, runtime_id, session_id, work_dir, trigger_comment_id, chat_session_id, autopilot_run_id, attempt, max_attempts, parent_task_id, failure_reason, trigger_summary, force_fresh_session, is_leader_task, wait_reason, initiator_user_id, handoff_note, prepare_lease_expires_at, squad_id, runtime_mcp_overlay, escalation_for_task_id, fire_at, originator_user_id, runtime_connected_apps, coalesced_comment_ids, delivered_comment_ids, chat_input_task_id, chat_finalize_deferred_at, originator_source, delegated_from_task_id, retry_of_task_id, rerun_of_task_id, rule_version_id, trigger_evidence_kind, trigger_evidence_ref_id, accountable_user_id, session_rollout_missing, retired_session_id, quick_actions_disabled, regenerate_quick_actions_for, branch_name, durable_work_dir, channel_context_revision
+RETURNING id, agent_id, issue_id, status, priority, dispatched_at, started_at, completed_at, result, error, created_at, context, runtime_id, session_id, work_dir, trigger_comment_id, chat_session_id, autopilot_run_id, attempt, max_attempts, parent_task_id, failure_reason, trigger_summary, force_fresh_session, is_leader_task, wait_reason, initiator_user_id, handoff_note, prepare_lease_expires_at, squad_id, runtime_mcp_overlay, escalation_for_task_id, fire_at, originator_user_id, runtime_connected_apps, coalesced_comment_ids, delivered_comment_ids, chat_input_task_id, chat_finalize_deferred_at, originator_source, delegated_from_task_id, retry_of_task_id, rerun_of_task_id, rule_version_id, trigger_evidence_kind, trigger_evidence_ref_id, accountable_user_id, session_rollout_missing, retired_session_id, quick_actions_disabled, regenerate_quick_actions_for, branch_name, durable_work_dir, channel_context_revision, comment_thread_id, cancelled_by_type, cancelled_by_id, cancelled_by_name, issue_snapshot
 `
 
 type CreateAutopilotTaskParams struct {
@@ -408,6 +408,11 @@ func (q *Queries) CreateAutopilotTask(ctx context.Context, arg CreateAutopilotTa
 		&i.BranchName,
 		&i.DurableWorkDir,
 		&i.ChannelContextRevision,
+		&i.CommentThreadID,
+		&i.CancelledByType,
+		&i.CancelledByID,
+		&i.CancelledByName,
+		&i.IssueSnapshot,
 	)
 	return i, err
 }
@@ -416,14 +421,16 @@ const createAutopilotTrigger = `-- name: CreateAutopilotTrigger :one
 INSERT INTO autopilot_trigger (
     autopilot_id, kind, enabled, cron_expression, timezone,
     next_run_at, webhook_token, label, provider, event_filters,
-    published_by_type, published_by_id
+    published_by_type, published_by_id,
+    created_by_type, created_by_id
 ) VALUES (
     $1, $2, $3, $4, $5,
     $6, $7, $8,
     COALESCE($9::text, 'generic'),
     $10,
-    $11, $12
-) RETURNING id, autopilot_id, kind, enabled, cron_expression, timezone, next_run_at, webhook_token, label, last_fired_at, created_at, updated_at, provider, signing_secret, event_filters, published_by_type, published_by_id
+    $11, $12,
+    $13, $14
+) RETURNING id, autopilot_id, kind, enabled, cron_expression, timezone, next_run_at, webhook_token, label, last_fired_at, created_at, updated_at, provider, signing_secret, event_filters, published_by_type, published_by_id, created_by_type, created_by_id
 `
 
 type CreateAutopilotTriggerParams struct {
@@ -439,6 +446,8 @@ type CreateAutopilotTriggerParams struct {
 	EventFilters    []byte             `json:"event_filters"`
 	PublishedByType pgtype.Text        `json:"published_by_type"`
 	PublishedByID   pgtype.UUID        `json:"published_by_id"`
+	CreatedByType   pgtype.Text        `json:"created_by_type"`
+	CreatedByID     pgtype.UUID        `json:"created_by_id"`
 }
 
 func (q *Queries) CreateAutopilotTrigger(ctx context.Context, arg CreateAutopilotTriggerParams) (AutopilotTrigger, error) {
@@ -455,6 +464,8 @@ func (q *Queries) CreateAutopilotTrigger(ctx context.Context, arg CreateAutopilo
 		arg.EventFilters,
 		arg.PublishedByType,
 		arg.PublishedByID,
+		arg.CreatedByType,
+		arg.CreatedByID,
 	)
 	var i AutopilotTrigger
 	err := row.Scan(
@@ -475,6 +486,8 @@ func (q *Queries) CreateAutopilotTrigger(ctx context.Context, arg CreateAutopilo
 		&i.EventFilters,
 		&i.PublishedByType,
 		&i.PublishedByID,
+		&i.CreatedByType,
+		&i.CreatedByID,
 	)
 	return i, err
 }
@@ -925,7 +938,7 @@ func (q *Queries) GetAutopilotRunByWebhookDelivery(ctx context.Context, webhookD
 }
 
 const getAutopilotTaskByRun = `-- name: GetAutopilotTaskByRun :one
-SELECT id, agent_id, issue_id, status, priority, dispatched_at, started_at, completed_at, result, error, created_at, context, runtime_id, session_id, work_dir, trigger_comment_id, chat_session_id, autopilot_run_id, attempt, max_attempts, parent_task_id, failure_reason, trigger_summary, force_fresh_session, is_leader_task, wait_reason, initiator_user_id, handoff_note, prepare_lease_expires_at, squad_id, runtime_mcp_overlay, escalation_for_task_id, fire_at, originator_user_id, runtime_connected_apps, coalesced_comment_ids, delivered_comment_ids, chat_input_task_id, chat_finalize_deferred_at, originator_source, delegated_from_task_id, retry_of_task_id, rerun_of_task_id, rule_version_id, trigger_evidence_kind, trigger_evidence_ref_id, accountable_user_id, session_rollout_missing, retired_session_id, quick_actions_disabled, regenerate_quick_actions_for, branch_name, durable_work_dir, channel_context_revision FROM agent_task_queue
+SELECT id, agent_id, issue_id, status, priority, dispatched_at, started_at, completed_at, result, error, created_at, context, runtime_id, session_id, work_dir, trigger_comment_id, chat_session_id, autopilot_run_id, attempt, max_attempts, parent_task_id, failure_reason, trigger_summary, force_fresh_session, is_leader_task, wait_reason, initiator_user_id, handoff_note, prepare_lease_expires_at, squad_id, runtime_mcp_overlay, escalation_for_task_id, fire_at, originator_user_id, runtime_connected_apps, coalesced_comment_ids, delivered_comment_ids, chat_input_task_id, chat_finalize_deferred_at, originator_source, delegated_from_task_id, retry_of_task_id, rerun_of_task_id, rule_version_id, trigger_evidence_kind, trigger_evidence_ref_id, accountable_user_id, session_rollout_missing, retired_session_id, quick_actions_disabled, regenerate_quick_actions_for, branch_name, durable_work_dir, channel_context_revision, comment_thread_id, cancelled_by_type, cancelled_by_id, cancelled_by_name, issue_snapshot FROM agent_task_queue
 WHERE autopilot_run_id = $1
 ORDER BY created_at
 LIMIT 1
@@ -991,12 +1004,17 @@ func (q *Queries) GetAutopilotTaskByRun(ctx context.Context, autopilotRunID pgty
 		&i.BranchName,
 		&i.DurableWorkDir,
 		&i.ChannelContextRevision,
+		&i.CommentThreadID,
+		&i.CancelledByType,
+		&i.CancelledByID,
+		&i.CancelledByName,
+		&i.IssueSnapshot,
 	)
 	return i, err
 }
 
 const getAutopilotTrigger = `-- name: GetAutopilotTrigger :one
-SELECT id, autopilot_id, kind, enabled, cron_expression, timezone, next_run_at, webhook_token, label, last_fired_at, created_at, updated_at, provider, signing_secret, event_filters, published_by_type, published_by_id FROM autopilot_trigger
+SELECT id, autopilot_id, kind, enabled, cron_expression, timezone, next_run_at, webhook_token, label, last_fired_at, created_at, updated_at, provider, signing_secret, event_filters, published_by_type, published_by_id, created_by_type, created_by_id FROM autopilot_trigger
 WHERE id = $1
 `
 
@@ -1021,12 +1039,61 @@ func (q *Queries) GetAutopilotTrigger(ctx context.Context, id pgtype.UUID) (Auto
 		&i.EventFilters,
 		&i.PublishedByType,
 		&i.PublishedByID,
+		&i.CreatedByType,
+		&i.CreatedByID,
+	)
+	return i, err
+}
+
+const getAutopilotTriggerForAutopilot = `-- name: GetAutopilotTriggerForAutopilot :one
+SELECT t.id, t.autopilot_id, t.kind, t.enabled, t.cron_expression, t.timezone, t.next_run_at, t.webhook_token, t.label, t.last_fired_at, t.created_at, t.updated_at, t.provider, t.signing_secret, t.event_filters, t.published_by_type, t.published_by_id, t.created_by_type, t.created_by_id FROM autopilot_trigger t
+JOIN autopilot a ON a.id = t.autopilot_id
+WHERE t.id = $1 AND t.autopilot_id = $2 AND a.workspace_id = $3
+`
+
+type GetAutopilotTriggerForAutopilotParams struct {
+	ID          pgtype.UUID `json:"id"`
+	AutopilotID pgtype.UUID `json:"autopilot_id"`
+	WorkspaceID pgtype.UUID `json:"workspace_id"`
+}
+
+// Trigger lookup BOUND to both the autopilot it must belong to AND that
+// autopilot's workspace. Since MUL-6951 the trigger row decides which human a run
+// acts as, so an unbound `WHERE id = $1` would let a trigger id from another
+// autopilot select the principal. The workspace join closes the other half: the
+// caller's membership check proves the resolved human belongs to the workspace it
+// passed, not that the AUTOPILOT does, and a member of two workspaces would
+// satisfy the former while the trigger came from the other tenant. Callers
+// resolving an authorization principal must use this, not GetAutopilotTrigger.
+func (q *Queries) GetAutopilotTriggerForAutopilot(ctx context.Context, arg GetAutopilotTriggerForAutopilotParams) (AutopilotTrigger, error) {
+	row := q.db.QueryRow(ctx, getAutopilotTriggerForAutopilot, arg.ID, arg.AutopilotID, arg.WorkspaceID)
+	var i AutopilotTrigger
+	err := row.Scan(
+		&i.ID,
+		&i.AutopilotID,
+		&i.Kind,
+		&i.Enabled,
+		&i.CronExpression,
+		&i.Timezone,
+		&i.NextRunAt,
+		&i.WebhookToken,
+		&i.Label,
+		&i.LastFiredAt,
+		&i.CreatedAt,
+		&i.UpdatedAt,
+		&i.Provider,
+		&i.SigningSecret,
+		&i.EventFilters,
+		&i.PublishedByType,
+		&i.PublishedByID,
+		&i.CreatedByType,
+		&i.CreatedByID,
 	)
 	return i, err
 }
 
 const getWebhookTriggerByToken = `-- name: GetWebhookTriggerByToken :one
-SELECT t.id, t.autopilot_id, t.kind, t.enabled, t.cron_expression, t.timezone, t.next_run_at, t.webhook_token, t.label, t.last_fired_at, t.created_at, t.updated_at, t.provider, t.signing_secret, t.event_filters, t.published_by_type, t.published_by_id, a.workspace_id AS autopilot_workspace_id
+SELECT t.id, t.autopilot_id, t.kind, t.enabled, t.cron_expression, t.timezone, t.next_run_at, t.webhook_token, t.label, t.last_fired_at, t.created_at, t.updated_at, t.provider, t.signing_secret, t.event_filters, t.published_by_type, t.published_by_id, t.created_by_type, t.created_by_id, a.workspace_id AS autopilot_workspace_id
 FROM autopilot_trigger t
 JOIN autopilot a ON a.id = t.autopilot_id
 WHERE t.kind = 'webhook'
@@ -1051,6 +1118,8 @@ type GetWebhookTriggerByTokenRow struct {
 	EventFilters         []byte             `json:"event_filters"`
 	PublishedByType      pgtype.Text        `json:"published_by_type"`
 	PublishedByID        pgtype.UUID        `json:"published_by_id"`
+	CreatedByType        pgtype.Text        `json:"created_by_type"`
+	CreatedByID          pgtype.UUID        `json:"created_by_id"`
 	AutopilotWorkspaceID pgtype.UUID        `json:"autopilot_workspace_id"`
 }
 
@@ -1080,6 +1149,8 @@ func (q *Queries) GetWebhookTriggerByToken(ctx context.Context, webhookToken pgt
 		&i.EventFilters,
 		&i.PublishedByType,
 		&i.PublishedByID,
+		&i.CreatedByType,
+		&i.CreatedByID,
 		&i.AutopilotWorkspaceID,
 	)
 	return i, err
@@ -1264,9 +1335,51 @@ func (q *Queries) ListAutopilotSubscribers(ctx context.Context, autopilotID pgty
 	return items, nil
 }
 
+const listAutopilotSubscribersForAutopilots = `-- name: ListAutopilotSubscribersForAutopilots :many
+SELECT s.autopilot_id, s.user_type, s.user_id, s.created_at FROM autopilot_subscriber AS s
+JOIN autopilot AS a ON a.id = s.autopilot_id
+JOIN member AS m
+  ON m.workspace_id = a.workspace_id
+ AND m.user_id = s.user_id
+WHERE s.autopilot_id = ANY($1::uuid[])
+  AND s.user_type = 'member'
+ORDER BY s.autopilot_id ASC, s.created_at ASC, s.user_id ASC
+`
+
+// Batch form of ListAutopilotSubscribers for the list endpoint, which must not
+// issue one query per row. The autopilot_subscriber primary key leads with
+// autopilot_id, so ANY($1) is index-supported and no extra index is needed.
+// The member join and ordering are identical to the single-autopilot query on
+// purpose: list and detail have to agree on who counts as a subscriber, or the
+// two projections disagree again (MUL-6680).
+func (q *Queries) ListAutopilotSubscribersForAutopilots(ctx context.Context, dollar_1 []pgtype.UUID) ([]AutopilotSubscriber, error) {
+	rows, err := q.db.Query(ctx, listAutopilotSubscribersForAutopilots, dollar_1)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	items := []AutopilotSubscriber{}
+	for rows.Next() {
+		var i AutopilotSubscriber
+		if err := rows.Scan(
+			&i.AutopilotID,
+			&i.UserType,
+			&i.UserID,
+			&i.CreatedAt,
+		); err != nil {
+			return nil, err
+		}
+		items = append(items, i)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
+	return items, nil
+}
+
 const listAutopilotTriggers = `-- name: ListAutopilotTriggers :many
 
-SELECT id, autopilot_id, kind, enabled, cron_expression, timezone, next_run_at, webhook_token, label, last_fired_at, created_at, updated_at, provider, signing_secret, event_filters, published_by_type, published_by_id FROM autopilot_trigger
+SELECT id, autopilot_id, kind, enabled, cron_expression, timezone, next_run_at, webhook_token, label, last_fired_at, created_at, updated_at, provider, signing_secret, event_filters, published_by_type, published_by_id, created_by_type, created_by_id FROM autopilot_trigger
 WHERE autopilot_id = $1
 ORDER BY created_at ASC
 `
@@ -1301,6 +1414,8 @@ func (q *Queries) ListAutopilotTriggers(ctx context.Context, autopilotID pgtype.
 			&i.EventFilters,
 			&i.PublishedByType,
 			&i.PublishedByID,
+			&i.CreatedByType,
+			&i.CreatedByID,
 		); err != nil {
 			return nil, err
 		}
@@ -1700,7 +1815,7 @@ SET webhook_token = $2,
     updated_at = now()
 WHERE id = $1
   AND kind = 'webhook'
-RETURNING id, autopilot_id, kind, enabled, cron_expression, timezone, next_run_at, webhook_token, label, last_fired_at, created_at, updated_at, provider, signing_secret, event_filters, published_by_type, published_by_id
+RETURNING id, autopilot_id, kind, enabled, cron_expression, timezone, next_run_at, webhook_token, label, last_fired_at, created_at, updated_at, provider, signing_secret, event_filters, published_by_type, published_by_id, created_by_type, created_by_id
 `
 
 type RotateAutopilotTriggerWebhookTokenParams struct {
@@ -1732,6 +1847,8 @@ func (q *Queries) RotateAutopilotTriggerWebhookToken(ctx context.Context, arg Ro
 		&i.EventFilters,
 		&i.PublishedByType,
 		&i.PublishedByID,
+		&i.CreatedByType,
+		&i.CreatedByID,
 	)
 	return i, err
 }
@@ -1831,8 +1948,14 @@ type SetAutopilotTriggerPublisherParams struct {
 }
 
 // Re-stamp a single trigger's responsible publisher after a substantive edit of
-// THAT trigger (cron / filter / enabled / webhook security). Future runs it fires
-// become accountable to this member (MUL-4302 trigger_owner transfer).
+// THAT trigger (cron / filter / enabled / webhook security), recording who is now
+// responsible for its config (MUL-4302).
+//
+// Since MUL-6951 this changes NOTHING about the runs it fires: they act as, and
+// are accountable to, the trigger's immutable created_by. An edit must not be able
+// to re-authorize the automation as the editor (Bohan's ruling), so this statement
+// deliberately does not touch created_by, and published_by is now a config-audit
+// column only.
 func (q *Queries) SetAutopilotTriggerPublisher(ctx context.Context, arg SetAutopilotTriggerPublisherParams) error {
 	_, err := q.db.Exec(ctx, setAutopilotTriggerPublisher, arg.ID, arg.PublishedByType, arg.PublishedByID)
 	return err
@@ -1866,7 +1989,7 @@ SET signing_secret = $2,
     updated_at = now()
 WHERE id = $1
   AND kind = 'webhook'
-RETURNING id, autopilot_id, kind, enabled, cron_expression, timezone, next_run_at, webhook_token, label, last_fired_at, created_at, updated_at, provider, signing_secret, event_filters, published_by_type, published_by_id
+RETURNING id, autopilot_id, kind, enabled, cron_expression, timezone, next_run_at, webhook_token, label, last_fired_at, created_at, updated_at, provider, signing_secret, event_filters, published_by_type, published_by_id, created_by_type, created_by_id
 `
 
 type SetAutopilotTriggerSigningSecretParams struct {
@@ -1900,6 +2023,8 @@ func (q *Queries) SetAutopilotTriggerSigningSecret(ctx context.Context, arg SetA
 		&i.EventFilters,
 		&i.PublishedByType,
 		&i.PublishedByID,
+		&i.CreatedByType,
+		&i.CreatedByID,
 	)
 	return i, err
 }
@@ -1909,7 +2034,7 @@ UPDATE autopilot_trigger
 SET webhook_token = $2,
     updated_at = now()
 WHERE id = $1
-RETURNING id, autopilot_id, kind, enabled, cron_expression, timezone, next_run_at, webhook_token, label, last_fired_at, created_at, updated_at, provider, signing_secret, event_filters, published_by_type, published_by_id
+RETURNING id, autopilot_id, kind, enabled, cron_expression, timezone, next_run_at, webhook_token, label, last_fired_at, created_at, updated_at, provider, signing_secret, event_filters, published_by_type, published_by_id, created_by_type, created_by_id
 `
 
 type SetAutopilotTriggerWebhookTokenParams struct {
@@ -1943,6 +2068,8 @@ func (q *Queries) SetAutopilotTriggerWebhookToken(ctx context.Context, arg SetAu
 		&i.EventFilters,
 		&i.PublishedByType,
 		&i.PublishedByID,
+		&i.CreatedByType,
+		&i.CreatedByID,
 	)
 	return i, err
 }
@@ -2456,7 +2583,7 @@ UPDATE autopilot_trigger SET
     event_filters = COALESCE($7, event_filters),
     updated_at = now()
 WHERE id = $1
-RETURNING id, autopilot_id, kind, enabled, cron_expression, timezone, next_run_at, webhook_token, label, last_fired_at, created_at, updated_at, provider, signing_secret, event_filters, published_by_type, published_by_id
+RETURNING id, autopilot_id, kind, enabled, cron_expression, timezone, next_run_at, webhook_token, label, last_fired_at, created_at, updated_at, provider, signing_secret, event_filters, published_by_type, published_by_id, created_by_type, created_by_id
 `
 
 type UpdateAutopilotTriggerParams struct {
@@ -2498,6 +2625,8 @@ func (q *Queries) UpdateAutopilotTrigger(ctx context.Context, arg UpdateAutopilo
 		&i.EventFilters,
 		&i.PublishedByType,
 		&i.PublishedByID,
+		&i.CreatedByType,
+		&i.CreatedByID,
 	)
 	return i, err
 }
