@@ -4,217 +4,125 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"log/slog"
 	"time"
 
 	"github.com/jackc/pgx/v5"
-	"github.com/jackc/pgx/v5/pgconn"
 	"github.com/jackc/pgx/v5/pgtype"
-	"github.com/multica-ai/multica/server/internal/cardsession"
-	"github.com/multica-ai/multica/server/internal/events"
-	"github.com/multica-ai/multica/server/internal/issuestatus"
 	"github.com/multica-ai/multica/server/internal/util"
 	db "github.com/multica-ai/multica/server/pkg/db/generated"
-	"github.com/multica-ai/multica/server/pkg/dbid"
-	"github.com/multica-ai/multica/server/pkg/protocol"
 )
 
-const cardSessionTokenStatsCandidateLimit int32 = 100
+const cardSessionTokenStatsRecoveryLimit int32 = 100
 
-type cardSessionTokenStatsPublication struct {
-	comment       db.Comment
-	issue         db.Issue
-	issueRevision int64
+// RefreshCardSessionTokenStatsAsync schedules a session aggregate update after
+// provider usage has been persisted. The recovery sweep repairs work lost to a
+// process restart between the usage write and this background refresh.
+func (s *TaskService) RefreshCardSessionTokenStatsAsync(taskID pgtype.UUID) {
+	if s == nil || s.Queries == nil || s.TxStarter == nil {
+		return
+	}
+	go func() {
+		ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
+		defer cancel()
+		if err := s.RefreshCardSessionTokenStatsForTask(ctx, taskID); err != nil {
+			slog.Warn("card session token stats refresh failed",
+				"task_id", util.UUIDToString(taskID),
+				"error", err,
+			)
+		}
+	}()
 }
 
-// PublishDueCardSessionTokenStats writes one cumulative, system-authored
-// snapshot for each due open generation. The publication watermark is
-// advanced in the same transaction as the comment, so a concurrent server
-// sweeper cannot produce duplicate snapshots for the same generation/interval.
-// A session with no usage yet advances its watermark without adding a noisy
-// zero-token comment; the next interval will include the first real usage.
-func (s *TaskService) PublishDueCardSessionTokenStats(ctx context.Context) (int64, error) {
+// RefreshCardSessionTokenStatsForTask recomputes the owning session's totals
+// from task_usage, so provider corrections replace prior values instead of
+// being double-counted.
+func (s *TaskService) RefreshCardSessionTokenStatsForTask(ctx context.Context, taskID pgtype.UUID) error {
+	if s == nil || s.Queries == nil || s.TxStarter == nil {
+		return nil
+	}
+	tx, err := s.TxStarter.Begin(ctx)
+	if err != nil {
+		return fmt.Errorf("begin card session token stats refresh: %w", err)
+	}
+	defer tx.Rollback(ctx)
+	qtx := s.Queries.WithTx(tx)
+	cardSessionID, err := qtx.LockCardSessionForTaskTokenStats(ctx, taskID)
+	if errors.Is(err, pgx.ErrNoRows) {
+		return nil
+	}
+	if err != nil {
+		return fmt.Errorf("lock card session for token stats refresh: %w", err)
+	}
+	if err := refreshCardSessionTokenStats(ctx, qtx, cardSessionID); err != nil {
+		return err
+	}
+	if err := tx.Commit(ctx); err != nil {
+		return fmt.Errorf("commit card session token stats refresh: %w", err)
+	}
+	return nil
+}
+
+// RecoverCardSessionTokenStats refreshes sessions whose task usage changed
+// after the last successful aggregate update.
+func (s *TaskService) RecoverCardSessionTokenStats(ctx context.Context) (int64, error) {
 	if s == nil || s.Queries == nil || s.TxStarter == nil {
 		return 0, nil
 	}
-
-	candidates, err := s.Queries.ListOpenCardSessionTokenStatsCandidateIDs(ctx, cardSessionTokenStatsCandidateLimit)
+	ids, err := s.Queries.ListCardSessionsWithStaleTokenStats(ctx, cardSessionTokenStatsRecoveryLimit)
 	if err != nil {
-		// The new binary can overlap a rolling deployment before migration 421
-		// has reached the database. Treat that as an unavailable optional sweep,
-		// matching the existing card-session expiry compatibility behavior.
-		if isMissingCardSessionTokenStatsSchema(err) {
-			return 0, nil
-		}
-		return 0, fmt.Errorf("list card session token stats candidates: %w", err)
+		return 0, fmt.Errorf("list card sessions with stale token stats: %w", err)
 	}
-
-	var published int64
+	var refreshed int64
 	var firstErr error
-	for _, candidate := range candidates {
-		publication, err := s.publishCardSessionTokenStats(ctx, candidate.ID, candidate.IssueID, candidate.WorkspaceID)
-		if err != nil {
-			if isMissingCardSessionTokenStatsSchema(err) {
-				return published, nil
-			}
+	for _, id := range ids {
+		if err := s.refreshCardSessionTokenStatsByID(ctx, id); err != nil {
 			if firstErr == nil {
 				firstErr = err
 			}
 			continue
 		}
-		if publication == nil {
-			continue
-		}
-		published++
-		if s.Bus == nil {
-			continue
-		}
-		s.Bus.Publish(events.Event{
-			Type:        protocol.EventCommentCreated,
-			WorkspaceID: util.UUIDToString(publication.issue.WorkspaceID),
-			ActorType:   "system",
-			ActorID:     "",
-			Payload: map[string]any{
-				"comment": func() map[string]any {
-					fields := commentEventFields(publication.comment)
-					fields["revision"] = publication.comment.Revision
-					return fields
-				}(),
-				"issue_title":    publication.issue.Title,
-				"issue_status":   publication.issue.Status,
-				"issue_revision": publication.issueRevision,
-			},
-		})
+		refreshed++
 	}
-	return published, firstErr
+	return refreshed, firstErr
 }
 
-func (s *TaskService) publishCardSessionTokenStats(ctx context.Context, sessionID, issueID, workspaceID pgtype.UUID) (*cardSessionTokenStatsPublication, error) {
+func (s *TaskService) refreshCardSessionTokenStatsByID(ctx context.Context, cardSessionID pgtype.UUID) error {
 	tx, err := s.TxStarter.Begin(ctx)
 	if err != nil {
-		return nil, fmt.Errorf("begin card session token stats: %w", err)
+		return fmt.Errorf("begin recovered card session token stats refresh: %w", err)
 	}
 	defer tx.Rollback(ctx)
 	qtx := s.Queries.WithTx(tx)
-
-	// Keep the lock order aligned with issue status changes: issue, workspace,
-	// then card_session. CreateComment touches the already-locked issue and the
-	// card-session status trigger takes the workspace lock.
-	if _, err := qtx.LockIssueForCardSessionTokenStats(ctx, db.LockIssueForCardSessionTokenStatsParams{
-		IssueID:     issueID,
-		WorkspaceID: workspaceID,
-	}); err != nil {
-		if errors.Is(err, pgx.ErrNoRows) {
-			return nil, nil
-		}
-		return nil, fmt.Errorf("lock card session issue: %w", err)
+	if _, err := qtx.LockCardSessionTokenStats(ctx, cardSessionID); errors.Is(err, pgx.ErrNoRows) {
+		return nil
+	} else if err != nil {
+		return fmt.Errorf("lock recovered card session token stats: %w", err)
 	}
-	if _, err := qtx.LockWorkspaceForCardSession(ctx, workspaceID); err != nil {
-		return nil, fmt.Errorf("lock card session workspace: %w", err)
-	}
-	locked, err := qtx.LockWorkspaceAndGetCardSessionTokenStats(ctx, sessionID)
-	if err != nil {
-		if errors.Is(err, pgx.ErrNoRows) {
-			return nil, nil
-		}
-		return nil, fmt.Errorf("lock open card session: %w", err)
-	}
-
-	settings, err := cardsession.Parse(locked.WorkspaceSettings)
-	if err != nil {
-		return nil, fmt.Errorf("parse card session token stats settings: %w", err)
-	}
-	now := time.Now().UTC()
-	interval := time.Duration(settings.TokenStatsIntervalMinutes) * time.Minute
-	if locked.LastTokenStatsAt.Valid && now.Sub(locked.LastTokenStatsAt.Time) < interval {
-		return nil, nil
-	}
-	if !locked.LastTokenStatsAt.Valid && locked.OpenedAt.Valid && now.Sub(locked.OpenedAt.Time) < interval {
-		return nil, nil
-	}
-
-	issue, err := qtx.GetIssueInWorkspace(ctx, db.GetIssueInWorkspaceParams{
-		ID:          locked.IssueID,
-		WorkspaceID: locked.WorkspaceID,
-	})
-	if err != nil {
-		return nil, fmt.Errorf("load card session token stats issue: %w", err)
-	}
-	if issuestatus.IsTerminal(issuestatus.Effective(ctx, qtx, issue.WorkspaceID, issue.Status)) {
-		// The status trigger normally moves the session out of open before this
-		// transaction can observe it. Do not let a drifted row produce a comment
-		// that would reopen the issue through CreateComment.
-		return nil, nil
-	}
-
-	usage, err := qtx.GetOpenCardSessionTokenUsage(ctx, db.GetOpenCardSessionTokenUsageParams{
-		IssueID:     locked.IssueID,
-		AgentID:     locked.AgentID,
-		WorkspaceID: locked.WorkspaceID,
-		Since:       locked.OpenedAt,
-	})
-	if err != nil {
-		return nil, fmt.Errorf("load card session token usage: %w", err)
-	}
-
-	if err := qtx.UpdateCardSessionTokenStatsAt(ctx, db.UpdateCardSessionTokenStatsAtParams{
-		ID:          locked.ID,
-		PublishedAt: pgtype.Timestamptz{Time: now, Valid: true},
-	}); err != nil {
-		return nil, fmt.Errorf("advance card session token stats watermark: %w", err)
-	}
-	if usage.TaskCount == 0 {
-		if err := tx.Commit(ctx); err != nil {
-			return nil, fmt.Errorf("commit empty card session token stats: %w", err)
-		}
-		s.observeCardSessionIdentity(ctx, cardSessionEventTokenStats, "empty", locked.IssueID, locked.ID, locked.AgentID, locked.Generation, locked.Provider)
-		return nil, nil
-	}
-
-	created, err := qtx.CreateComment(ctx, db.CreateCommentParams{
-		ID:           dbid.NewV7(),
-		IssueID:      locked.IssueID,
-		WorkspaceID:  locked.WorkspaceID,
-		AuthorType:   "system",
-		AuthorID:     pgtype.UUID{Valid: true},
-		Content:      formatCardSessionTokenStats(locked.Generation, now, usage),
-		Type:         "system",
-		ParentID:     pgtype.UUID{Valid: false},
-		SourceTaskID: pgtype.UUID{Valid: false},
-	})
-	if err != nil {
-		return nil, fmt.Errorf("create card session token stats comment: %w", err)
+	if err := refreshCardSessionTokenStats(ctx, qtx, cardSessionID); err != nil {
+		return err
 	}
 	if err := tx.Commit(ctx); err != nil {
-		return nil, fmt.Errorf("commit card session token stats: %w", err)
+		return fmt.Errorf("commit recovered card session token stats: %w", err)
 	}
-	s.observeCardSessionIdentity(ctx, cardSessionEventTokenStats, "published", locked.IssueID, locked.ID, locked.AgentID, locked.Generation, locked.Provider,
-		"task_count", usage.TaskCount,
-	)
-
-	return &cardSessionTokenStatsPublication{
-		comment:       created.Comment(),
-		issue:         issue,
-		issueRevision: created.IssueRevision,
-	}, nil
+	return nil
 }
 
-func formatCardSessionTokenStats(generation int64, at time.Time, usage db.GetOpenCardSessionTokenUsageRow) string {
-	return fmt.Sprintf(
-		"Intermediate token usage update for open card generation %d (cumulative since the session opened, as of %s): input %d, output %d, cache read %d, cache write %d, tasks with usage %d.",
-		generation,
-		at.UTC().Format(time.RFC3339),
-		usage.TotalInputTokens,
-		usage.TotalOutputTokens,
-		usage.TotalCacheReadTokens,
-		usage.TotalCacheWriteTokens,
-		usage.TaskCount,
-	)
-}
-
-func isMissingCardSessionTokenStatsSchema(err error) bool {
-	var pgErr *pgconn.PgError
-	if !errors.As(err, &pgErr) {
-		return false
+func refreshCardSessionTokenStats(ctx context.Context, q *db.Queries, cardSessionID pgtype.UUID) error {
+	stats, err := q.GetCardSessionTokenStats(ctx, cardSessionID)
+	if err != nil {
+		return fmt.Errorf("aggregate card session token stats: %w", err)
 	}
-	return pgErr.Code == "42P01" || pgErr.Code == "42703"
+	if err := q.UpdateCardSessionTokenStats(ctx, db.UpdateCardSessionTokenStatsParams{
+		CardSessionID:    cardSessionID,
+		InputTokens:      stats.InputTokens,
+		OutputTokens:     stats.OutputTokens,
+		CacheReadTokens:  stats.CacheReadTokens,
+		CacheWriteTokens: stats.CacheWriteTokens,
+		TaskCount:        stats.TaskCount,
+		LatestUsageAt:    stats.LatestUsageAt,
+	}); err != nil {
+		return fmt.Errorf("update card session token stats: %w", err)
+	}
+	return nil
 }

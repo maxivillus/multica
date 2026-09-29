@@ -8,7 +8,6 @@ import (
 	"time"
 
 	"github.com/jackc/pgx/v5"
-	"github.com/jackc/pgx/v5/pgconn"
 	"github.com/jackc/pgx/v5/pgtype"
 	"github.com/multica-ai/multica/server/internal/cardsession"
 	"github.com/multica-ai/multica/server/internal/issuestatus"
@@ -17,23 +16,21 @@ import (
 )
 
 var (
-	// ErrCardSessionCapacity is returned before a task is inserted when a new
-	// generation would exceed the workspace's configured open-session cap.
+	// ErrCardSessionCapacity tells enqueue paths to keep the task deferred until
+	// a slot opens instead of creating a session over the workspace limit.
 	ErrCardSessionCapacity = errors.New("card session capacity exhausted")
-	// ErrCardSessionCloseForbidden makes the lifecycle rule explicit for future
-	// close endpoints: an open generation can only enter retention through a
-	// terminal issue transition, never through an arbitrary close request.
-	ErrCardSessionCloseForbidden = errors.New("card session can only close after issue reaches done or cancelled")
+	ErrCardSessionStatus   = errors.New("issue status does not allow an active card session")
+	ErrCardSessionInactive = ErrCardSessionStatus
 )
 
 const (
-	cardSessionEventEnsure      = "ensure"
-	cardSessionEventTerminal    = "terminal"
-	cardSessionEventReopen      = "reopen"
-	cardSessionEventExpire      = "expire"
-	cardSessionEventProviderPin = "provider_pin"
-	cardSessionEventTokenStats  = "token_stats"
-	cardSessionEventCapacity    = "capacity"
+	cardSessionEventEnsure             = "ensure"
+	cardSessionEventStatus             = "status"
+	cardSessionEventExpire             = "expire"
+	cardSessionEventProviderPin        = "provider_pin"
+	cardSessionEventCapacity           = "capacity"
+	cardSessionCapacityRetryDelay      = 30 * time.Second
+	cardSessionCapacityWaiterBatchSize = 20
 )
 
 func (s *TaskService) observeCardSession(ctx context.Context, event, result string, session db.CardSession, attrs ...any) {
@@ -109,9 +106,7 @@ func (s *TaskService) ObserveCardSessionProviderPinDuration(ctx context.Context,
 
 func normalizeCardSessionEvent(event string) string {
 	switch event {
-	case cardSessionEventEnsure, cardSessionEventTerminal, cardSessionEventReopen,
-		cardSessionEventExpire, cardSessionEventProviderPin, cardSessionEventTokenStats,
-		cardSessionEventCapacity:
+	case cardSessionEventEnsure, cardSessionEventStatus, cardSessionEventExpire, cardSessionEventProviderPin, cardSessionEventCapacity:
 		return event
 	default:
 		return "other"
@@ -120,27 +115,9 @@ func normalizeCardSessionEvent(event string) string {
 
 func normalizeCardSessionResult(result string) string {
 	switch result {
-	case "created", "reused", "reopened", "ready", "retained", "expired", "updated",
-		"published", "empty", "rejected", "noop", "unavailable", "error":
+	case "created", "reused", "paused", "resumed", "expired", "updated",
+		"rejected", "noop", "unavailable", "error":
 		return result
-	default:
-		return "other"
-	}
-}
-
-func normalizeCardSessionReopenSource(source string) string {
-	switch source {
-	case "status_transition", "comment_after_terminal", "agent_comment_after_terminal":
-		return source
-	default:
-		return "other"
-	}
-}
-
-func normalizeCardSessionTerminalStatus(status string) string {
-	switch status {
-	case issuestatus.Done, issuestatus.Cancelled:
-		return status
 	default:
 		return "other"
 	}
@@ -151,11 +128,6 @@ func normalizeCardSessionTerminalStatus(status string) string {
 // generation allocation atomic across concurrent comment/status triggers.
 func (s *TaskService) EnsureCardSession(ctx context.Context, issueID, workspaceID, agentID pgtype.UUID, provider string) (db.CardSession, error) {
 	started := time.Now()
-	// A few transaction-scoped and compatibility service instances are
-	// intentionally built without a transaction starter (for example, a
-	// caller that already owns the transaction, or a read-only test service).
-	// Card sessions are additive state, so those instances must retain the
-	// pre-session enqueue behavior instead of rejecting an otherwise valid task.
 	if s == nil || s.Queries == nil || s.TxStarter == nil {
 		return db.CardSession{}, nil
 	}
@@ -200,14 +172,28 @@ func (s *TaskService) ensureCardSessionWithQueries(ctx context.Context, q *db.Qu
 	if err != nil {
 		return db.CardSession{}, "", fmt.Errorf("lock workspace for card session: %w", err)
 	}
+	if _, err := q.LockIssueForCardSession(ctx, db.LockIssueForCardSessionParams{
+		ID: issueID, WorkspaceID: workspaceID,
+	}); err != nil {
+		if errors.Is(err, pgx.ErrNoRows) {
+			return db.CardSession{}, "", ErrCardSessionInactive
+		}
+		return db.CardSession{}, "", fmt.Errorf("lock issue for card session: %w", err)
+	}
 	settings, err := cardsession.Parse(workspace.Settings)
 	if err != nil {
 		return db.CardSession{}, "", err
 	}
+	issue, err := q.GetIssueInWorkspace(ctx, db.GetIssueInWorkspaceParams{ID: issueID, WorkspaceID: workspaceID})
+	if err != nil {
+		return db.CardSession{}, "", fmt.Errorf("load issue for card session: %w", err)
+	}
+	if !issuestatus.AllowsAgentTask(ctx, q, workspaceID, issue.Status) {
+		return db.CardSession{}, "", ErrCardSessionInactive
+	}
 
-	// Expire only this workspace's retained rows while its lock is held. This
-	// keeps stale rows from consuming capacity without allowing one enqueue to
-	// mutate another workspace.
+	// Expire only this workspace's idle rows while its lock is held. This keeps
+	// stale sessions from consuming capacity without mutating other workspaces.
 	if _, err := q.ExpireCardSessionsForWorkspace(ctx, workspaceID); err != nil {
 		return db.CardSession{}, "", fmt.Errorf("expire card sessions: %w", err)
 	}
@@ -218,19 +204,25 @@ func (s *TaskService) ensureCardSessionWithQueries(ctx context.Context, q *db.Qu
 		WorkspaceID: workspaceID,
 	})
 	if err == nil {
-		if current.State == "done_retained" {
-			current, err = q.ReopenCardSession(ctx, current.ID)
+		if current.State != "open" {
+			openCount, err := q.CountOpenCardSessions(ctx, workspaceID)
 			if err != nil {
-				return db.CardSession{}, "", fmt.Errorf("reopen card session: %w", err)
+				return db.CardSession{}, "", fmt.Errorf("count open card sessions: %w", err)
 			}
-			return current, "reopened", nil
-		} else {
-			current, err = q.TouchCardSession(ctx, current.ID)
-			if err != nil {
-				return db.CardSession{}, "", fmt.Errorf("touch card session: %w", err)
+			if !settings.CapacityAvailable(openCount) {
+				return db.CardSession{}, "", fmt.Errorf("%w: workspace %s has %d open sessions (limit %d)",
+					ErrCardSessionCapacity,
+					util.UUIDToString(workspaceID),
+					openCount,
+					settings.MaxOpenSessions,
+				)
 			}
-			return current, "reused", nil
 		}
+		current, err = q.TouchCardSession(ctx, current.ID)
+		if err != nil {
+			return db.CardSession{}, "", fmt.Errorf("touch card session: %w", err)
+		}
+		return current, "reused", nil
 	}
 	if !errors.Is(err, pgx.ErrNoRows) {
 		return db.CardSession{}, "", fmt.Errorf("load card session: %w", err)
@@ -269,140 +261,66 @@ func (s *TaskService) ensureCardSessionWithQueries(ctx context.Context, q *db.Qu
 		Provider:    provider,
 	})
 	if err != nil {
+		if errors.Is(err, pgx.ErrNoRows) {
+			return db.CardSession{}, "", ErrCardSessionInactive
+		}
 		return db.CardSession{}, "", fmt.Errorf("create card session: %w", err)
 	}
 	return created, "created", nil
 }
 
-// MarkIssueCardSessionsTerminal moves every open generation for an issue into
-// the configured terminal retention state. It is intentionally callable only
-// by status-write code; there is no generic close operation for open sessions.
-func (s *TaskService) MarkIssueCardSessionsTerminal(ctx context.Context, issueID, workspaceID pgtype.UUID) error {
-	return s.MarkIssueCardSessionsTerminalWithStatus(ctx, issueID, workspaceID, "")
-}
-
-// MarkIssueCardSessionsTerminalWithStatus is the status-aware form used by
-// issue status writers. The status is a bounded diagnostic attribute, not a
-// source of lifecycle authority; the database update remains authoritative.
-func (s *TaskService) MarkIssueCardSessionsTerminalWithStatus(ctx context.Context, issueID, workspaceID pgtype.UUID, terminalStatus string) error {
+// SyncIssueCardSessions records the issue's current lifecycle status. The
+// migration trigger performs the same transition for direct SQL and webhook
+// writes; this call keeps application transitions observable and idempotent.
+func (s *TaskService) SyncIssueCardSessions(ctx context.Context, issueID, workspaceID pgtype.UUID) error {
 	if s == nil || s.Queries == nil || s.TxStarter == nil {
 		return nil
 	}
 	started := time.Now()
-	terminalStatus = normalizeCardSessionTerminalStatus(terminalStatus)
 	tx, err := s.TxStarter.Begin(ctx)
 	if err != nil {
-		s.observeCardSessionIdentity(ctx, cardSessionEventTerminal, "error", issueID, pgtype.UUID{}, pgtype.UUID{}, 0, "", "terminal_status", terminalStatus)
-		s.observeCardSessionDuration(cardSessionEventTerminal, "error", time.Since(started))
-		return fmt.Errorf("begin card session close: %w", err)
-	}
-	defer tx.Rollback(ctx)
-	qtx := s.Queries.WithTx(tx)
-	workspace, err := qtx.LockWorkspaceForCardSession(ctx, workspaceID)
-	if err != nil {
-		s.observeCardSessionIdentity(ctx, cardSessionEventTerminal, "error", issueID, pgtype.UUID{}, pgtype.UUID{}, 0, "", "terminal_status", terminalStatus)
-		s.observeCardSessionDuration(cardSessionEventTerminal, "error", time.Since(started))
-		return fmt.Errorf("lock workspace for card session close: %w", err)
-	}
-	settings, err := cardsession.Parse(workspace.Settings)
-	if err != nil {
-		s.observeCardSessionIdentity(ctx, cardSessionEventTerminal, "error", issueID, pgtype.UUID{}, pgtype.UUID{}, 0, "", "terminal_status", terminalStatus)
-		s.observeCardSessionDuration(cardSessionEventTerminal, "error", time.Since(started))
-		return err
-	}
-	rows, err := qtx.MarkCardSessionsTerminal(ctx, db.MarkCardSessionsTerminalParams{
-		IssueID:        issueID,
-		WorkspaceID:    workspaceID,
-		RetentionHours: int64(settings.PostDoneRetentionHours),
-	})
-	if err != nil {
-		s.observeCardSessionIdentity(ctx, cardSessionEventTerminal, "error", issueID, pgtype.UUID{}, pgtype.UUID{}, 0, "", "terminal_status", terminalStatus)
-		s.observeCardSessionDuration(cardSessionEventTerminal, "error", time.Since(started))
-		return fmt.Errorf("retain card sessions: %w", err)
-	}
-	if err := tx.Commit(ctx); err != nil {
-		s.observeCardSessionIdentity(ctx, cardSessionEventTerminal, "error", issueID, pgtype.UUID{}, pgtype.UUID{}, 0, "", "terminal_status", terminalStatus)
-		s.observeCardSessionDuration(cardSessionEventTerminal, "error", time.Since(started))
-		return err
-	}
-	if len(rows) == 0 {
-		s.observeCardSessionIdentity(ctx, cardSessionEventTerminal, "noop", issueID, pgtype.UUID{}, pgtype.UUID{}, 0, "", "terminal_status", terminalStatus)
-	} else {
-		for _, row := range rows {
-			s.observeCardSession(ctx, cardSessionEventTerminal, "retained", row, "terminal_status", terminalStatus)
-		}
-	}
-	s.observeCardSessionDuration(cardSessionEventTerminal, func() string {
-		if len(rows) == 0 {
-			return "noop"
-		}
-		return "retained"
-	}(), time.Since(started))
-	return nil
-}
-
-// ReopenIssueCardSessions preserves the same generation when a terminal issue
-// is reopened during its configured retention window.
-func (s *TaskService) ReopenIssueCardSessions(ctx context.Context, issueID, workspaceID pgtype.UUID) error {
-	return s.ReopenIssueCardSessionsWithSource(ctx, issueID, workspaceID, "status_transition")
-}
-
-// ReopenIssueCardSessionsWithSource records whether a status transition or a
-// terminal-comment readback reopened a retained generation. The source is
-// diagnostic context only; the database row and trigger own the decision.
-func (s *TaskService) ReopenIssueCardSessionsWithSource(ctx context.Context, issueID, workspaceID pgtype.UUID, source string) error {
-	if s == nil || s.Queries == nil || s.TxStarter == nil {
-		return nil
-	}
-	started := time.Now()
-	source = normalizeCardSessionReopenSource(source)
-	tx, err := s.TxStarter.Begin(ctx)
-	if err != nil {
-		s.observeCardSessionIdentity(ctx, cardSessionEventReopen, "error", issueID, pgtype.UUID{}, pgtype.UUID{}, 0, "", "source", source)
-		s.observeCardSessionDuration(cardSessionEventReopen, "error", time.Since(started))
-		return fmt.Errorf("begin card session reopen: %w", err)
+		s.observeCardSessionIdentity(ctx, cardSessionEventStatus, "error", issueID, pgtype.UUID{}, pgtype.UUID{}, 0, "")
+		s.observeCardSessionDuration(cardSessionEventStatus, "error", time.Since(started))
+		return fmt.Errorf("begin card session status sync: %w", err)
 	}
 	defer tx.Rollback(ctx)
 	qtx := s.Queries.WithTx(tx)
 	if _, err := qtx.LockWorkspaceForCardSession(ctx, workspaceID); err != nil {
-		s.observeCardSessionIdentity(ctx, cardSessionEventReopen, "error", issueID, pgtype.UUID{}, pgtype.UUID{}, 0, "", "source", source)
-		s.observeCardSessionDuration(cardSessionEventReopen, "error", time.Since(started))
-		return fmt.Errorf("lock workspace for card session reopen: %w", err)
+		s.observeCardSessionIdentity(ctx, cardSessionEventStatus, "error", issueID, pgtype.UUID{}, pgtype.UUID{}, 0, "")
+		s.observeCardSessionDuration(cardSessionEventStatus, "error", time.Since(started))
+		return fmt.Errorf("lock workspace for card session status sync: %w", err)
 	}
-	rows, err := qtx.ReopenCardSessionsForIssue(ctx, db.ReopenCardSessionsForIssueParams{
+	rows, err := qtx.SyncCardSessionsForIssue(ctx, db.SyncCardSessionsForIssueParams{
 		IssueID:     issueID,
 		WorkspaceID: workspaceID,
 	})
 	if err != nil {
-		s.observeCardSessionIdentity(ctx, cardSessionEventReopen, "error", issueID, pgtype.UUID{}, pgtype.UUID{}, 0, "", "source", source)
-		s.observeCardSessionDuration(cardSessionEventReopen, "error", time.Since(started))
-		return fmt.Errorf("reopen card sessions: %w", err)
+		s.observeCardSessionIdentity(ctx, cardSessionEventStatus, "error", issueID, pgtype.UUID{}, pgtype.UUID{}, 0, "")
+		s.observeCardSessionDuration(cardSessionEventStatus, "error", time.Since(started))
+		return fmt.Errorf("sync card session status: %w", err)
 	}
 	if err := tx.Commit(ctx); err != nil {
-		s.observeCardSessionIdentity(ctx, cardSessionEventReopen, "error", issueID, pgtype.UUID{}, pgtype.UUID{}, 0, "", "source", source)
-		s.observeCardSessionDuration(cardSessionEventReopen, "error", time.Since(started))
+		s.observeCardSessionIdentity(ctx, cardSessionEventStatus, "error", issueID, pgtype.UUID{}, pgtype.UUID{}, 0, "")
+		s.observeCardSessionDuration(cardSessionEventStatus, "error", time.Since(started))
 		return err
 	}
-	if len(rows) == 0 {
-		s.observeCardSessionIdentity(ctx, cardSessionEventReopen, "noop", issueID, pgtype.UUID{}, pgtype.UUID{}, 0, "", "source", source)
-	} else {
-		for _, row := range rows {
-			s.observeCardSession(ctx, cardSessionEventReopen, "reopened", row, "source", source)
+	for _, row := range rows {
+		result := "paused"
+		if row.State == "open" {
+			result = "resumed"
 		}
+		s.observeCardSession(ctx, cardSessionEventStatus, result, row)
 	}
-	s.observeCardSessionDuration(cardSessionEventReopen, func() string {
-		if len(rows) == 0 {
-			return "noop"
-		}
-		return "reopened"
-	}(), time.Since(started))
+	result := "updated"
+	if len(rows) == 0 {
+		result = "noop"
+	}
+	s.observeCardSessionDuration(cardSessionEventStatus, result, time.Since(started))
 	return nil
 }
 
-// ExpireCardSessions closes retained generations whose terminal window has
-// elapsed. The server sweeper calls this globally; a missing table is ignored
-// so a rolling deployment can start the new binary before migration 420 has
-// reached every database node.
+// ExpireCardSessions closes idle generations after each workspace's configured
+// timeout, while keeping any generation with unfinished work open.
 func (s *TaskService) ExpireCardSessions(ctx context.Context) (int64, error) {
 	if s == nil || s.Queries == nil || s.TxStarter == nil {
 		return 0, nil
@@ -410,22 +328,12 @@ func (s *TaskService) ExpireCardSessions(ctx context.Context) (int64, error) {
 	started := time.Now()
 	rows, err := s.Queries.ExpireCardSessions(ctx)
 	if err != nil {
-		var pgErr *pgconn.PgError
-		if errors.As(err, &pgErr) && pgErr.Code == "42P01" {
-			s.observeCardSessionIdentity(ctx, cardSessionEventExpire, "unavailable", pgtype.UUID{}, pgtype.UUID{}, pgtype.UUID{}, 0, "")
-			s.observeCardSessionDuration(cardSessionEventExpire, "unavailable", time.Since(started))
-			return 0, nil
-		}
 		s.observeCardSessionIdentity(ctx, cardSessionEventExpire, "error", pgtype.UUID{}, pgtype.UUID{}, pgtype.UUID{}, 0, "")
 		s.observeCardSessionDuration(cardSessionEventExpire, "error", time.Since(started))
 		return 0, fmt.Errorf("expire card sessions: %w", err)
 	}
-	if len(rows) == 0 {
-		s.observeCardSessionIdentity(ctx, cardSessionEventExpire, "noop", pgtype.UUID{}, pgtype.UUID{}, pgtype.UUID{}, 0, "")
-	} else {
-		for _, row := range rows {
-			s.observeCardSession(ctx, cardSessionEventExpire, "expired", row)
-		}
+	for _, row := range rows {
+		s.observeCardSession(ctx, cardSessionEventExpire, "expired", row)
 	}
 	result := "expired"
 	if len(rows) == 0 {
@@ -433,6 +341,45 @@ func (s *TaskService) ExpireCardSessions(ctx context.Context) (int64, error) {
 	}
 	s.observeCardSessionDuration(cardSessionEventExpire, result, time.Since(started))
 	return int64(len(rows)), nil
+}
+
+// WakeCardSessionCapacityWaiters admits due issue tasks one at a time through
+// EnsureCardSession, which owns the workspace lock and capacity check. Tasks
+// stay deferred when the workspace is full or the issue is paused.
+func (s *TaskService) WakeCardSessionCapacityWaiters(ctx context.Context, runtimeIDs []pgtype.UUID) error {
+	if s == nil || s.Queries == nil || s.TxStarter == nil || len(runtimeIDs) == 0 {
+		return nil
+	}
+	waiters, err := s.Queries.ListDueCardSessionCapacityWaitersForRuntimes(ctx, db.ListDueCardSessionCapacityWaitersForRuntimesParams{
+		RuntimeIds:  runtimeIDs,
+		WaiterLimit: int32(cardSessionCapacityWaiterBatchSize),
+	})
+	if err != nil {
+		return fmt.Errorf("list card-session capacity waiters: %w", err)
+	}
+	for _, waiter := range waiters {
+		_, err := s.EnsureCardSession(ctx, waiter.IssueID, waiter.WorkspaceID, waiter.AgentID, waiter.RuntimeMode)
+		if err != nil {
+			if _, scheduleErr := s.Queries.RetryCardSessionCapacityWaiter(ctx, db.RetryCardSessionCapacityWaiterParams{
+				ID:                waiter.ID,
+				RetryDelaySeconds: cardSessionCapacityRetryDelay.Seconds(),
+			}); scheduleErr != nil {
+				return fmt.Errorf("reschedule card-session capacity waiter: %w", scheduleErr)
+			}
+			if !errors.Is(err, ErrCardSessionCapacity) && !errors.Is(err, ErrCardSessionInactive) {
+				slog.Warn("card-session capacity waiter could not open session",
+					"task_id", util.UUIDToString(waiter.ID),
+					"issue_id", util.UUIDToString(waiter.IssueID),
+					"error", err,
+				)
+			}
+			continue
+		}
+		if _, err := s.Queries.ReleaseCardSessionCapacityWaiter(ctx, waiter.ID); err != nil {
+			return fmt.Errorf("release card-session capacity waiter: %w", err)
+		}
+	}
+	return nil
 }
 
 // UpdateCardSessionProviderState mirrors the task pin into the durable
@@ -454,4 +401,62 @@ func (s *TaskService) UpdateCardSessionProviderState(ctx context.Context, taskID
 	}
 	s.ObserveCardSessionProviderPinDuration(ctx, taskID, result, time.Since(started))
 	return err
+}
+
+// bindStartedIssueTaskToCardSession fixes the issue task's generation before
+// the start transaction commits. Backlog comment/mention tasks remain ordinary
+// tasks without a persistent card session or provider resume state.
+func (s *TaskService) bindStartedIssueTaskToCardSession(ctx context.Context, q *db.Queries, task db.AgentTaskQueue) (db.AgentTaskQueue, error) {
+	if !task.IssueID.Valid {
+		return task, nil
+	}
+	issue, err := q.GetIssue(ctx, task.IssueID)
+	if err != nil {
+		return db.AgentTaskQueue{}, fmt.Errorf("load issue for started task card session: %w", err)
+	}
+	agent, err := q.GetAgent(ctx, task.AgentID)
+	if err != nil {
+		return db.AgentTaskQueue{}, fmt.Errorf("load agent for started task card session: %w", err)
+	}
+	session, _, err := s.ensureCardSessionWithQueries(ctx, q, issue.ID, issue.WorkspaceID, agent.ID, agent.RuntimeMode)
+	if errors.Is(err, ErrCardSessionStatus) {
+		return task, nil
+	}
+	if err != nil {
+		return db.AgentTaskQueue{}, fmt.Errorf("ensure card session for started task: %w", err)
+	}
+	bound, err := q.BindAgentTaskToCardSession(ctx, db.BindAgentTaskToCardSessionParams{
+		TaskID:        task.ID,
+		CardSessionID: session.ID,
+	})
+	if err != nil {
+		return db.AgentTaskQueue{}, fmt.Errorf("bind started task to card session: %w", err)
+	}
+	return bound, nil
+}
+
+// TouchCardSessionActivityForTask advances activity after provider usage or a
+// committed task transition. The update runs after the task transaction so it
+// cannot invert task and card-session lock order.
+func (s *TaskService) TouchCardSessionActivityForTask(ctx context.Context, taskID pgtype.UUID) error {
+	return s.touchCardSessionActivityForTaskIDs(ctx, []pgtype.UUID{taskID})
+}
+
+func (s *TaskService) touchCardSessionActivityForTasks(ctx context.Context, tasks []db.AgentTaskQueue) {
+	ids := make([]pgtype.UUID, 0, len(tasks))
+	for _, task := range tasks {
+		if task.IssueID.Valid {
+			ids = append(ids, task.ID)
+		}
+	}
+	if err := s.touchCardSessionActivityForTaskIDs(ctx, ids); err != nil {
+		slog.Warn("failed to touch card session after task transition", "error", err)
+	}
+}
+
+func (s *TaskService) touchCardSessionActivityForTaskIDs(ctx context.Context, taskIDs []pgtype.UUID) error {
+	if s == nil || s.Queries == nil || len(taskIDs) == 0 {
+		return nil
+	}
+	return s.Queries.TouchCardSessionsForTasks(ctx, taskIDs)
 }

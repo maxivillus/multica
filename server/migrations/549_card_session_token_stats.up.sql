@@ -4,7 +4,3 @@
 -- cadence.
 ALTER TABLE card_session
 ADD COLUMN last_token_stats_at TIMESTAMPTZ;
-
-CREATE INDEX card_session_open_token_stats_due_idx
-    ON card_session (last_token_stats_at NULLS FIRST, id)
-    WHERE state = 'open';

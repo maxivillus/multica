@@ -302,6 +302,12 @@ ws_lark_installations AS MATERIALIZED (
 ),
 deleted_card_sessions AS (
     DELETE FROM card_session WHERE workspace_id = $1
+    RETURNING id
+),
+cleared_card_session_task_bindings AS (
+    UPDATE agent_task_queue
+    SET card_session_id = NULL
+    WHERE card_session_id IN (SELECT id FROM deleted_card_sessions)
 ),
 deleted_task_tokens AS (
     DELETE FROM task_token

@@ -1,71 +1,73 @@
 ## Card session lifecycle
 
-Multica now keeps a durable per-issue agent generation in `card_session`. The
-generation is the server-owned continuity identity; a provider process and its
-in-memory cache are implementation details and may be restarted.
+Multica stores a durable per-issue agent generation in `card_session`. The
+generation is the server-owned continuity identity. A provider process and its
+in-memory cache may be restarted; they are not the source of truth.
 
 ### Lifecycle contract
 
-- A generation is `open` while its issue is in the non-terminal work/review
-  flow. New task enqueue paths reuse that generation for the same issue and
-  agent.
-- A transition into the effective `done` or `cancelled` category changes the
-  generation to `done_retained`. The retention window is read from
-  `workspace.settings.card_sessions.post_done_retention_hours`.
-- A comment on a done or cancelled issue atomically changes the issue to
-  `in_review`. The same transaction also fires the database lifecycle trigger,
-  which reopens the retained generation when it has not expired. Repeated
-  comments and concurrent status writers are idempotent at the row boundary.
-- Expired retained rows are closed by the server's periodic expiry sweep (and
-  opportunistically during allocation). There is no arbitrary close operation
-  for an open generation; an ordinary status or comment path cannot close it.
-- `workspace.settings.card_sessions.max_open_sessions` limits the number of
-  open or unexpired retained generations. Workspace-row locking serializes
-  expiry, capacity checks, and new generation allocation.
-- While a generation is `open`, the runtime sweeper periodically writes a
-  cumulative system comment with input, output, cache-read, cache-write, and
-  task counts from `task_usage`. The interval is configured by
-  `workspace.settings.card_sessions.token_stats_interval_minutes`; it defaults
-  to 15 minutes and is bounded to 1–1,440 minutes. The snapshot is scoped to
-  the generation's `opened_at` boundary and the matching issue/agent.
-- The publication watermark is stored on the generation row and advanced in
-  the same transaction as the comment. This makes concurrent server sweepers
-  idempotent and keeps these system comments out of ordinary agent-trigger
-  reconciliation. A due session with no usage advances the watermark without
-  posting a zero-token comment.
+- An assigned issue gets a generation when it enters `todo`. The generation
+  stays `open` through `todo`, `in_progress`, `in_review`, and `done`.
+- Upgrades do not backfill empty generations for issues that were already
+  assigned in `todo`; the next task start or comment lazily creates the first
+  generation for that issue.
+- A new issue in `backlog` does not get a generation. Explicit comment or
+  mention runs in `backlog` remain ordinary tasks and are not bound to a
+  persistent card session.
+- Moving an issue to `backlog`, `blocked`, or `cancelled` pauses its generation.
+  Moving it back to an active status resumes the same generation while it has
+  not expired. A new generation is created after expiry.
+- Moving an issue to `cancelled` immediately stops its unfinished tasks on that
+  issue. It does not stop completed tasks or tasks on other issues. The
+  generation and provider resume state remain paused until expiry.
+- A generation expires after the configured idle period when no task is
+  running, dispatched, or waiting for a local directory. In an active status,
+  a queued or deferred task also keeps its generation. In a paused status, the
+  generation can expire while work waits; that work opens a new generation when
+  the issue returns to an active status. Expiry never interrupts active work or
+  removes queued work.
+- `workspace.settings.card_sessions.idle_timeout_hours` is the single idle
+  timeout. It defaults to 24 hours and accepts values from 1 to 999.
+  `workspace.settings.card_sessions.max_open_sessions` defaults to 100 and
+  limits open generations; paused generations do not use an open slot.
+- A comment on a `done` or `cancelled` issue reopens it as `in_review` and
+  resumes its retained generation if the idle timeout has not passed. Repeated
+  comments and concurrent status writers are idempotent at the database row.
+
+### Token statistics
+
+After each accepted provider usage update, the server refreshes the generation's
+cumulative token totals in the background from `task_usage`. The refresh is
+scoped to the generation's start time and the tasks bound to that generation.
+A recovery sweep refreshes totals missed during a server restart. Statistics do
+not create card comments or agent input. This lifecycle does not measure or
+claim token savings, and it does not require a final summary comment from the
+agent.
 
 ### Diagnostics
 
-The experimental lifecycle has a separate observability surface controlled by
+The lifecycle has a separate observability surface controlled by
 `MULTICA_CARD_SESSION_OBSERVABILITY_ENABLED` (default `true`). When enabled,
-the server emits structured diagnostic events for generation allocation/reuse,
-terminal retention, reopen attempts, expiry, provider-state pins, token-stat
-publication, and capacity rejection. With `METRICS_ADDR` enabled it also
-registers the bounded Prometheus families
+the server emits structured events for generation allocation and reuse, status
+changes, expiry, provider-state pins, and capacity handling. With `METRICS_ADDR`
+enabled it registers the bounded Prometheus families
 `multica_card_session_events_total` and
 `multica_card_session_operation_duration_seconds`.
 
-Metric labels are fixed event/result enums and never contain issue IDs,
-session IDs, provider session IDs, work directories, prompts, or token
-payloads. The flag disables both the additional logs and these metric
-families; ordinary server logs and existing task/LLM metrics are unchanged.
+Metric labels use fixed event/result values and do not contain issue IDs,
+session IDs, provider session IDs, work directories, prompts, or token payloads.
+The flag disables these additional logs and metric families; ordinary server
+logs and existing task/LLM metrics are unchanged.
 
-The terminal-retention setting is bounded to 1–720 hours, open sessions to
-1–10,000, and token-statistics interval to 1–1,440 minutes. The defaults are
-24 hours, 100 sessions, and 15 minutes.
+The idle timeout is bounded to 1–999 hours. The open-generation limit is
+bounded to 1–10,000. Their defaults are 24 hours and 100 generations.
 
 ### Provider continuity
 
-`PinTaskSession` mirrors the provider session ID and work directory into the
-generation record. Existing provider-specific resume/rejoin behavior remains
-the recovery path after a daemon or process restart. This follows the useful
-parts of the reviewed harnesses: a server-owned identity and durable lifecycle
-state from Codex app-server, transcript/session rejoin from Claude, and
-crash-safe event/driver separation from DeepSeek Harness.
-
-This change does not claim that a provider process or prompt cache stays alive
-for the entire retention window. The current executor still runs provider turns
-through the task queue. A future live-host implementation must use the
-generation's lease fields and provider capability checks, while preserving the
-durable generation as the source of truth and retaining the existing fresh
-session fallback.
+When a task is pinned, Multica stores its provider session ID and work directory
+on the exact card generation linked to that task. On a later task, the runtime
+uses the provider's resume or rejoin mechanism when it is available. If the
+provider cannot resume that state, Multica can start a fresh provider session.
+The durable generation remains available across daemon or process restarts,
+but the implementation does not keep a provider process alive for the entire
+idle window.

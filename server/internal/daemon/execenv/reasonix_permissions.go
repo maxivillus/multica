@@ -169,8 +169,9 @@ func writeReasonixProjectConfig(workDir string, taskEnv map[string]string, manif
 	if err != nil {
 		if logger != nil {
 			logger.Warn("execenv: cannot restate the reasonix user permissions; leaving the task without a project config — the reasonix ask tool stays enabled for this task",
-				"user_config", userConfig,
-				"error", err,
+				"user_config_present", userConfig != "",
+				"error_present", true,
+				"error_type", fmt.Sprintf("%T", err),
 			)
 		}
 		return nil
@@ -180,7 +181,7 @@ func writeReasonixProjectConfig(workDir string, taskEnv map[string]string, manif
 	if errors.Is(err, errPathPreExists) {
 		if logger != nil {
 			logger.Warn("execenv: project reasonix.toml already exists; leaving it untouched — the reasonix ask tool stays enabled for this task",
-				"path", path,
+				"path_present", path != "",
 			)
 		}
 		return nil

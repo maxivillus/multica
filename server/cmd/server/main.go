@@ -628,12 +628,12 @@ func main() {
 	var dbRoutingMetrics *obsmetrics.DBRoutingMetrics
 	if metricsConfig.Enabled() {
 		metricsRegistry := obsmetrics.NewRegistry(obsmetrics.RegistryOptions{
-			Pool:        pool,
-			ReplicaPool: replicaPool,
-			Realtime:    realtime.M,
-			DaemonWS:    daemonws.M,
-			Version:     version,
-			Commit:      commit,
+			Pool:                     pool,
+			ReplicaPool:              replicaPool,
+			Realtime:                 realtime.M,
+			DaemonWS:                 daemonws.M,
+			Version:                  version,
+			Commit:                   commit,
 			CardSessionObservability: cardSessionObservabilityEnabled,
 		})
 		httpMetrics = metricsRegistry.HTTP
@@ -684,21 +684,21 @@ func main() {
 	}
 
 	r, h := NewRouterWithOptions(pool, hub, bus, analyticsClient, storeRedis, RouterOptions{
-		HTTPMetrics:         httpMetrics,
-		BusinessMetrics:     businessMetrics,
-		CardSessionMetrics:  cardSessionMetrics,
+		HTTPMetrics:                     httpMetrics,
+		BusinessMetrics:                 businessMetrics,
+		CardSessionMetrics:              cardSessionMetrics,
 		CardSessionObservabilityEnabled: cardSessionObservabilityEnabled,
-		ChannelLeaseMetrics: channelLeaseMetrics,
-		ChannelLeaseRedis:   channelLeaseRedis,
-		WecomMetrics:        wecomMetrics,
-		DaemonHub:           daemonHub,
-		DaemonWakeup:        daemonWakeup,
-		WecomSenders:        wecomSenders,
-		WecomRelayOutbound:  wecomRelayOutbound,
-		FeatureFlags:        flags,
-		HeartbeatScheduler:  heartbeatScheduler,
-		LLMMaxRetries:       llmMaxRetries,
-		LLMDisableThinking:  llmDisableThinking,
+		ChannelLeaseMetrics:             channelLeaseMetrics,
+		ChannelLeaseRedis:               channelLeaseRedis,
+		WecomMetrics:                    wecomMetrics,
+		DaemonHub:                       daemonHub,
+		DaemonWakeup:                    daemonWakeup,
+		WecomSenders:                    wecomSenders,
+		WecomRelayOutbound:              wecomRelayOutbound,
+		FeatureFlags:                    flags,
+		HeartbeatScheduler:              heartbeatScheduler,
+		LLMMaxRetries:                   llmMaxRetries,
+		LLMDisableThinking:              llmDisableThinking,
 	})
 	var replicaQueries *db.Queries
 	if replicaPool != nil {
@@ -755,6 +755,7 @@ func main() {
 	// work, so there is no separate queue TTL to tune: a busy runtime keeps its
 	// backlog, and a departed one retires everything it owned at once.
 	go runRuntimeSweeper(sweepCtx, queries, liveness, taskSvc, bus, runtimeReconnectGrace)
+	go runCardSessionSweeper(sweepCtx, taskSvc)
 	if telemetryWorker != nil {
 		go telemetryWorker.Run(sweepCtx)
 	}

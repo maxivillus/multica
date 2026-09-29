@@ -210,7 +210,7 @@ func prepareCodexHomeWithOpts(codexHome string, opts CodexHomeOptions, logger *s
 	// shared ~/.codex/sessions in — a huge shared history would otherwise stall
 	// Codex's `initialize` state backfill (MUL-4424). See prepareCodexSessionsDir.
 	if err := prepareCodexSessionsDir(codexHome, sharedHome, opts, logger); err != nil {
-		logger.Warn("execenv: codex-home sessions dir prepare failed", "error", err)
+		logger.Warn("execenv: codex-home sessions dir prepare failed", "error_present", true)
 	}
 
 	// Symlink shared files (auth).
@@ -218,7 +218,7 @@ func prepareCodexHomeWithOpts(codexHome string, opts CodexHomeOptions, logger *s
 		src := filepath.Join(sharedHome, name)
 		dst := filepath.Join(codexHome, name)
 		if err := ensureSymlink(src, dst); err != nil {
-			logger.Warn("execenv: codex-home symlink failed", "file", name, "error", err)
+			logger.Warn("execenv: codex-home symlink failed", "file", name, "error_present", true)
 		}
 	}
 
@@ -237,7 +237,7 @@ func prepareCodexHomeWithOpts(codexHome string, opts CodexHomeOptions, logger *s
 		src := filepath.Join(sharedHome, name)
 		dst := filepath.Join(codexHome, name)
 		if err := syncCopiedFile(src, dst); err != nil {
-			logger.Warn("execenv: codex-home sync failed", "file", name, "error", err)
+			logger.Warn("execenv: codex-home sync failed", "file", name, "error_present", true)
 			if name == "config.toml" {
 				configSyncErr = err
 			}
@@ -250,7 +250,7 @@ func prepareCodexHomeWithOpts(codexHome string, opts CodexHomeOptions, logger *s
 	// agent's active skills directly to `codex-home/skills/`, so the
 	// user-level registry is redundant here. See codex_skill_strip.go.
 	if err := sanitizeCopiedCodexConfig(filepath.Join(codexHome, "config.toml")); err != nil {
-		logger.Warn("execenv: codex-home sanitize config failed", "error", err)
+		logger.Warn("execenv: codex-home sanitize config failed", "error_present", true)
 	}
 
 	if err := syncCodexReferencedFiles(codexHome, sharedHome); err != nil {
@@ -263,14 +263,14 @@ func prepareCodexHomeWithOpts(codexHome string, opts CodexHomeOptions, logger *s
 	// If binding fails, discard the optional cache so Codex refreshes it instead
 	// of potentially using models from the wrong provider.
 	if err := syncCodexModelsCache(codexHome, sharedHome, freshHome); err != nil {
-		logger.Warn("execenv: codex-home models cache sync failed; discarding cache", "error", err)
+		logger.Warn("execenv: codex-home models cache sync failed; discarding cache", "error_present", true)
 		if removeErr := os.RemoveAll(filepath.Join(codexHome, codexModelsCacheFile)); removeErr != nil {
 			return fmt.Errorf("sync codex models cache: %v; discard unsafe cache: %w", err, removeErr)
 		}
 	}
 
 	if err := exposeSharedCodexPluginCache(codexHome, sharedHome); err != nil {
-		logger.Warn("execenv: codex-home plugin cache exposure failed", "error", err)
+		logger.Warn("execenv: codex-home plugin cache exposure failed", "error_present", true)
 	}
 
 	// Write a daemon-managed sandbox block into config.toml. On macOS we may
@@ -304,7 +304,7 @@ func prepareCodexHomeWithOpts(codexHome string, opts CodexHomeOptions, logger *s
 	// completion while spawned subagents are still running. See
 	// codex_multi_agent.go for the full rationale and escape hatch.
 	if err := ensureCodexMultiAgentConfig(filepath.Join(codexHome, "config.toml"), logger); err != nil {
-		logger.Warn("execenv: codex-home ensure multi-agent config failed", "error", err)
+		logger.Warn("execenv: codex-home ensure multi-agent config failed", "error_present", true)
 	}
 
 	// Disable Codex native auto-memory inside daemon-managed task sessions
@@ -312,7 +312,7 @@ func prepareCodexHomeWithOpts(codexHome string, opts CodexHomeOptions, logger *s
 	// happen via `codex-home/memories/` or `~/.codex/memories/`. See
 	// codex_memory.go for the full rationale and escape hatch.
 	if err := ensureCodexMemoryConfig(filepath.Join(codexHome, "config.toml"), logger); err != nil {
-		logger.Warn("execenv: codex-home ensure memory config failed", "error", err)
+		logger.Warn("execenv: codex-home ensure memory config failed", "error_present", true)
 	}
 
 	return nil
@@ -503,7 +503,7 @@ func PruneCodexSessionStores(profile string, retention time.Duration, now time.T
 				commit()
 			}
 			if err != nil {
-				logger.Warn("execenv: prune codex session store failed", "store", storeDir, "error", err)
+				logger.Warn("execenv: prune codex session store failed", "store_present", true, "error_present", true)
 				kept++
 				continue
 			}
@@ -622,11 +622,11 @@ func prepareCodexSessionsDir(codexHome, sharedHome string, opts CodexHomeOptions
 	// local dir is all a fresh thread needs.
 	if opts.ResumeSessionID != "" && storeDir != "" {
 		logger.Info("execenv: migrated codex-home sessions from shared symlink to per-issue store",
-			"codex_home", codexHome, "resume_session", true)
+			"codex_home_present", codexHome != "", "resume_session", true)
 		return linkCodexSessionsToStore(dst, storeDir, sharedSessions, opts.ResumeSessionID, logger)
 	}
 	logger.Info("execenv: migrated codex-home sessions from shared symlink to task-local dir",
-		"codex_home", codexHome, "resume_session", false)
+		"codex_home_present", codexHome != "", "resume_session", false)
 	return os.MkdirAll(dst, 0o755)
 }
 
@@ -650,7 +650,7 @@ func linkCodexSessionsToStore(dst, storeDir, sharedSessions, resumeID string, lo
 	if resumeID != "" && len(findCodexRollouts(storeDir, resumeID)) == 0 {
 		if err := exposeResumeRollout(sharedSessions, storeDir, resumeID, logger); err != nil {
 			logger.Warn("execenv: bootstrap resume rollout into session store failed; task will fall back to a fresh thread",
-				"session_id", resumeID, "error", err)
+				"resume_session", true, "error_present", true)
 		}
 	}
 	if err := ensureCodexSessionsLink(dst, storeDir); err != nil {
@@ -673,7 +673,7 @@ func linkCodexSessionsToStore(dst, storeDir, sharedSessions, resumeID string, lo
 func touchCodexSessionStore(storeDir string, logger *slog.Logger) {
 	now := time.Now()
 	if err := os.Chtimes(storeDir, now, now); err != nil {
-		logger.Warn("execenv: refresh codex session store activity failed", "store", storeDir, "error", err)
+		logger.Warn("execenv: refresh codex session store activity failed", "store_present", storeDir != "", "error_present", true)
 	}
 }
 
@@ -709,7 +709,7 @@ func resetCodexSessionState(codexHome string, logger *slog.Logger) {
 		}
 		for _, m := range matches {
 			if err := os.Remove(m); err != nil && !os.IsNotExist(err) {
-				logger.Warn("execenv: codex-home reset session state failed", "path", m, "error", err)
+				logger.Warn("execenv: codex-home reset session state failed", "path_present", m != "", "error_present", true)
 			}
 		}
 	}
@@ -817,7 +817,7 @@ func exposeResumeRollout(sharedSessions, localSessions, sessionID string, logger
 		}
 		linked++
 	}
-	logger.Info("execenv: exposed resume rollout into task-local sessions", "session_id", sessionID, "files", linked)
+	logger.Info("execenv: exposed resume rollout into task-local sessions", "session_id_present", sessionID != "", "files", linked)
 	return nil
 }
 
@@ -1305,16 +1305,15 @@ func ensureSymlink(src, dst string) error {
 func logCodexAuthState(authPath string, logger *slog.Logger) {
 	fi, err := os.Lstat(authPath)
 	if err != nil {
-		logger.Info("execenv: codex auth.json absent", "path", authPath, "error", err)
+		logger.Info("execenv: codex auth.json absent", "path_present", authPath != "", "error_present", true)
 		return
 	}
 	if fi.Mode()&os.ModeSymlink != 0 {
-		target, _ := os.Readlink(authPath)
-		logger.Info("execenv: codex auth.json is symlink", "path", authPath, "target", target)
+		logger.Info("execenv: codex auth.json is symlink", "path_present", authPath != "")
 		return
 	}
 	logger.Info("execenv: codex auth.json is regular file",
-		"path", authPath,
+		"path_present", authPath != "",
 		"size", fi.Size(),
 		"mtime", fi.ModTime().UTC(),
 	)

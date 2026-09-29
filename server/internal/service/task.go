@@ -43,9 +43,12 @@ type TaskService struct {
 	Bus       *events.Bus
 	Analytics analytics.Client
 	Metrics   *obsmetrics.BusinessMetrics
+	// CardSessionMetrics and CardSessionObservabilityEnabled are kept separate
+	// from the general business metrics so the experimental lifecycle
+	// diagnostics can be removed or disabled without changing task telemetry.
 	CardSessionMetrics              *obsmetrics.CardSessionMetrics
 	CardSessionObservabilityEnabled bool
-	Wakeup    TaskWakeupNotifier
+	Wakeup                          TaskWakeupNotifier
 	// Entitlements supplies Cloud's workspace-scoped issue-count instruction.
 	// Nil keeps self-hosted and isolated test services unlimited.
 	Entitlements entitlement.Provider
@@ -1143,8 +1146,8 @@ func (s *TaskService) EnqueueDeferredChannelIssueTask(ctx context.Context, issue
 	return task, nil
 }
 
-// createDeferredChannelIssueTaskWithQueries inserts the inert media-gated task
-// through the caller's query handle. IssueService passes its transaction-bound
+// createDeferredChannelIssueTaskWithQueries inserts the deferred task through
+// the caller's query handle. IssueService passes its transaction-bound
 // Queries so the issue and task become visible atomically. Composio is
 // intentionally absent from the transaction-scoped service: the task cannot be
 // claimed while deferred, so the optional external overlay is hydrated after
@@ -1156,7 +1159,13 @@ func (s *TaskService) createDeferredChannelIssueTaskWithQueries(ctx context.Cont
 			return db.AgentTaskQueue{}, fmt.Errorf("load agent for card session: %w", err)
 		}
 		if _, _, err := s.ensureCardSessionWithQueries(ctx, q, issue.ID, issue.WorkspaceID, agent.ID, agent.RuntimeMode); err != nil {
-			return db.AgentTaskQueue{}, err
+			if !errors.Is(err, ErrCardSessionCapacity) {
+				return db.AgentTaskQueue{}, err
+			}
+			return (&TaskService{Queries: q}).enqueueIssueTaskWithCommentPlanAndCardSessionState(
+				ctx, issue, pgtype.UUID{}, nil, false, "", pgtype.UUID{}, pgtype.UUID{},
+				pgtype.Timestamptz{Time: fireAt, Valid: true}, OriginDerived, true,
+			)
 		}
 	}
 	txService := &TaskService{Queries: q}
@@ -1261,6 +1270,10 @@ func (s *TaskService) enqueueIssueTask(ctx context.Context, issue db.Issue, trig
 }
 
 func (s *TaskService) enqueueIssueTaskWithCommentPlan(ctx context.Context, issue db.Issue, triggerCommentID pgtype.UUID, coalescedCommentIDs []pgtype.UUID, forceFreshSession bool, handoffNote string, actorUserID pgtype.UUID, rerunOfTaskID pgtype.UUID, fireAt pgtype.Timestamptz, origin RunOrigin) (db.AgentTaskQueue, error) {
+	return s.enqueueIssueTaskWithCommentPlanAndCardSessionState(ctx, issue, triggerCommentID, coalescedCommentIDs, forceFreshSession, handoffNote, actorUserID, rerunOfTaskID, fireAt, origin, false)
+}
+
+func (s *TaskService) enqueueIssueTaskWithCommentPlanAndCardSessionState(ctx context.Context, issue db.Issue, triggerCommentID pgtype.UUID, coalescedCommentIDs []pgtype.UUID, forceFreshSession bool, handoffNote string, actorUserID pgtype.UUID, rerunOfTaskID pgtype.UUID, fireAt pgtype.Timestamptz, origin RunOrigin, cardSessionCapacityPending bool) (db.AgentTaskQueue, error) {
 	if !issue.AssigneeID.Valid {
 		slog.Error("task enqueue failed", "issue_id", util.UUIDToString(issue.ID), "error", "issue has no assignee")
 		return db.AgentTaskQueue{}, fmt.Errorf("issue has no assignee")
@@ -1299,6 +1312,28 @@ func (s *TaskService) enqueueIssueTaskWithCommentPlan(ctx context.Context, issue
 	originatorUserID := attr.UserID
 	runtimeMCPOverlay := s.buildRuntimeMCPOverlay(ctx, originatorUserID, agent)
 	attrSource, attrDelegatedFrom, attrEvidenceKind, attrEvidenceRef := attributionCreateParams(attr)
+	if !cardSessionCapacityPending {
+		if _, err := s.EnsureCardSession(ctx, issue.ID, issue.WorkspaceID, agent.ID, agent.RuntimeMode); err != nil {
+			if errors.Is(err, ErrCardSessionCapacity) {
+				cardSessionCapacityPending = true
+			} else if errors.Is(err, ErrCardSessionStatus) && triggerCommentID.Valid {
+				// A comment explicitly wakes the assigned agent even when the
+				// issue is parked in backlog. Keep that task ordinary and
+				// unbound; only active issues own resumable card sessions.
+			} else {
+				slog.Warn("task enqueue refused: card session unavailable",
+					"issue_id", util.UUIDToString(issue.ID),
+					"agent_id", util.UUIDToString(agent.ID),
+					"error", err,
+				)
+				return db.AgentTaskQueue{}, err
+			}
+		}
+	}
+	channelMediaPending := fireAt.Valid
+	if cardSessionCapacityPending && !fireAt.Valid {
+		fireAt = pgtype.Timestamptz{Time: time.Now().Add(cardSessionCapacityRetryDelay), Valid: true}
+	}
 	createParams := db.CreateAgentTaskParams{
 		ID:                   dbid.NewV7(),
 		AgentID:              issue.AssigneeID,
@@ -1326,32 +1361,7 @@ func (s *TaskService) enqueueIssueTaskWithCommentPlan(ctx context.Context, issue
 	}
 	var task db.AgentTaskQueue
 	if fireAt.Valid {
-		task, err = s.Queries.CreateDeferredChannelIssueTask(ctx, db.CreateDeferredChannelIssueTaskParams{
-			ID:                   dbid.NewV7(),
-			AgentID:              createParams.AgentID,
-			RuntimeID:            createParams.RuntimeID,
-			IssueID:              createParams.IssueID,
-			Priority:             createParams.Priority,
-			TriggerCommentID:     createParams.TriggerCommentID,
-			CoalescedCommentIds:  createParams.CoalescedCommentIds,
-			TriggerSummary:       createParams.TriggerSummary,
-			ForceFreshSession:    createParams.ForceFreshSession,
-			IsLeaderTask:         createParams.IsLeaderTask,
-			HandoffNote:          createParams.HandoffNote,
-			SquadID:              createParams.SquadID,
-			HeadSha:              createParams.HeadSha,
-			OriginatorUserID:     createParams.OriginatorUserID,
-			AccountableUserID:    createParams.AccountableUserID,
-			RuntimeMcpOverlay:    createParams.RuntimeMcpOverlay,
-			RuntimeConnectedApps: createParams.RuntimeConnectedApps,
-			OriginatorSource:     createParams.OriginatorSource,
-			DelegatedFromTaskID:  createParams.DelegatedFromTaskID,
-			RuleVersionID:        createParams.RuleVersionID,
-			RerunOfTaskID:        createParams.RerunOfTaskID,
-			TriggerEvidenceKind:  createParams.TriggerEvidenceKind,
-			TriggerEvidenceRefID: createParams.TriggerEvidenceRefID,
-			FireAt:               fireAt,
-		})
+		task, err = s.Queries.CreateDeferredIssueTask(ctx, deferredIssueTaskParams(createParams, fireAt, channelMediaPending, cardSessionCapacityPending))
 	} else {
 		task, err = s.Queries.CreateAgentTask(ctx, createParams)
 	}
@@ -1376,7 +1386,7 @@ func (s *TaskService) enqueueIssueTaskWithCommentPlan(ctx context.Context, issue
 		"agent_id", util.UUIDToString(issue.AssigneeID),
 		"force_fresh_session", forceFreshSession,
 	)
-	if fireAt.Valid {
+	if channelMediaPending {
 		return task, nil
 	}
 	// Order matters: broadcast first, notify daemon second. notifyTaskAvailable
@@ -1388,6 +1398,37 @@ func (s *TaskService) enqueueIssueTaskWithCommentPlan(ctx context.Context, issue
 	s.broadcastTaskEvent(ctx, protocol.EventTaskQueued, task)
 	s.NotifyTaskEnqueued(ctx, task)
 	return task, nil
+}
+
+func deferredIssueTaskParams(task db.CreateAgentTaskParams, fireAt pgtype.Timestamptz, channelMediaPending, cardSessionCapacityPending bool) db.CreateDeferredIssueTaskParams {
+	return db.CreateDeferredIssueTaskParams{
+		ID:                         task.ID,
+		AgentID:                    task.AgentID,
+		RuntimeID:                  task.RuntimeID,
+		IssueID:                    task.IssueID,
+		Priority:                   task.Priority,
+		TriggerCommentID:           task.TriggerCommentID,
+		CoalescedCommentIds:        task.CoalescedCommentIds,
+		TriggerSummary:             task.TriggerSummary,
+		ForceFreshSession:          task.ForceFreshSession,
+		IsLeaderTask:               task.IsLeaderTask,
+		HandoffNote:                task.HandoffNote,
+		SquadID:                    task.SquadID,
+		HeadSha:                    task.HeadSha,
+		ChannelIssueMediaPending:   channelMediaPending,
+		CardSessionCapacityPending: cardSessionCapacityPending,
+		OriginatorUserID:           task.OriginatorUserID,
+		AccountableUserID:          task.AccountableUserID,
+		RuntimeMcpOverlay:          task.RuntimeMcpOverlay,
+		RuntimeConnectedApps:       task.RuntimeConnectedApps,
+		OriginatorSource:           task.OriginatorSource,
+		DelegatedFromTaskID:        task.DelegatedFromTaskID,
+		RuleVersionID:              task.RuleVersionID,
+		RerunOfTaskID:              task.RerunOfTaskID,
+		TriggerEvidenceKind:        task.TriggerEvidenceKind,
+		TriggerEvidenceRefID:       task.TriggerEvidenceRefID,
+		FireAt:                     fireAt,
+	}
 }
 
 // EnqueueTaskForMention creates a queued task for a mentioned agent on an issue.
@@ -1470,7 +1511,24 @@ func (s *TaskService) enqueueMentionTaskWithCommentPlan(ctx context.Context, iss
 	originatorUserID := attr.UserID
 	runtimeMCPOverlay := s.buildRuntimeMCPOverlay(ctx, originatorUserID, agent)
 	attrSource, attrDelegatedFrom, attrEvidenceKind, attrEvidenceRef := attributionCreateParams(attr)
-	task, err := s.Queries.CreateAgentTask(ctx, db.CreateAgentTaskParams{
+	cardSessionCapacityPending := false
+	if _, err := s.EnsureCardSession(ctx, issue.ID, issue.WorkspaceID, agent.ID, agent.RuntimeMode); err != nil {
+		if errors.Is(err, ErrCardSessionCapacity) {
+			cardSessionCapacityPending = true
+		} else if errors.Is(err, ErrCardSessionStatus) {
+			// Explicit mention, reply, and squad-leader requests remain durable
+			// tasks on backlog issues, but backlog must not create or resume a
+			// persistent card-session generation.
+		} else {
+			slog.Warn("mention task enqueue refused: card session unavailable",
+				"issue_id", util.UUIDToString(issue.ID),
+				"agent_id", util.UUIDToString(agent.ID),
+				"error", err,
+			)
+			return db.AgentTaskQueue{}, err
+		}
+	}
+	createParams := db.CreateAgentTaskParams{
 		ID:                   dbid.NewV7(),
 		AgentID:              agentID,
 		RuntimeID:            agent.RuntimeID,
@@ -1496,7 +1554,18 @@ func (s *TaskService) enqueueMentionTaskWithCommentPlan(ctx context.Context, iss
 		// Stamp the reviewed head so dedup can distinguish this run's target
 		// from a later request against a new HEAD (TEN-356).
 		HeadSha: headShaText(s.ResolveIssueReviewSHA(ctx, issue.ID)),
-	})
+	}
+	var task db.AgentTaskQueue
+	if cardSessionCapacityPending {
+		task, err = s.Queries.CreateDeferredIssueTask(ctx, deferredIssueTaskParams(
+			createParams,
+			pgtype.Timestamptz{Time: time.Now().Add(cardSessionCapacityRetryDelay), Valid: true},
+			false,
+			true,
+		))
+	} else {
+		task, err = s.Queries.CreateAgentTask(ctx, createParams)
+	}
 	if err != nil {
 		// A concurrent enqueue for the same (issue, agent) won the race and the
 		// unique index rejected this insert. That is benign — a sibling run
@@ -2271,6 +2340,12 @@ func (s *TaskService) PromoteDeferredChannelIssueTask(ctx context.Context, taskI
 	if err != nil {
 		return fmt.Errorf("promote deferred channel issue task: %w", err)
 	}
+	if task.Status == "deferred" {
+		// Media is ready, but this row must wait until its card session can be
+		// opened. Wake the runtime so it schedules the deferred retry.
+		s.notifyRuntimeMayHaveWork(task.RuntimeID, "")
+		return nil
+	}
 	slog.Info("channel media-ready issue task promoted",
 		"task_id", util.UUIDToString(task.ID),
 		"issue_id", util.UUIDToString(task.IssueID),
@@ -2595,11 +2670,9 @@ func (s *TaskService) OpenMikaOnboardingChat(ctx context.Context, session db.Cha
 // affected agent's status, and broadcasts task:cancelled events so frontends
 // clear their live cards.
 //
-// Callers are explicit issue-lifecycle cleanup paths only — DeleteIssue and
-// BatchDeleteIssues, where the owning issue row is going away so its tasks
-// must not be left orphaned. A plain status flip, `cancelled` included, no
-// longer routes here (MUL-4465): cancelling an issue is not an implicit "stop
-// all runs" switch. Do not re-add a status-driven caller.
+// Callers are explicit issue-lifecycle paths: issue deletion removes orphaned
+// work, and moving an issue to `cancelled` is the hard-stop operation for its
+// current tasks. Other paused statuses keep queued work available for resume.
 //
 // Before #1587 this path was "cancel rows and return", which left each affected
 // agent stuck at status="working" indefinitely, requiring a manual
@@ -2622,6 +2695,7 @@ func (s *TaskService) CancelTasksForIssue(ctx context.Context, issueID pgtype.UU
 	}); err != nil {
 		return err
 	}
+	s.touchCardSessionActivityForTasks(ctx, cancelled)
 	for _, t := range cancelled {
 		s.captureTaskCancelled(ctx, t)
 		s.broadcastTaskEvent(ctx, protocol.EventTaskCancelled, t)
@@ -2673,6 +2747,7 @@ func (s *TaskService) CancelTasksForAgent(ctx context.Context, agentID pgtype.UU
 	}); err != nil {
 		return nil, err
 	}
+	s.touchCardSessionActivityForTasks(ctx, cancelled)
 	for _, t := range cancelled {
 		s.captureTaskCancelled(ctx, t)
 		s.broadcastTaskEvent(ctx, protocol.EventTaskCancelled, t)
@@ -2701,6 +2776,7 @@ func (s *TaskService) CancelTasksByTriggerComment(ctx context.Context, commentID
 	}); err != nil {
 		return nil, err
 	}
+	s.touchCardSessionActivityForTasks(ctx, cancelled)
 	for _, t := range cancelled {
 		s.captureTaskCancelled(ctx, t)
 		s.broadcastTaskEvent(ctx, protocol.EventTaskCancelled, t)
@@ -2732,6 +2808,7 @@ func (s *TaskService) CancelTasksByTriggerComment(ctx context.Context, commentID
 // — it is the one whose session, member or runtime is being torn down — so the
 // lookup is not needed and cannot fail.
 func (s *TaskService) BroadcastCancelledTasks(ctx context.Context, workspaceID string, cancelled []db.AgentTaskQueue) {
+	s.touchCardSessionActivityForTasks(ctx, cancelled)
 	for _, t := range cancelled {
 		s.captureTaskCancelled(ctx, t)
 		s.ReconcileAgentStatus(ctx, t.AgentID)
@@ -2971,6 +3048,9 @@ func (s *TaskService) CancelTaskWithResult(ctx context.Context, taskID pgtype.UU
 		return nil, fmt.Errorf("cancel task: %w", err)
 	}
 
+	if !opts.QueuedOnly {
+		s.touchCardSessionActivityForTasks(ctx, []db.AgentTaskQueue{task})
+	}
 	slog.Info("task cancelled", "task_id", util.UUIDToString(task.ID), "issue_id", util.UUIDToString(task.IssueID))
 	s.captureTaskCancelled(ctx, task)
 	if !opts.QueuedOnly {
@@ -3641,6 +3721,10 @@ func (s *TaskService) ClaimTaskForRuntime(ctx context.Context, runtimeID pgtype.
 	}()
 
 	runtimeKey := util.UUIDToString(runtimeID)
+	if err := s.WakeCardSessionCapacityWaiters(ctx, []pgtype.UUID{runtimeID}); err != nil {
+		outcome = "error_wake_card_session_waiters"
+		return nil, err
+	}
 	if err := s.PromoteDueDeferredTasksForRuntime(ctx, runtimeID); err != nil {
 		outcome = "error_promote_deferred"
 		return nil, err
@@ -3931,6 +4015,9 @@ func (s *TaskService) ClaimTasksForRuntimes(ctx context.Context, runtimeIDs []pg
 	// MarkEmpty from a prior idle poll would short-circuit the runtime and the
 	// promoted task would sit unclaimed until the empty key's TTL. Also emits
 	// the deferred→queued UI event and the enqueue analytics sample.
+	if err := s.WakeCardSessionCapacityWaiters(ctx, uniqueIDs); err != nil {
+		return nil, err
+	}
 	s.cancelSupersededDeferredRetries(ctx, uniqueIDs)
 	promoted, err := s.Queries.PromoteDueDeferredTasksForRuntimes(ctx, db.PromoteDueDeferredTasksForRuntimesParams{
 		RuntimeIds:       uniqueIDs,
@@ -4178,12 +4265,39 @@ func (s *TaskService) maybeLogClaimSlow(agentID pgtype.UUID, outcome string, sta
 // Issue status is NOT changed here — the agent manages it via the CLI.
 func (s *TaskService) StartTask(ctx context.Context, taskID pgtype.UUID, supplementSupport ...bool) (*db.AgentTaskQueue, error) {
 	enableTaskSupplement := len(supplementSupport) > 0 && supplementSupport[0]
-	task, err := s.Queries.StartAgentTaskWithSupplement(ctx, db.StartAgentTaskWithSupplementParams{
+	if s.TxStarter == nil {
+		// Keep the legacy query-only service used by isolated mock tests. The
+		// production service always has a transaction starter so issue tasks are
+		// bound to their card-session generation before StartTask returns.
+		task, err := s.Queries.StartAgentTaskWithSupplement(ctx, db.StartAgentTaskWithSupplementParams{
+			TaskID:               taskID,
+			EnableTaskSupplement: enableTaskSupplement,
+		})
+		if err != nil {
+			return nil, fmt.Errorf("start task: %w", err)
+		}
+		s.taskStarted(ctx, task)
+		return &task, nil
+	}
+	tx, err := s.TxStarter.Begin(ctx)
+	if err != nil {
+		return nil, fmt.Errorf("begin task start: %w", err)
+	}
+	defer tx.Rollback(ctx)
+	qtx := s.Queries.WithTx(tx)
+	task, err := qtx.StartAgentTaskWithSupplement(ctx, db.StartAgentTaskWithSupplementParams{
 		TaskID:               taskID,
 		EnableTaskSupplement: enableTaskSupplement,
 	})
 	if err != nil {
 		return nil, fmt.Errorf("start task: %w", err)
+	}
+	task, err = s.bindStartedIssueTaskToCardSession(ctx, qtx, task)
+	if err != nil {
+		return nil, err
+	}
+	if err := tx.Commit(ctx); err != nil {
+		return nil, fmt.Errorf("commit task start: %w", err)
 	}
 	s.taskStarted(ctx, task)
 	return &task, nil
@@ -4214,6 +4328,10 @@ func (s *TaskService) StartTaskForClaim(ctx context.Context, claim db.LockAgentT
 		})
 		if err != nil {
 			return nil, fmt.Errorf("start claimed task: %w", err)
+		}
+		task, err = s.bindStartedIssueTaskToCardSession(ctx, qtx, task)
+		if err != nil {
+			return nil, err
 		}
 	}
 	if err := tx.Commit(ctx); err != nil {
@@ -4492,6 +4610,7 @@ func (s *TaskService) CompleteTaskWithTransition(ctx context.Context, taskID pgt
 		return nil, false, fmt.Errorf("complete task: %w", err)
 	}
 
+	s.touchCardSessionActivityForTasks(ctx, []db.AgentTaskQueue{task})
 	slog.Info("task completed", "task_id", util.UUIDToString(task.ID), "issue_id", util.UUIDToString(task.IssueID))
 	s.captureTaskCompleted(ctx, task)
 
@@ -5121,6 +5240,7 @@ func (s *TaskService) FailTaskWithTransition(ctx context.Context, taskID pgtype.
 		return nil, false, fmt.Errorf("fail task: %w", err)
 	}
 
+	s.touchCardSessionActivityForTasks(ctx, []db.AgentTaskQueue{task})
 	slog.Warn("task failed", "task_id", util.UUIDToString(task.ID), "issue_id", util.UUIDToString(task.IssueID), "error", errMsg, "failure_reason", failureReason)
 	s.captureTaskFailed(ctx, task)
 
@@ -5994,6 +6114,7 @@ func (s *TaskService) terminateTasksInTx(ctx context.Context, fail func(*db.Quer
 	}); err != nil {
 		return nil, err
 	}
+	s.touchCardSessionActivityForTasks(ctx, failed)
 	return failed, nil
 }
 
@@ -7483,6 +7604,38 @@ func commentEventFields(c db.Comment) map[string]any {
 	}
 }
 
+// reconcileTerminalCommentIssue reads back the atomic status change performed
+// by CreateComment. Agent comments use the same reopen contract as human
+// comments, but they do not pass through the HTTP handler that publishes the
+// issue update event.
+func (s *TaskService) reconcileTerminalCommentIssue(ctx context.Context, previous db.Issue, agentID pgtype.UUID, newStatus string) db.Issue {
+	if s == nil || s.Queries == nil || newStatus == "" || newStatus == previous.Status || !issuestatus.IsTerminal(issuestatus.Effective(ctx, s.Queries, previous.WorkspaceID, previous.Status)) {
+		return previous
+	}
+	updated, err := s.Queries.GetIssueInWorkspace(ctx, db.GetIssueInWorkspaceParams{
+		ID:          previous.ID,
+		WorkspaceID: previous.WorkspaceID,
+	})
+	if err != nil {
+		slog.Warn("agent comment: read reopened issue failed", "issue_id", util.UUIDToString(previous.ID), "error", err)
+		return previous
+	}
+	if err := s.SyncIssueCardSessions(ctx, updated.ID, updated.WorkspaceID); err != nil {
+		slog.Warn("agent comment: sync card session failed", "issue_id", util.UUIDToString(updated.ID), "error", err)
+	}
+	if issuestatus.AllowsAgentTask(ctx, s.Queries, updated.WorkspaceID, updated.Status) {
+		if agent, err := s.Queries.GetAgent(ctx, agentID); err == nil {
+			if _, err := s.EnsureCardSession(ctx, updated.ID, updated.WorkspaceID, agent.ID, agent.RuntimeMode); err != nil {
+				slog.Warn("agent comment: ensure card session failed", "issue_id", util.UUIDToString(updated.ID), "error", err)
+			}
+		}
+	}
+	if s.Bus != nil {
+		s.broadcastIssueUpdated(ctx, updated, previous.Status)
+	}
+	return updated
+}
+
 func (s *TaskService) createAgentComment(ctx context.Context, issueID, agentID pgtype.UUID, content, commentType string, parentID, sourceTaskID pgtype.UUID) {
 	if content == "" {
 		return
@@ -7519,8 +7672,7 @@ func (s *TaskService) createAgentComment(ctx context.Context, issueID, agentID p
 		return
 	}
 	comment := created.Comment()
-	issue = s.reconcileTerminalCommentIssue(ctx, issue, created.IssueStatus)
-	s.CancelDeferredEscalationsForIssueAgent(ctx, issueID, agentID)
+	issue = s.reconcileTerminalCommentIssue(ctx, issue, agentID, created.IssueStatus)
 	commentFields := commentEventFields(comment)
 	commentFields["revision"] = comment.Revision
 	issueRevision := created.IssueRevision
@@ -7540,31 +7692,6 @@ func (s *TaskService) createAgentComment(ctx context.Context, issueID, agentID p
 		},
 	})
 	s.AutoUnresolveThreadOnReply(ctx, rootComment, util.UUIDToString(issue.WorkspaceID), "agent", util.UUIDToString(agentID), sourceTaskID)
-}
-
-// reconcileTerminalCommentIssue reads back the atomic status change performed by
-// CreateComment. Agent comments use the same reopen contract as human
-// comments, but they do not pass through the HTTP handler that publishes the
-// issue update event.
-func (s *TaskService) reconcileTerminalCommentIssue(ctx context.Context, previous db.Issue, newStatus string) db.Issue {
-	if s == nil || s.Queries == nil || newStatus == "" || newStatus == previous.Status || !issuestatus.IsTerminal(issuestatus.Effective(ctx, s.Queries, previous.WorkspaceID, previous.Status)) {
-		return previous
-	}
-	updated, err := s.Queries.GetIssueInWorkspace(ctx, db.GetIssueInWorkspaceParams{
-		ID:          previous.ID,
-		WorkspaceID: previous.WorkspaceID,
-	})
-	if err != nil {
-		slog.Warn("agent comment: read reopened issue failed", "issue_id", util.UUIDToString(previous.ID), "error", err)
-		return previous
-	}
-	if err := s.ReopenIssueCardSessions(ctx, updated.ID, updated.WorkspaceID); err != nil {
-		slog.Warn("agent comment: reopen retained card session failed", "issue_id", util.UUIDToString(updated.ID), "error", err)
-	}
-	if s.Bus != nil {
-		s.broadcastIssueUpdated(ctx, updated, previous.Status)
-	}
-	return updated
 }
 
 // AutoUnresolveThreadOnReply clears resolved_at on the thread root when a

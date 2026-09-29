@@ -140,12 +140,18 @@ var pgBigmOperatorClass = extensionOperatorClass{
 // they are still pending: a fresh self-hosted install, which is exactly where an
 // interrupted build would otherwise leave a permanently unusable index.
 var concurrentIndexCleanups = map[string]string{
+	"555_card_session_one_resumable_per_issue_agent":            "card_session_one_resumable_per_issue_agent",
+	"556_card_session_workspace_state_index":                    "card_session_workspace_state_idx",
+	"557_card_session_issue_index":                              "card_session_issue_idx",
+	"558_card_session_open_token_stats_due_index":               "card_session_open_token_stats_due_idx",
 	"535_github_pr_address_index":                               "idx_github_pull_request_pr_owner_repo",
 	"539_task_supplement_request_index":                         "task_supplement_task_request_uidx",
 	"540_task_supplement_capability_index":                      "task_supplement_capability_task_uidx",
 	"541_task_supplement_comment_index":                         "task_supplement_comment_uidx",
 	"546_issue_pr_automation_workspace_index":                   "idx_issue_pr_automation_workspace",
 	"547_issue_pull_request_exclusion_workspace_index":          "idx_issue_pull_request_exclusion_workspace",
+	"552_card_session_workspace_activity_index":                 "card_session_workspace_activity_idx",
+	"554_agent_task_card_session_index":                         "agent_task_queue_card_session_idx",
 	"510_wakeup_id":                                             "issue_wakeup_id_idx",
 	"511_wakeup_issue":                                          "issue_wakeup_issue_idx",
 	"512_wakeup_due":                                            "issue_wakeup_due_idx",

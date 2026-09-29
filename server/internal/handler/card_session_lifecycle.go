@@ -9,39 +9,73 @@ import (
 	"github.com/multica-ai/multica/server/pkg/protocol"
 )
 
-// reconcileCardSessionStatus keeps the durable generation aligned with the
-// issue's business status. A Done or Cancelled transition enters the
-// configured retention window; leaving either terminal category reopens the
-// same generation while it is retained.
+// reconcileCardSessionStatus pauses sessions outside the active statuses,
+// resumes them when the issue becomes active, and opens one for a newly active
+// issue. Cancelled also interrupts all current tasks on that issue.
 func (h *Handler) reconcileCardSessionStatus(ctx context.Context, previous, current db.Issue) {
 	if h.TaskService == nil || previous.Status == current.Status {
 		return
 	}
-	previousCategory := issuestatus.Effective(ctx, h.Queries, previous.WorkspaceID, previous.Status)
-	currentCategory := issuestatus.Effective(ctx, h.Queries, current.WorkspaceID, current.Status)
-
-	switch {
-	case !issuestatus.IsTerminal(previousCategory) && issuestatus.IsTerminal(currentCategory):
-		if err := h.TaskService.MarkIssueCardSessionsTerminalWithStatus(ctx, current.ID, current.WorkspaceID, currentCategory); err != nil {
-			slog.Warn("failed to retain card session after terminal issue status",
-				"issue_id", uuidToString(current.ID),
-				"error", err,
-			)
-		}
-	case issuestatus.IsTerminal(previousCategory) && !issuestatus.IsTerminal(currentCategory):
-		if err := h.TaskService.ReopenIssueCardSessionsWithSource(ctx, current.ID, current.WorkspaceID, "status_transition"); err != nil {
-			slog.Warn("failed to reopen retained card session",
+	status := issuestatus.Effective(ctx, h.Queries, current.WorkspaceID, current.Status)
+	if status == issuestatus.Cancelled {
+		if err := h.TaskService.CancelTasksForIssue(ctx, current.ID); err != nil {
+			slog.Warn("failed to cancel issue tasks after cancelled status",
 				"issue_id", uuidToString(current.ID),
 				"error", err,
 			)
 		}
 	}
+	if err := h.TaskService.SyncIssueCardSessions(ctx, current.ID, current.WorkspaceID); err != nil {
+		slog.Warn("failed to sync card session after issue status change",
+			"issue_id", uuidToString(current.ID),
+			"error", err,
+		)
+	}
+	if issuestatus.AllowsAgentTask(ctx, h.Queries, current.WorkspaceID, current.Status) {
+		h.ensureIssueCardSession(ctx, current)
+	}
+}
+
+func (h *Handler) reconcileCardSessionAssignee(ctx context.Context, issue db.Issue) {
+	if h.TaskService == nil {
+		return
+	}
+	if err := h.TaskService.SyncIssueCardSessions(ctx, issue.ID, issue.WorkspaceID); err != nil {
+		slog.Warn("failed to sync card session after issue assignee change",
+			"issue_id", uuidToString(issue.ID),
+			"error", err,
+		)
+	}
+	if issuestatus.AllowsAgentTask(ctx, h.Queries, issue.WorkspaceID, issue.Status) {
+		h.ensureIssueCardSession(ctx, issue)
+	}
+}
+
+func (h *Handler) ensureIssueCardSession(ctx context.Context, issue db.Issue) {
+	if h.TaskService == nil || h.Queries == nil || !issue.AssigneeID.Valid {
+		return
+	}
+	agent, err := h.Queries.GetAgent(ctx, issue.AssigneeID)
+	if err != nil {
+		slog.Warn("failed to load issue agent for card session",
+			"issue_id", uuidToString(issue.ID),
+			"error", err,
+		)
+		return
+	}
+	if _, err := h.TaskService.EnsureCardSession(ctx, issue.ID, issue.WorkspaceID, agent.ID, agent.RuntimeMode); err != nil {
+		slog.Warn("failed to ensure card session after active issue status",
+			"issue_id", uuidToString(issue.ID),
+			"agent_id", uuidToString(agent.ID),
+			"error", err,
+		)
+	}
 }
 
 // reopenTerminalIssueOnComment publishes the status transition performed by
-// the CreateComment SQL statement and wakes the retained generation. The
-// database statement owns the transition itself, so this helper is deliberately
-// a readback/reconcile step rather than a second status write.
+// the CreateComment SQL statement and ensures the active generation exists.
+// The database statement owns the transition itself, so this is a readback
+// step rather than a second status write.
 func (h *Handler) reopenTerminalIssueOnComment(ctx context.Context, issue db.Issue, newStatus, actorType, actorID string) db.Issue {
 	if h.Queries == nil || newStatus == "" || newStatus == issue.Status || !issuestatus.IsTerminal(issuestatus.Effective(ctx, h.Queries, issue.WorkspaceID, issue.Status)) {
 		return issue
@@ -60,11 +94,14 @@ func (h *Handler) reopenTerminalIssueOnComment(ctx context.Context, issue db.Iss
 	}
 
 	if h.TaskService != nil {
-		if err := h.TaskService.ReopenIssueCardSessionsWithSource(ctx, updated.ID, updated.WorkspaceID, "comment_after_terminal"); err != nil {
-			slog.Warn("failed to reopen retained card session from comment",
+		if err := h.TaskService.SyncIssueCardSessions(ctx, updated.ID, updated.WorkspaceID); err != nil {
+			slog.Warn("failed to sync card session after comment reopened issue",
 				"issue_id", uuidToString(updated.ID),
 				"error", err,
 			)
+		}
+		if issuestatus.AllowsAgentTask(ctx, h.Queries, updated.WorkspaceID, updated.Status) {
+			h.ensureIssueCardSession(ctx, updated)
 		}
 	}
 

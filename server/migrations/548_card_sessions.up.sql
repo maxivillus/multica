@@ -3,9 +3,12 @@
 -- the generation remains addressable by its stable id.
 CREATE TABLE card_session (
     id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
-    workspace_id UUID NOT NULL REFERENCES workspace(id) ON DELETE CASCADE,
-    issue_id UUID NOT NULL REFERENCES issue(id) ON DELETE CASCADE,
-    agent_id UUID NOT NULL REFERENCES agent(id) ON DELETE CASCADE,
+    -- These references are validated by CreateCardSession and cleaned up by
+    -- the workspace, issue, and agent teardown paths. Keep the lifecycle table
+    -- independent of FK cascades so teardown remains explicitly ordered.
+    workspace_id UUID NOT NULL,
+    issue_id UUID NOT NULL,
+    agent_id UUID NOT NULL,
     generation BIGINT NOT NULL DEFAULT 1 CHECK (generation > 0),
     state TEXT NOT NULL DEFAULT 'open'
         CHECK (state IN ('open', 'done_retained', 'closed')),
@@ -32,16 +35,6 @@ CREATE TABLE card_session (
 -- At most one resumable generation exists for an issue/agent pair. Closed
 -- generations remain as immutable history and the next one increments the
 -- generation number under the workspace lock.
-CREATE UNIQUE INDEX card_session_one_resumable_per_issue_agent
-    ON card_session (issue_id, agent_id)
-    WHERE state <> 'closed';
-
-CREATE INDEX card_session_workspace_state_idx
-    ON card_session (workspace_id, state, retain_until);
-
-CREATE INDEX card_session_issue_idx
-    ON card_session (issue_id, agent_id, generation DESC);
-
 COMMENT ON TABLE card_session IS
     'Server-owned lifecycle for a per-issue agent generation; provider process state is resumable but not the source of truth.';
 

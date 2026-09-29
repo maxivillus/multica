@@ -1,4 +1,4 @@
--- Restore migration 420's done-only trigger behavior when rolling back this
+-- Restore migration 548's done-only trigger behavior when rolling back this
 -- migration. The card_session schema and trigger names remain unchanged.
 
 CREATE OR REPLACE FUNCTION guard_card_session_close()

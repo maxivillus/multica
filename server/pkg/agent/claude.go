@@ -98,7 +98,7 @@ func (b *claudeBackend) Execute(ctx context.Context, prompt string, opts ExecOpt
 	if opts.ResumeSessionID != "" {
 		snapshot, snapshotErr := captureClaudeUsageSnapshot(cmd.Env, cmd.Dir, opts.ResumeSessionID)
 		if snapshotErr != nil {
-			b.cfg.Logger.Warn("claude usage baseline unavailable; falling back to reported totals", "error", snapshotErr)
+			b.cfg.Logger.Warn("claude usage baseline unavailable; falling back to reported totals", "error_present", snapshotErr != nil)
 		} else {
 			usageSnapshot = snapshot
 		}
@@ -140,7 +140,7 @@ func (b *claudeBackend) Execute(ctx context.Context, prompt string, opts ExecOpt
 		return nil, fmt.Errorf("start claude: %w", err)
 	}
 
-	b.cfg.Logger.Info("claude started", "pid", cmd.Process.Pid, "cwd", opts.Cwd, "model", opts.Model)
+	b.cfg.Logger.Info("claude started", "pid", cmd.Process.Pid, "cwd_present", opts.Cwd != "", "model", opts.Model)
 
 	// The process started — transfer temp file ownership to the goroutine.
 	mcpFileCleanup = nil
@@ -170,7 +170,7 @@ func (b *claudeBackend) Execute(ctx context.Context, prompt string, opts ExecOpt
 	go func() {
 		if supplements != nil {
 			if initErr := supplements.initialize(inputWriter, claudeSupplementHandshakeTimeout); initErr != nil {
-				b.cfg.Logger.Warn("Claude additional messages unavailable; continuing normally", "error", initErr)
+				b.cfg.Logger.Warn("Claude additional messages unavailable; continuing normally", "error_present", initErr != nil)
 				supplements.end()
 			}
 		}
@@ -365,7 +365,7 @@ func (b *claudeBackend) Execute(ctx context.Context, prompt string, opts ExecOpt
 			appendedUsage, found, snapshotErr := usageSnapshot.appendedCostStateUsage()
 			switch {
 			case snapshotErr != nil:
-				b.cfg.Logger.Warn("claude final cost state unavailable; keeping stream usage fallback", "error", snapshotErr)
+				b.cfg.Logger.Warn("claude final cost state unavailable; keeping stream usage fallback", "error_present", snapshotErr != nil)
 			case found:
 				usage = subtractClaudeUsage(appendedUsage, usageSnapshot.baseline)
 			}
@@ -435,8 +435,8 @@ func (b *claudeBackend) Execute(ctx context.Context, prompt string, opts ExecOpt
 				}
 			}
 			b.cfg.Logger.Info("claude resume was rejected; dropping session id and signalling fresh-session retry",
-				"requested_resume", opts.ResumeSessionID,
-				"emitted_session", sessionID,
+				"requested_session_id_present", opts.ResumeSessionID != "",
+				"emitted_session_id_present", sessionID != "",
 			)
 		}
 
@@ -588,12 +588,12 @@ func (b *claudeBackend) handleControlRequest(msg claudeSDKMessage, stdin interfa
 
 	data, err := json.Marshal(response)
 	if err != nil {
-		b.cfg.Logger.Warn("claude: failed to marshal control response", "error", err)
+		b.cfg.Logger.Warn("claude: failed to marshal control response", "error_present", err != nil)
 		return
 	}
 	data = append(data, '\n')
 	if _, err := stdin.Write(data); err != nil {
-		b.cfg.Logger.Warn("claude: failed to write control response", "error", err)
+		b.cfg.Logger.Warn("claude: failed to write control response", "error_present", err != nil)
 	}
 }
 
@@ -1564,7 +1564,7 @@ func salvageProbeAnswer(runtimeCmd Command, probe string, answered bool, err err
 	if runtimeCmd.logger != nil {
 		runtimeCmd.logger.Warn("agent: CLI answered but left its output pipes open; "+
 			"using the answer and reaping the tree",
-			"command", runtimeCmd.String(), "probe", probe, "err", err)
+			"command_configured", runtimeCmd.Path != "", "probe", probe, "error_present", err != nil)
 	}
 	return true
 }
@@ -1611,9 +1611,8 @@ func newLogWriter(logger *slog.Logger, prefix string) *logWriter {
 }
 
 func (w *logWriter) Write(p []byte) (int, error) {
-	text := strings.TrimSpace(string(p))
-	if text != "" {
-		w.logger.Debug(w.prefix + text)
+	if strings.TrimSpace(string(p)) != "" {
+		w.logger.Debug(w.prefix+"provider output received", "bytes", len(p))
 	}
 	return len(p), nil
 }

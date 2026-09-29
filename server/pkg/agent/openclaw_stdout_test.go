@@ -15,6 +15,27 @@ import (
 	"time"
 )
 
+func TestOpenclawUnstructuredOutputLogOmitsProviderContents(t *testing.T) {
+	var logs bytes.Buffer
+	logger := slog.New(slog.NewTextHandler(&logs, &slog.HandlerOptions{Level: slog.LevelDebug}))
+	marker := "provider session_id=openclaw-private-session cwd=/private/openclaw-workdir"
+	b := &openclawBackend{cfg: Config{Logger: logger}}
+	result := b.processOutput(strings.NewReader(marker), make(chan Message, 1))
+
+	if !strings.Contains(result.output, marker) {
+		t.Fatalf("unstructured provider output changed: %#v", result)
+	}
+	got := logs.String()
+	for _, secret := range []string{"openclaw-private-session", "/private/openclaw-workdir", marker} {
+		if strings.Contains(got, secret) {
+			t.Fatalf("openclaw log contains provider output %q: %s", secret, got)
+		}
+	}
+	if !strings.Contains(got, "bytes=") {
+		t.Fatalf("openclaw log omitted safe byte count: %s", got)
+	}
+}
+
 // Reproduces the production failure where a chat reply was generated but never
 // delivered. Timeline observed on an OpenClaw host:
 //

@@ -498,6 +498,17 @@ cleared_pr_automation AS (
 ),
 cleared_pr_exclusions AS (
     DELETE FROM issue_pull_request_exclusion WHERE issue_id IN (SELECT target.id FROM target)
+),
+deleted_card_sessions AS (
+    DELETE FROM card_session
+    WHERE issue_id IN (SELECT target.id FROM target)
+      AND workspace_id = $2
+    RETURNING id
+),
+cleared_card_session_task_bindings AS (
+    UPDATE agent_task_queue
+    SET card_session_id = NULL
+    WHERE card_session_id IN (SELECT id FROM deleted_card_sessions)
 )
 DELETE FROM issue WHERE issue.id IN (SELECT target.id FROM target);
 

@@ -163,7 +163,7 @@ func classifyACPResumeFailure(runCtx context.Context, backend, rpc string, err e
 		logger.Warn("resumed session rejected by the runtime; the daemon will retry from a fresh session",
 			"backend", backend,
 			"rpc", rpc,
-			"error", err,
+			"error_present", err != nil,
 		)
 	}
 	return "failed", errText, true

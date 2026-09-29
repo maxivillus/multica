@@ -190,8 +190,8 @@ func TestRerunIssue_PrivateHistoricalAgent(t *testing.T) {
 
 	var issueID string
 	if err := testPool.QueryRow(ctx, `
-		INSERT INTO issue (workspace_id, title, creator_type, creator_id, assignee_type, assignee_id, priority)
-		VALUES ($1, 'rerun private agent', 'member', $2, 'agent', $3, 'medium')
+		INSERT INTO issue (workspace_id, title, creator_type, creator_id, assignee_type, assignee_id, priority, status)
+		VALUES ($1, 'rerun private agent', 'member', $2, 'agent', $3, 'medium', 'todo')
 		RETURNING id`, testWorkspaceID, ownerID, agentID).Scan(&issueID); err != nil {
 		t.Fatalf("seed issue: %v", err)
 	}

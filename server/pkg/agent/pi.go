@@ -465,7 +465,7 @@ func (b *piBackend) Execute(ctx context.Context, prompt string, opts ExecOptions
 		close(stderrDone)
 	}()
 
-	b.cfg.Logger.Info(label+" started", "pid", cmd.Process.Pid, "cwd", opts.Cwd, "model", opts.Model)
+	b.cfg.Logger.Info(label+" started", "pid", cmd.Process.Pid, "cwd_present", opts.Cwd != "", "model", opts.Model)
 
 	msgCh := make(chan Message, 256)
 	resCh := make(chan Result, 1)

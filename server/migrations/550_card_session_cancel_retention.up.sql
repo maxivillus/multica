@@ -1,5 +1,5 @@
 -- Treat the built-in cancelled category like done for durable card-session
--- retention. Migration 420 created the trigger with done-only predicates;
+-- retention. Migration 548 created the trigger with done-only predicates;
 -- replace the functions in a forward migration so existing databases keep
 -- their history and receive the new lifecycle rule safely.
 

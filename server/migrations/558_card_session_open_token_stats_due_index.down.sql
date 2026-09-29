@@ -1,0 +1,1 @@
+DROP INDEX CONCURRENTLY IF EXISTS card_session_open_token_stats_due_idx;

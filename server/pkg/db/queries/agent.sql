@@ -89,8 +89,21 @@ RETURNING *;
 -- Builder sessions own their hidden execution agent. Deleting the session
 -- removes that carrier and its task rows; the kind guard prevents this cleanup
 -- path from ever deleting a user-authored agent.
-DELETE FROM agent
-WHERE id = $1 AND kind = 'system' AND system_key LIKE 'agent_builder:%';
+WITH target AS MATERIALIZED (
+    SELECT a.id FROM agent AS a
+    WHERE a.id = $1 AND a.kind = 'system' AND a.system_key LIKE 'agent_builder:%'
+),
+deleted_card_sessions AS (
+    DELETE FROM card_session AS cs
+    WHERE cs.agent_id IN (SELECT target.id FROM target)
+    RETURNING id
+),
+cleared_card_session_task_bindings AS (
+    UPDATE agent_task_queue
+    SET card_session_id = NULL
+    WHERE card_session_id IN (SELECT deleted_card_sessions.id FROM deleted_card_sessions)
+)
+DELETE FROM agent AS a WHERE a.id IN (SELECT target.id FROM target);
 
 -- name: RebindAgentBuilderRuntime :one
 -- Re-points a builder carrier at another runtime mid-conversation. The carrier
@@ -343,14 +356,14 @@ SELECT
 WHERE lock_task_owner_rows($1, $3, $2)
 RETURNING *;
 
--- name: CreateDeferredChannelIssueTask :one
+-- name: CreateDeferredIssueTask :one
 -- Fenced against workspace teardown: lock_task_owner_rows (migration 284)
 -- locks the owners' workspace rows in the writer's own transaction and returns
 -- false once they are gone, so this statement writes no row instead of stranding
 -- a task in a workspace that has just been deleted (MUL-5999).
--- Channel /issue media resolves after issue creation. Persist the assigned
--- issue task up front for crash safety, but keep it inert until attachment
--- binding settles or the fire_at fallback is promoted by the normal sweeper.
+-- Persists an issue task that must wait for channel media or a card-session
+-- slot. The matching context marker controls the early media-ready promotion
+-- and the capacity gate in the normal deferred-task promoter.
 INSERT INTO agent_task_queue (
     agent_id, runtime_id, issue_id, status, priority, trigger_comment_id,
     coalesced_comment_ids, trigger_summary, force_fresh_session, is_leader_task, handoff_note,
@@ -369,7 +382,8 @@ SELECT
     sqlc.narg(squad_id),
     jsonb_strip_nulls(jsonb_build_object(
         'head_sha', NULLIF(COALESCE(sqlc.narg('head_sha')::text, ''), ''),
-        'channel_issue_media_pending', TRUE
+        'channel_issue_media_pending', CASE WHEN @channel_issue_media_pending::boolean THEN TRUE END,
+        'card_session_capacity_pending', CASE WHEN @card_session_capacity_pending::boolean THEN TRUE END
     )),
     sqlc.narg(originator_user_id),
     sqlc.narg(accountable_user_id),
@@ -388,10 +402,23 @@ RETURNING *;
 
 -- name: PromoteDeferredChannelIssueTask :one
 -- Early promotion is idempotent at the service layer: a task already promoted
--- by the fire_at sweeper no longer matches and is treated as settled.
+-- by the fire_at sweeper no longer matches and is treated as settled. A
+-- capacity-waiting task has its media marker cleared but stays deferred until
+-- the card-session admission step releases it.
 UPDATE agent_task_queue
-SET status = 'queued', fire_at = NULL
-WHERE id = $1 AND issue_id IS NOT NULL AND status = 'deferred'
+SET status = CASE
+        WHEN context->>'card_session_capacity_pending' = 'true' THEN 'deferred'
+        ELSE 'queued'
+    END,
+    fire_at = CASE
+        WHEN context->>'card_session_capacity_pending' = 'true' THEN LEAST(fire_at, now())
+        ELSE NULL
+    END,
+    context = context - 'channel_issue_media_pending'
+WHERE id = $1
+  AND issue_id IS NOT NULL
+  AND status = 'deferred'
+  AND context->>'channel_issue_media_pending' = 'true'
 RETURNING *;
 
 -- name: SetDeferredChannelIssueTaskRuntimeOverlay :execrows
@@ -619,8 +646,9 @@ WHERE id = sqlc.arg(task_id)
 -- Cancels every active task on the issue and returns the affected rows so the
 -- caller can reconcile each agent's status and broadcast task:cancelled events
 -- (#1587). Prior :exec form silently dropped that info, leaving agents stuck at
--- status="working" with no self-correction. Only issue-deletion cleanup calls
--- this now; a status flip to cancelled/done no longer does (MUL-4465).
+-- status="working" with no self-correction. Issue deletion and explicit
+-- cancelled status transitions call this; done transitions leave tasks running
+-- so card-session completion can preserve their resumable work (MUL-4465).
 UPDATE agent_task_queue
 SET status = 'cancelled', completed_at = now(), prepare_lease_expires_at = NULL,
     cancelled_by_type = 'system', cancelled_by_id = NULL, cancelled_by_name = NULL
@@ -990,6 +1018,25 @@ SELECT * FROM agent_task_queue
 WHERE id = $1 AND runtime_id = $2 AND dispatched_at = $3
   AND status IN ('dispatched', 'waiting_local_directory', 'running')
 FOR UPDATE;
+
+-- name: BindAgentTaskToCardSession :one
+-- The task's first successful start fixes its card-session generation. Later
+-- provider callbacks use this id so an old task cannot write into a new one.
+UPDATE agent_task_queue AS task
+SET card_session_id = sqlc.arg(card_session_id)
+WHERE task.id = sqlc.arg(task_id)
+  AND task.status = 'running'
+  AND task.issue_id IS NOT NULL
+  AND task.card_session_id IS NULL
+  AND EXISTS (
+      SELECT 1
+      FROM card_session AS session
+      WHERE session.id = sqlc.arg(card_session_id)
+        AND session.issue_id = task.issue_id
+        AND session.agent_id = task.agent_id
+        AND session.state = 'open'
+  )
+RETURNING task.*;
 
 -- name: MarkAgentTaskWaitingLocalDirectory :one
 -- Transitions a freshly-dispatched task into 'waiting_local_directory' while
@@ -2372,6 +2419,10 @@ WITH due AS (
     WHERE t.runtime_id = @runtime_id
       AND t.status = 'deferred'
       AND t.fire_at <= now()
+      -- Card-session capacity waiters are admitted only by
+      -- WakeCardSessionCapacityWaiters after EnsureCardSession checks the
+      -- workspace slot. Never let the generic promoter make one claimable.
+      AND COALESCE(t.context->>'card_session_capacity_pending', '') <> 'true'
       AND EXISTS (
         SELECT 1 FROM agent_runtime r
         WHERE r.id = t.runtime_id
@@ -2475,6 +2526,9 @@ WITH due AS (
     WHERE t.runtime_id = ANY(@runtime_ids::uuid[])
       AND t.status = 'deferred'
       AND t.fire_at <= now()
+      -- Keep capacity waiters behind the application-level slot check even
+      -- when this batch promoter sees more rows than the bounded wake pass.
+      AND COALESCE(t.context->>'card_session_capacity_pending', '') <> 'true'
       AND EXISTS (
         SELECT 1 FROM agent_runtime r
         WHERE r.id = t.runtime_id
