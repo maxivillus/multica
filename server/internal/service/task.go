@@ -4503,8 +4503,22 @@ func (s *TaskService) maybeLogClaimSlow(agentID pgtype.UUID, outcome string, sta
 // StartTask transitions a dispatched task to running.
 // Issue status is NOT changed here — the agent manages it via the CLI.
 func (s *TaskService) StartTask(ctx context.Context, taskID pgtype.UUID, supplementSupport ...bool) (*db.AgentTaskQueue, error) {
+	return s.startTask(ctx, taskID, "", supplementSupport...)
+}
+
+// StartTaskWithCardSessionLease is the daemon-owned start path. The lease is
+// acquired in the same transaction as the dispatched -> running transition so
+// no provider host can begin a card turn without owning its generation.
+func (s *TaskService) StartTaskWithCardSessionLease(ctx context.Context, taskID pgtype.UUID, leaseOwner string, supplementSupport ...bool) (*db.AgentTaskQueue, error) {
+	return s.startTask(ctx, taskID, leaseOwner, supplementSupport...)
+}
+
+func (s *TaskService) startTask(ctx context.Context, taskID pgtype.UUID, leaseOwner string, supplementSupport ...bool) (*db.AgentTaskQueue, error) {
 	enableTaskSupplement := len(supplementSupport) > 0 && supplementSupport[0]
 	if s.TxStarter == nil {
+		if strings.TrimSpace(leaseOwner) != "" {
+			return nil, fmt.Errorf("start task with card session lease requires a transaction")
+		}
 		// Keep the legacy query-only service used by isolated mock tests. The
 		// production service always has a transaction starter so issue tasks are
 		// bound to their card-session generation before StartTask returns.
@@ -4535,6 +4549,11 @@ func (s *TaskService) StartTask(ctx context.Context, taskID pgtype.UUID, supplem
 	if err != nil {
 		return nil, err
 	}
+	if strings.TrimSpace(leaseOwner) != "" && task.CardSessionID.Valid {
+		if _, err := s.acquireCardSessionLeaseWithQueries(ctx, qtx, task.ID, leaseOwner); err != nil {
+			return nil, err
+		}
+	}
 	if err := tx.Commit(ctx); err != nil {
 		return nil, fmt.Errorf("commit task start: %w", err)
 	}
@@ -4546,6 +4565,17 @@ func (s *TaskService) StartTask(ctx context.Context, taskID pgtype.UUID, supplem
 // cancellation and other start requests. A replay linearizes at the locked read;
 // a cancellation that commits later can still cancel the acknowledged task.
 func (s *TaskService) StartTaskForClaim(ctx context.Context, claim db.LockAgentTaskStartClaimParams, supplementSupport ...bool) (*db.AgentTaskQueue, error) {
+	return s.startTaskForClaim(ctx, claim, "", supplementSupport...)
+}
+
+// StartTaskForClaimWithCardSessionLease is the claim-validated daemon path.
+// The owner is kept separate from the task row so a stale process cannot
+// replay a task and silently take the current generation.
+func (s *TaskService) StartTaskForClaimWithCardSessionLease(ctx context.Context, claim db.LockAgentTaskStartClaimParams, leaseOwner string, supplementSupport ...bool) (*db.AgentTaskQueue, error) {
+	return s.startTaskForClaim(ctx, claim, leaseOwner, supplementSupport...)
+}
+
+func (s *TaskService) startTaskForClaim(ctx context.Context, claim db.LockAgentTaskStartClaimParams, leaseOwner string, supplementSupport ...bool) (*db.AgentTaskQueue, error) {
 	if !claim.ID.Valid || !claim.RuntimeID.Valid || !claim.DispatchedAt.Valid {
 		return nil, fmt.Errorf("start task: incomplete claim")
 	}
@@ -4570,6 +4600,11 @@ func (s *TaskService) StartTaskForClaim(ctx context.Context, claim db.LockAgentT
 		}
 		task, err = s.bindStartedIssueTaskToCardSession(ctx, qtx, task)
 		if err != nil {
+			return nil, err
+		}
+	}
+	if strings.TrimSpace(leaseOwner) != "" && task.CardSessionID.Valid {
+		if _, err := s.acquireCardSessionLeaseWithQueries(ctx, qtx, task.ID, leaseOwner); err != nil {
 			return nil, err
 		}
 	}

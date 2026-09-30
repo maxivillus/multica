@@ -8437,10 +8437,27 @@ func (d *Daemon) runTask(ctx context.Context, task Task, provider string, slot i
 	if agent.SupportsTaskSupplement(provider, resolvedVersion) && task.IssueID != "" {
 		taskCapabilities = append(taskCapabilities, protocol.DaemonCapabilityTaskSupplementV1)
 	}
-	taskSupplementNegotiated, err := d.client.StartTask(prepareCtx, task, taskCapabilities...)
+	taskSupplementNegotiated, cardSessionLease, err := d.client.StartTaskWithLease(prepareCtx, task, taskCapabilities...)
 	if err != nil {
 		stopPrepareLease()
 		return TaskResult{}, fmt.Errorf("start task failed: %w", err)
+	}
+	// A card-session start response carries a server-issued fencing epoch. Keep
+	// that lease alive for the whole provider turn and fail closed if ownership
+	// can no longer be proven. The legacy zero lease remains compatible with
+	// older servers that do not expose card-session fencing yet.
+	executionCtx := ctx
+	stopCardSessionLease := func() {}
+	if cardSessionLease.CardSessionID != "" && cardSessionLease.LeaseEpoch > 0 {
+		var cancelExecution context.CancelFunc
+		executionCtx, cancelExecution = context.WithCancel(ctx)
+		stopCardSessionLease = d.maintainCardSessionLease(
+			executionCtx, task.ID, cardSessionLease.LeaseEpoch, cancelExecution, taskLog,
+		)
+		defer func() {
+			stopCardSessionLease()
+			cancelExecution()
+		}()
 	}
 	if taskSupplementNegotiated {
 		// Register before provider launch so a hint cannot arrive in the gap
@@ -8812,7 +8829,7 @@ func (d *Daemon) runTask(ctx context.Context, task Task, provider string, slot i
 	// Shared across the resume-retry below so the retry's transcript rows
 	// keep ascending seq values for the same task.
 	var msgSeq atomic.Int32
-	result, tools, err := d.executeAndDrain(ctx, backend, prompt, execOpts, taskLog, task.ID, env.CodexHome, &msgSeq)
+	result, tools, err := d.executeAndDrain(executionCtx, backend, prompt, execOpts, taskLog, task.ID, env.CodexHome, &msgSeq)
 	if err != nil {
 		return TaskResult{}, err
 	}
@@ -8868,7 +8885,7 @@ func (d *Daemon) runTask(ctx context.Context, task Task, provider string, slot i
 		}
 		freshPrompt := BuildPrompt(task, provider, promptOptions...)
 
-		retryResult, retryTools, retryErr := d.executeAndDrain(ctx, backend, freshPrompt, execOpts, taskLog, task.ID, env.CodexHome, &msgSeq)
+		retryResult, retryTools, retryErr := d.executeAndDrain(executionCtx, backend, freshPrompt, execOpts, taskLog, task.ID, env.CodexHome, &msgSeq)
 		if retryErr != nil {
 			logFreshSessionStartFailure(taskLog, retryErr)
 		} else if retryResult.Status != "completed" && retryResult.SessionID == "" {

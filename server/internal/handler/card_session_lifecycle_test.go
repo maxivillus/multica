@@ -462,6 +462,79 @@ func TestExistingAssignedTodoAllocatesGenerationLazilyAtTaskStart(t *testing.T) 
 	}
 }
 
+func TestCardSessionLeaseFencesOwnerAndDoesNotTouchActivity(t *testing.T) {
+	if testHandler == nil || testPool == nil {
+		t.Skip("database not available")
+	}
+	ctx := context.Background()
+	_, runtimeID, agentID, _, issueID := createCardSessionCapacityFixture(t, ctx)
+	var taskID pgtype.UUID
+	if err := testPool.QueryRow(ctx, `
+		INSERT INTO agent_task_queue (agent_id, runtime_id, issue_id, status, priority, dispatched_at)
+		VALUES ($1, $2, $3, 'dispatched', 0, now()) RETURNING id`, agentID, runtimeID, issueID).Scan(&taskID); err != nil {
+		t.Fatalf("insert dispatched task: %v", err)
+	}
+	t.Cleanup(func() { testPool.Exec(context.Background(), `DELETE FROM agent_task_queue WHERE id = $1`, taskID) })
+
+	started, err := testHandler.TaskService.StartTaskWithCardSessionLease(ctx, taskID, "daemon-a")
+	if err != nil {
+		t.Fatalf("start task with lease: %v", err)
+	}
+	if !started.CardSessionID.Valid {
+		t.Fatal("started task has no card session binding")
+	}
+	initial, err := testHandler.Queries.GetCardSession(ctx, started.CardSessionID)
+	if err != nil {
+		t.Fatalf("load acquired card session: %v", err)
+	}
+	if !initial.LeaseOwner.Valid || initial.LeaseOwner.String != "daemon-a" || initial.LeaseEpoch != 1 {
+		t.Fatalf("initial lease = owner=%q valid=%t epoch=%d, want daemon-a/1", initial.LeaseOwner.String, initial.LeaseOwner.Valid, initial.LeaseEpoch)
+	}
+	activityBefore := initial.LastActivityAt
+
+	heartbeat, err := testHandler.TaskService.HeartbeatCardSessionLeaseByTask(ctx, taskID, "daemon-a", initial.LeaseEpoch)
+	if err != nil {
+		t.Fatalf("heartbeat lease: %v", err)
+	}
+	if !heartbeat.LastActivityAt.Valid || !activityBefore.Valid || !heartbeat.LastActivityAt.Time.Equal(activityBefore.Time) {
+		t.Fatalf("heartbeat changed last_activity_at from %v to %v", activityBefore, heartbeat.LastActivityAt)
+	}
+	replayed, err := testHandler.TaskService.AcquireCardSessionLeaseForTask(ctx, taskID, "daemon-a")
+	if err != nil {
+		t.Fatalf("same-owner lease replay: %v", err)
+	}
+	if replayed.LeaseEpoch != initial.LeaseEpoch {
+		t.Fatalf("same-owner replay advanced epoch from %d to %d", initial.LeaseEpoch, replayed.LeaseEpoch)
+	}
+	if _, err := testHandler.TaskService.AcquireCardSessionLeaseForTask(ctx, taskID, "daemon-b"); !errors.Is(err, service.ErrCardSessionLeaseUnavailable) {
+		t.Fatalf("fresh lease takeover error = %v, want ErrCardSessionLeaseUnavailable", err)
+	}
+
+	if _, err := testPool.Exec(ctx, `UPDATE card_session SET lease_heartbeat_at = now() - interval '2 minutes' WHERE id = $1`, started.CardSessionID); err != nil {
+		t.Fatalf("age lease heartbeat: %v", err)
+	}
+	takenOver, err := testHandler.TaskService.AcquireCardSessionLeaseForTask(ctx, taskID, "daemon-b")
+	if err != nil {
+		t.Fatalf("stale lease takeover: %v", err)
+	}
+	if !takenOver.LeaseOwner.Valid || takenOver.LeaseOwner.String != "daemon-b" || takenOver.LeaseEpoch != initial.LeaseEpoch+1 {
+		t.Fatalf("takeover lease = owner=%q valid=%t epoch=%d, want daemon-b/%d", takenOver.LeaseOwner.String, takenOver.LeaseOwner.Valid, takenOver.LeaseEpoch, initial.LeaseEpoch+1)
+	}
+	if _, err := testHandler.TaskService.ReleaseCardSessionLeaseByTask(ctx, taskID, "daemon-a", initial.LeaseEpoch); !errors.Is(err, service.ErrCardSessionLeaseUnavailable) {
+		t.Fatalf("stale release error = %v, want ErrCardSessionLeaseUnavailable", err)
+	}
+	if _, err := testHandler.TaskService.ReleaseCardSessionLeaseByTask(ctx, taskID, "daemon-b", takenOver.LeaseEpoch); err != nil {
+		t.Fatalf("current owner release: %v", err)
+	}
+	cleared, err := testHandler.Queries.GetCardSession(ctx, started.CardSessionID)
+	if err != nil {
+		t.Fatalf("load released card session: %v", err)
+	}
+	if cleared.LeaseOwner.Valid || cleared.LeaseHeartbeatAt.Valid {
+		t.Fatalf("released lease remains owner=%q heartbeat_valid=%t", cleared.LeaseOwner.String, cleared.LeaseHeartbeatAt.Valid)
+	}
+}
+
 func TestExpiredCardSessionStartsFreshGenerationBeforeSweeper(t *testing.T) {
 	if testHandler == nil || testPool == nil {
 		t.Skip("database not available")
