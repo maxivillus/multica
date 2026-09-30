@@ -34,6 +34,20 @@ in-memory cache may be restarted; they are not the source of truth.
   resumes its retained generation if the idle timeout has not passed. Repeated
   comments and concurrent status writers are idempotent at the database row.
 
+### Provider-host fencing
+
+The daemon start transition acquires the open generation's lease in the same
+transaction as `dispatched → running`. A fresh same-owner start replay is
+idempotent; a different owner can take over only after the 90-second lease
+heartbeat window is stale, and every takeover advances `lease_epoch`.
+
+The daemon API exposes heartbeat and release operations fenced by
+`lease_owner + lease_epoch`. Heartbeat updates only the lease timestamp; it
+never updates `last_activity_at`, so an idle provider host cannot keep a card
+generation alive indefinitely. State transitions to `paused` or `closed`
+clear the lease in both the service and database-trigger paths, and a stale
+owner cannot release a replacement lease.
+
 ### Token statistics
 
 After each accepted provider usage update, the server refreshes the generation's
@@ -72,5 +86,7 @@ The daemon pins the same state as soon as it is observed and repeats the pin in
 the transaction that completes or fails a task. This closes the hand-off window
 where a follow-up comment could be claimed after the task ended but before an
 asynchronous pin reached the database. The durable generation remains
-available across daemon or process restarts, but the implementation does not
-keep a provider process alive for the entire idle window.
+available across daemon or process restarts. The lease is the fencing contract
+for a future live provider host; the current one-shot backend execution path
+still uses provider resume/rejoin after the task boundary and does not keep a
+provider process alive for the entire idle window.

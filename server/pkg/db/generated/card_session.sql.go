@@ -11,6 +11,76 @@ import (
 	"github.com/jackc/pgx/v5/pgtype"
 )
 
+const acquireCardSessionLeaseForTask = `-- name: AcquireCardSessionLeaseForTask :one
+UPDATE card_session AS cs
+SET lease_owner = NULLIF($1::text, ''),
+    lease_epoch = cs.lease_epoch + CASE
+        WHEN cs.lease_owner = $1::text
+             AND cs.lease_heartbeat_at > now() - make_interval(secs => $2::double precision)
+            THEN 0
+        ELSE 1
+    END,
+    lease_heartbeat_at = now(),
+    updated_at = now()
+FROM agent_task_queue AS task
+WHERE task.id = $3
+  AND task.card_session_id = cs.id
+  AND task.status = 'running'
+  AND cs.state = 'open'
+  AND NULLIF($1::text, '') IS NOT NULL
+  AND (
+      cs.lease_owner IS NULL
+      OR cs.lease_heartbeat_at IS NULL
+      OR cs.lease_heartbeat_at <= now() - make_interval(secs => $2::double precision)
+      OR cs.lease_owner = $1::text
+  )
+RETURNING cs.id, cs.workspace_id, cs.issue_id, cs.agent_id, cs.generation, cs.state, cs.provider, cs.provider_session_id, cs.work_dir, cs.opened_at, cs.last_activity_at, cs.done_at, cs.retain_until, cs.closed_at, cs.lease_owner, cs.lease_epoch, cs.lease_heartbeat_at, cs.created_at, cs.updated_at, cs.last_token_stats_at, cs.pause_reason, cs.token_input_tokens, cs.token_output_tokens, cs.token_cache_read_tokens, cs.token_cache_write_tokens, cs.token_task_count
+`
+
+type AcquireCardSessionLeaseForTaskParams struct {
+	LeaseOwner        string      `json:"lease_owner"`
+	StaleAfterSeconds float64     `json:"stale_after_seconds"`
+	TaskID            pgtype.UUID `json:"task_id"`
+}
+
+// A live provider host acquires the current generation only when no other
+// owner has a fresh heartbeat. A same-owner replay with a fresh heartbeat is
+// idempotent; a takeover or stale same-owner recovery advances the fencing
+// epoch. The task binding keeps a stale task from acquiring a newer generation.
+func (q *Queries) AcquireCardSessionLeaseForTask(ctx context.Context, arg AcquireCardSessionLeaseForTaskParams) (CardSession, error) {
+	row := q.db.QueryRow(ctx, acquireCardSessionLeaseForTask, arg.LeaseOwner, arg.StaleAfterSeconds, arg.TaskID)
+	var i CardSession
+	err := row.Scan(
+		&i.ID,
+		&i.WorkspaceID,
+		&i.IssueID,
+		&i.AgentID,
+		&i.Generation,
+		&i.State,
+		&i.Provider,
+		&i.ProviderSessionID,
+		&i.WorkDir,
+		&i.OpenedAt,
+		&i.LastActivityAt,
+		&i.DoneAt,
+		&i.RetainUntil,
+		&i.ClosedAt,
+		&i.LeaseOwner,
+		&i.LeaseEpoch,
+		&i.LeaseHeartbeatAt,
+		&i.CreatedAt,
+		&i.UpdatedAt,
+		&i.LastTokenStatsAt,
+		&i.PauseReason,
+		&i.TokenInputTokens,
+		&i.TokenOutputTokens,
+		&i.TokenCacheReadTokens,
+		&i.TokenCacheWriteTokens,
+		&i.TokenTaskCount,
+	)
+	return i, err
+}
+
 const countOpenCardSessions = `-- name: CountOpenCardSessions :one
 SELECT COUNT(*)::bigint
 FROM card_session
@@ -92,6 +162,8 @@ UPDATE card_session AS cs
 SET state = 'closed',
     pause_reason = NULL,
     closed_at = now(),
+    lease_owner = NULL,
+    lease_heartbeat_at = NULL,
     updated_at = now()
 FROM workspace AS w
 WHERE w.id = cs.workspace_id
@@ -177,6 +249,8 @@ UPDATE card_session AS cs
 SET state = 'closed',
     pause_reason = NULL,
     closed_at = now(),
+    lease_owner = NULL,
+    lease_heartbeat_at = NULL,
     updated_at = now()
 FROM workspace AS w
 WHERE cs.workspace_id = $1
@@ -287,6 +361,46 @@ func (q *Queries) FinalizeCardSessionProviderStateByTask(ctx context.Context, ar
 	return err
 }
 
+const getCardSession = `-- name: GetCardSession :one
+SELECT id, workspace_id, issue_id, agent_id, generation, state, provider, provider_session_id, work_dir, opened_at, last_activity_at, done_at, retain_until, closed_at, lease_owner, lease_epoch, lease_heartbeat_at, created_at, updated_at, last_token_stats_at, pause_reason, token_input_tokens, token_output_tokens, token_cache_read_tokens, token_cache_write_tokens, token_task_count
+FROM card_session
+WHERE id = $1
+`
+
+func (q *Queries) GetCardSession(ctx context.Context, id pgtype.UUID) (CardSession, error) {
+	row := q.db.QueryRow(ctx, getCardSession, id)
+	var i CardSession
+	err := row.Scan(
+		&i.ID,
+		&i.WorkspaceID,
+		&i.IssueID,
+		&i.AgentID,
+		&i.Generation,
+		&i.State,
+		&i.Provider,
+		&i.ProviderSessionID,
+		&i.WorkDir,
+		&i.OpenedAt,
+		&i.LastActivityAt,
+		&i.DoneAt,
+		&i.RetainUntil,
+		&i.ClosedAt,
+		&i.LeaseOwner,
+		&i.LeaseEpoch,
+		&i.LeaseHeartbeatAt,
+		&i.CreatedAt,
+		&i.UpdatedAt,
+		&i.LastTokenStatsAt,
+		&i.PauseReason,
+		&i.TokenInputTokens,
+		&i.TokenOutputTokens,
+		&i.TokenCacheReadTokens,
+		&i.TokenCacheWriteTokens,
+		&i.TokenTaskCount,
+	)
+	return i, err
+}
+
 const getCardSessionTokenStats = `-- name: GetCardSessionTokenStats :one
 SELECT
     COALESCE(SUM(usage.input_tokens), 0)::bigint AS input_tokens,
@@ -395,6 +509,60 @@ type GetResumableCardSessionParams struct {
 
 func (q *Queries) GetResumableCardSession(ctx context.Context, arg GetResumableCardSessionParams) (CardSession, error) {
 	row := q.db.QueryRow(ctx, getResumableCardSession, arg.IssueID, arg.AgentID, arg.WorkspaceID)
+	var i CardSession
+	err := row.Scan(
+		&i.ID,
+		&i.WorkspaceID,
+		&i.IssueID,
+		&i.AgentID,
+		&i.Generation,
+		&i.State,
+		&i.Provider,
+		&i.ProviderSessionID,
+		&i.WorkDir,
+		&i.OpenedAt,
+		&i.LastActivityAt,
+		&i.DoneAt,
+		&i.RetainUntil,
+		&i.ClosedAt,
+		&i.LeaseOwner,
+		&i.LeaseEpoch,
+		&i.LeaseHeartbeatAt,
+		&i.CreatedAt,
+		&i.UpdatedAt,
+		&i.LastTokenStatsAt,
+		&i.PauseReason,
+		&i.TokenInputTokens,
+		&i.TokenOutputTokens,
+		&i.TokenCacheReadTokens,
+		&i.TokenCacheWriteTokens,
+		&i.TokenTaskCount,
+	)
+	return i, err
+}
+
+const heartbeatCardSessionLeaseByTask = `-- name: HeartbeatCardSessionLeaseByTask :one
+UPDATE card_session AS cs
+SET lease_heartbeat_at = now(),
+    updated_at = now()
+FROM agent_task_queue AS task
+WHERE task.id = $1
+  AND task.card_session_id = cs.id
+  AND cs.state = 'open'
+  AND cs.lease_owner = $2::text
+  AND cs.lease_epoch = $3
+RETURNING cs.id, cs.workspace_id, cs.issue_id, cs.agent_id, cs.generation, cs.state, cs.provider, cs.provider_session_id, cs.work_dir, cs.opened_at, cs.last_activity_at, cs.done_at, cs.retain_until, cs.closed_at, cs.lease_owner, cs.lease_epoch, cs.lease_heartbeat_at, cs.created_at, cs.updated_at, cs.last_token_stats_at, cs.pause_reason, cs.token_input_tokens, cs.token_output_tokens, cs.token_cache_read_tokens, cs.token_cache_write_tokens, cs.token_task_count
+`
+
+type HeartbeatCardSessionLeaseByTaskParams struct {
+	TaskID     pgtype.UUID `json:"task_id"`
+	LeaseOwner string      `json:"lease_owner"`
+	LeaseEpoch int64       `json:"lease_epoch"`
+}
+
+// Heartbeats fence ownership only; they must never extend card idle activity.
+func (q *Queries) HeartbeatCardSessionLeaseByTask(ctx context.Context, arg HeartbeatCardSessionLeaseByTaskParams) (CardSession, error) {
+	row := q.db.QueryRow(ctx, heartbeatCardSessionLeaseByTask, arg.TaskID, arg.LeaseOwner, arg.LeaseEpoch)
 	var i CardSession
 	err := row.Scan(
 		&i.ID,
@@ -629,6 +797,62 @@ func (q *Queries) ReleaseCardSessionCapacityWaiter(ctx context.Context, id pgtyp
 	return result.RowsAffected(), nil
 }
 
+const releaseCardSessionLeaseByTask = `-- name: ReleaseCardSessionLeaseByTask :one
+UPDATE card_session AS cs
+SET lease_owner = NULL,
+    lease_heartbeat_at = NULL,
+    updated_at = now()
+FROM agent_task_queue AS task
+WHERE task.id = $1
+  AND task.card_session_id = cs.id
+  AND cs.state <> 'closed'
+  AND cs.lease_owner = $2::text
+  AND cs.lease_epoch = $3
+RETURNING cs.id, cs.workspace_id, cs.issue_id, cs.agent_id, cs.generation, cs.state, cs.provider, cs.provider_session_id, cs.work_dir, cs.opened_at, cs.last_activity_at, cs.done_at, cs.retain_until, cs.closed_at, cs.lease_owner, cs.lease_epoch, cs.lease_heartbeat_at, cs.created_at, cs.updated_at, cs.last_token_stats_at, cs.pause_reason, cs.token_input_tokens, cs.token_output_tokens, cs.token_cache_read_tokens, cs.token_cache_write_tokens, cs.token_task_count
+`
+
+type ReleaseCardSessionLeaseByTaskParams struct {
+	TaskID     pgtype.UUID `json:"task_id"`
+	LeaseOwner string      `json:"lease_owner"`
+	LeaseEpoch int64       `json:"lease_epoch"`
+}
+
+// Release is fenced by both owner and epoch so a previous process cannot
+// clear a lease acquired by its replacement.
+func (q *Queries) ReleaseCardSessionLeaseByTask(ctx context.Context, arg ReleaseCardSessionLeaseByTaskParams) (CardSession, error) {
+	row := q.db.QueryRow(ctx, releaseCardSessionLeaseByTask, arg.TaskID, arg.LeaseOwner, arg.LeaseEpoch)
+	var i CardSession
+	err := row.Scan(
+		&i.ID,
+		&i.WorkspaceID,
+		&i.IssueID,
+		&i.AgentID,
+		&i.Generation,
+		&i.State,
+		&i.Provider,
+		&i.ProviderSessionID,
+		&i.WorkDir,
+		&i.OpenedAt,
+		&i.LastActivityAt,
+		&i.DoneAt,
+		&i.RetainUntil,
+		&i.ClosedAt,
+		&i.LeaseOwner,
+		&i.LeaseEpoch,
+		&i.LeaseHeartbeatAt,
+		&i.CreatedAt,
+		&i.UpdatedAt,
+		&i.LastTokenStatsAt,
+		&i.PauseReason,
+		&i.TokenInputTokens,
+		&i.TokenOutputTokens,
+		&i.TokenCacheReadTokens,
+		&i.TokenCacheWriteTokens,
+		&i.TokenTaskCount,
+	)
+	return i, err
+}
+
 const retryCardSessionCapacityWaiter = `-- name: RetryCardSessionCapacityWaiter :execrows
 UPDATE agent_task_queue
 SET fire_at = now() + make_interval(secs => $1::double precision)
@@ -657,6 +881,8 @@ SET state = 'paused',
         WHEN issue_status_allows_agent_task(issue.workspace_id, issue.status) THEN 'unassigned'
         ELSE issue_effective_status(issue.workspace_id, issue.status)
     END,
+    lease_owner = NULL,
+    lease_heartbeat_at = NULL,
     last_activity_at = now(),
     updated_at = now()
 FROM issue
@@ -733,6 +959,8 @@ const touchCardSession = `-- name: TouchCardSession :one
 UPDATE card_session
 SET state = 'open',
     pause_reason = NULL,
+    lease_owner = CASE WHEN state = 'paused' THEN NULL ELSE lease_owner END,
+    lease_heartbeat_at = CASE WHEN state = 'paused' THEN NULL ELSE lease_heartbeat_at END,
     last_activity_at = now(),
     updated_at = now()
 WHERE id = $1

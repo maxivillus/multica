@@ -4157,13 +4157,14 @@ func (h *Handler) StartTask(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 	enableTaskSupplement := slices.Contains(req.Capabilities, protocol.DaemonCapabilityTaskSupplementV1)
+	leaseOwner := middleware.DaemonIDFromContext(r.Context())
 	var task *db.AgentTaskQueue
 	var err error
 	legacy := req.RuntimeID == "" && req.DispatchedAt == ""
 	if legacy {
 		// Older daemons send {}. Keep their single-winner behavior; in
 		// particular, they cannot acknowledge an already-running task.
-		task, err = h.TaskService.StartTask(r.Context(), parseUUID(taskID), enableTaskSupplement)
+		task, err = h.TaskService.StartTaskWithCardSessionLease(r.Context(), parseUUID(taskID), leaseOwner, enableTaskSupplement)
 	} else {
 		runtimeID, ok := parseUUIDOrBadRequest(w, req.RuntimeID, "runtime_id")
 		if !ok {
@@ -4174,13 +4175,17 @@ func (h *Handler) StartTask(w http.ResponseWriter, r *http.Request) {
 			writeError(w, http.StatusBadRequest, "dispatched_at must be a PostgreSQL claim timestamp")
 			return
 		}
-		task, err = h.TaskService.StartTaskForClaim(r.Context(), db.LockAgentTaskStartClaimParams{
+		task, err = h.TaskService.StartTaskForClaimWithCardSessionLease(r.Context(), db.LockAgentTaskStartClaimParams{
 			ID: parseUUID(taskID), RuntimeID: runtimeID,
 			DispatchedAt: pgtype.Timestamptz{Time: generation, Valid: true},
-		}, enableTaskSupplement)
+		}, leaseOwner, enableTaskSupplement)
 	}
 	if err != nil {
 		slog.Warn("start task failed", "task_id", taskID, "error", err)
+		if errors.Is(err, service.ErrCardSessionLeaseUnavailable) {
+			writeError(w, http.StatusConflict, "card session lease is held by another provider host")
+			return
+		}
 		if errors.Is(err, pgx.ErrNoRows) {
 			status := http.StatusConflict
 			if legacy {
@@ -4195,6 +4200,14 @@ func (h *Handler) StartTask(w http.ResponseWriter, r *http.Request) {
 
 	slog.Info("task started", "task_id", taskID, "agent_id", uuidToString(task.AgentID))
 	resp := taskToResponse(*task, workspaceID)
+	if task.CardSessionID.Valid {
+		if cardSession, sessionErr := h.Queries.GetCardSession(r.Context(), task.CardSessionID); sessionErr == nil {
+			resp.CardSessionGeneration = cardSession.Generation
+			resp.CardSessionLeaseEpoch = cardSession.LeaseEpoch
+		} else if !errors.Is(sessionErr, pgx.ErrNoRows) {
+			slog.Warn("start task: failed to load card session lease epoch", "task_id", taskID, "card_session_id", uuidToString(task.CardSessionID), "error", sessionErr)
+		}
+	}
 	// Echo the capability the server actually committed for this exact run.
 	// A daemon must use this response rather than its own offer: an old server
 	// ignores the offer and omits the field, which keeps daemon-first rollouts
