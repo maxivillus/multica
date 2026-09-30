@@ -1,6 +1,7 @@
 package execenv
 
 import (
+	"bytes"
 	"context"
 	"errors"
 	"fmt"
@@ -17,6 +18,277 @@ import (
 
 func worktreeTestLogger() *slog.Logger {
 	return slog.New(slog.NewTextHandler(io.Discard, nil))
+}
+
+func captureWorktreeLogger(buf *bytes.Buffer) *slog.Logger {
+	return slog.New(slog.NewTextHandler(buf, &slog.HandlerOptions{Level: slog.LevelDebug}))
+}
+
+func TestLocalWorktreeLogsDoNotExposeWorkdirPaths(t *testing.T) {
+	repo := newTestRepo(t)
+	marker := "APPSEC_PRIVATE_CARD_WORKDIR_MARKER"
+	envRoot := filepath.Join(t.TempDir(), marker)
+	if err := os.MkdirAll(envRoot, 0o755); err != nil {
+		t.Fatalf("mkdir env root: %v", err)
+	}
+	var logs bytes.Buffer
+	logger := captureWorktreeLogger(&logs)
+	wt, err := PrepareLocalWorktree(LocalWorktreeParams{
+		LocalPath:       repo,
+		EnvRoot:         envRoot,
+		AgentName:       "J",
+		TaskID:          turnOneTask,
+		ConversationKey: "NTSI-713",
+		WorkspaceID:     testBranchOwner.WorkspaceID,
+		AgentID:         testBranchOwner.AgentID,
+		ConversationID:  testBranchOwner.ConversationID,
+	}, logger)
+	if err != nil {
+		t.Fatalf("PrepareLocalWorktree: %v", err)
+	}
+	if !strings.Contains(logs.String(), "workdir_present=true") || strings.Contains(logs.String(), marker) || strings.Contains(logs.String(), wt.WorkDir) {
+		t.Fatalf("worktree ready log exposed or omitted the workdir presence marker: %s", logs.String())
+	}
+
+	// The actual finalize-aborted logger route receives a path-bearing cause.
+	// Its error type and workdir presence are useful while the private path stays
+	// out of the serialized log.
+	wt.AbortWithReason(fmt.Errorf("sidecar cleanup failed at %s", wt.WorkDir))
+	if _, err := wt.Finalize(logger); err == nil {
+		t.Fatal("Finalize should refuse to deliver an aborted worktree")
+	}
+	output := logs.String()
+	if strings.Contains(output, marker) || strings.Contains(output, wt.WorkDir) {
+		t.Fatalf("worktree finalize log exposed a private path: %s", output)
+	}
+	for _, field := range []string{"error_present=true", "error_type=*errors.errorString", "git_root_present=true"} {
+		if !strings.Contains(output, field) {
+			t.Errorf("safe worktree diagnostic missing %q: %s", field, output)
+		}
+	}
+}
+
+func TestSuccessfulLocalWorktreeFinalizeLogsDoNotExposePaths(t *testing.T) {
+	repo := newTestRepo(t)
+	marker := "APPSEC_PRIVATE_SUCCESSFUL_FINALIZE_WORKDIR"
+	var logs bytes.Buffer
+	logger := captureWorktreeLogger(&logs)
+	prepare := func(taskID string, envRoot string) *LocalWorktree {
+		t.Helper()
+		wt, err := PrepareLocalWorktree(LocalWorktreeParams{
+			LocalPath:       repo,
+			EnvRoot:         envRoot,
+			AgentName:       "J",
+			TaskID:          taskID,
+			ConversationKey: "NTSI-713-SUCCESS-LOG",
+			WorkspaceID:     testBranchOwner.WorkspaceID,
+			AgentID:         testBranchOwner.AgentID,
+			ConversationID:  testBranchOwner.ConversationID,
+		}, logger)
+		if err != nil {
+			t.Fatalf("PrepareLocalWorktree: %v", err)
+		}
+		return wt
+	}
+
+	firstRoot := filepath.Join(t.TempDir(), marker)
+	if err := os.MkdirAll(firstRoot, 0o755); err != nil {
+		t.Fatalf("mkdir first env root: %v", err)
+	}
+	first := prepare(turnOneTask, firstRoot)
+	writeFile(t, filepath.Join(first.WorkDir, "tracked.txt"), "delivered by first turn\n")
+	if _, err := first.Finalize(logger); err != nil {
+		t.Fatalf("finalize first turn: %v", err)
+	}
+
+	second := prepare(turnTwoTask, t.TempDir())
+	if !second.Continued {
+		t.Fatal("follow-up did not continue the owned branch")
+	}
+	if _, err := second.Finalize(logger); err != nil {
+		t.Fatalf("finalize follow-up: %v", err)
+	}
+
+	output := logs.String()
+	if strings.Contains(output, marker) || strings.Contains(output, first.WorkDir) {
+		t.Fatalf("successful worktree logs exposed a private path: %s", output)
+	}
+	for _, field := range []string{"git_root_present=true", "workdir_present=true", "continued=true"} {
+		if !strings.Contains(output, field) {
+			t.Errorf("safe successful worktree diagnostic missing %q: %s", field, output)
+		}
+	}
+}
+
+func TestLocalWorktreeCleanupAndReplayLogsDoNotExposeWorkdirPaths(t *testing.T) {
+	marker := "APPSEC_PRIVATE_WORKTREE_CLEANUP_MARKER"
+	root := filepath.Join(t.TempDir(), marker)
+	worktreePath := filepath.Join(root, "worktree")
+	if err := os.MkdirAll(worktreePath, 0o755); err != nil {
+		t.Fatalf("mkdir worktree path: %v", err)
+	}
+	var logs bytes.Buffer
+	logger := captureWorktreeLogger(&logs)
+
+	// These real cleanup helpers exercise their error/output logging paths with
+	// a path marker. The synthetic non-repository root makes git fail; cleanup
+	// still removes the disposable worktree directory.
+	if err := removeLocalWorktreeDir(filepath.Join(root, "not-a-repository"), worktreePath, logger); err != nil {
+		t.Fatalf("removeLocalWorktreeDir: %v", err)
+	}
+	if err := os.MkdirAll(worktreePath, 0o755); err != nil {
+		t.Fatalf("recreate worktree path: %v", err)
+	}
+	abortCherryPick(worktreePath, logger)
+	dropBranch(filepath.Join(root, "not-a-repository"), "agent/j/private-branch", logger)
+	pruneOrphanedStateRefs(filepath.Join(root, "not-a-repository"), logger)
+
+	output := logs.String()
+	if strings.Contains(output, marker) || strings.Contains(output, worktreePath) {
+		t.Fatalf("worktree cleanup/replay logs exposed a private path: %s", output)
+	}
+	if !strings.Contains(output, "output_bytes=") || !strings.Contains(output, "error_type=") {
+		t.Fatalf("cleanup/replay failures should retain safe output length and error type: %s", output)
+	}
+}
+
+func TestPruneOrphanedStateRefLogsDoNotExposeRepositoryPath(t *testing.T) {
+	repo := newTestRepo(t)
+	marker := "APPSEC_PRIVATE_GIT_ROOT_MARKER"
+	privateRepo := filepath.Join(t.TempDir(), marker)
+	if err := os.Rename(repo, privateRepo); err != nil {
+		t.Fatalf("move test repo under marker path: %v", err)
+	}
+	head := gitRun(t, privateRepo, "rev-parse", "HEAD")
+	ref := userStateRef("agent/j/deleted-branch")
+	gitRun(t, privateRepo, "update-ref", ref, head)
+
+	var logs bytes.Buffer
+	logger := captureWorktreeLogger(&logs)
+	pruneOrphanedStateRefs(privateRepo, logger)
+	output := logs.String()
+	if strings.Contains(output, marker) || strings.Contains(output, privateRepo) {
+		t.Fatalf("state-ref cleanup log exposed repository path: %s", output)
+	}
+	if !strings.Contains(output, "git_root_present=true") {
+		t.Fatalf("state-ref cleanup log omitted safe root presence: %s", output)
+	}
+	if _, err := gitTry(t, privateRepo, "show-ref", "--verify", ref); err == nil {
+		t.Fatalf("orphaned ref %q was not removed", ref)
+	}
+}
+
+func TestUntrackedSymlinkLogDoesNotExposePath(t *testing.T) {
+	repo := newTestRepo(t)
+	marker := "APPSEC_PRIVATE_SYMLINK_FILENAME"
+	if err := os.Symlink("missing-target", filepath.Join(repo, marker)); err != nil {
+		t.Fatalf("create untracked symlink: %v", err)
+	}
+	var logs bytes.Buffer
+	logger := captureWorktreeLogger(&logs)
+	if err := checkUntrackedReplayable(repo, logger); err == nil {
+		t.Fatal("checkUntrackedReplayable accepted an untracked symlink")
+	}
+	output := logs.String()
+	if strings.Contains(output, marker) {
+		t.Fatalf("untracked path leaked into logger output: %s", output)
+	}
+	if !strings.Contains(output, "file_path_present=true") {
+		t.Fatalf("untracked symlink log omitted safe path presence: %s", output)
+	}
+}
+
+func TestSnapshotIndexFallbackLogDoesNotExposeRepositoryPath(t *testing.T) {
+	repo := newTestRepo(t)
+	marker := "APPSEC_PRIVATE_SNAPSHOT_REPOSITORY_PATH"
+	privateRepo := filepath.Join(t.TempDir(), marker)
+	if err := os.Rename(repo, privateRepo); err != nil {
+		t.Fatalf("move test repo under marker path: %v", err)
+	}
+	writeFile(t, filepath.Join(privateRepo, ".gitattributes"), "*.appsec filter=appsec_fail\n")
+	gitRun(t, privateRepo, "add", ".gitattributes")
+	gitRun(t, privateRepo, "-c", "user.name=Test", "-c", "user.email=test@example.invalid", "commit", "-m", "add filter attributes")
+	gitRun(t, privateRepo, "config", "filter.appsec_fail.clean", "false")
+	gitRun(t, privateRepo, "config", "filter.appsec_fail.required", "true")
+	writeFile(t, filepath.Join(privateRepo, marker+".appsec"), "force clean-filter failure\n")
+	head := gitRun(t, privateRepo, "rev-parse", "HEAD")
+
+	var logs bytes.Buffer
+	logger := captureWorktreeLogger(&logs)
+	if _, err := captureUserSnapshot(privateRepo, t.TempDir(), head, logger); err == nil {
+		t.Fatal("captureUserSnapshot succeeded despite the rejecting clean filter")
+	}
+	output := logs.String()
+	if strings.Contains(output, marker) || strings.Contains(output, privateRepo) {
+		t.Fatalf("snapshot fallback log exposed repository path: %s", output)
+	}
+	for _, field := range []string{"git_root_present=true", "error_present=true", "error_type=", "output_bytes="} {
+		if !strings.Contains(output, field) {
+			t.Errorf("snapshot fallback log missing safe field %q: %s", field, output)
+		}
+	}
+}
+
+func TestLocalWorktreeConflictLogsDoNotExposeWorkdirPaths(t *testing.T) {
+	repo := newTestRepo(t)
+	owner := testBranchOwner
+	first, err := PrepareLocalWorktree(LocalWorktreeParams{
+		LocalPath:       repo,
+		EnvRoot:         t.TempDir(),
+		AgentName:       "J",
+		TaskID:          turnOneTask,
+		ConversationKey: "NTSI-713-CONFLICT",
+		WorkspaceID:     owner.WorkspaceID,
+		AgentID:         owner.AgentID,
+		ConversationID:  owner.ConversationID,
+	}, worktreeTestLogger())
+	if err != nil {
+		t.Fatalf("prepare first turn: %v", err)
+	}
+	writeFile(t, filepath.Join(first.WorkDir, "tracked.txt"), "rewritten by the agent\n")
+	if _, err := first.Finalize(worktreeTestLogger()); err != nil {
+		t.Fatalf("finalize first turn: %v", err)
+	}
+
+	writeFile(t, filepath.Join(repo, "tracked.txt"), "rewritten by the user instead\n")
+	marker := "APPSEC_PRIVATE_REPLAY_WORKDIR_MARKER"
+	envRoot := filepath.Join(t.TempDir(), marker)
+	if err := os.MkdirAll(envRoot, 0o755); err != nil {
+		t.Fatalf("mkdir env root: %v", err)
+	}
+	var logs bytes.Buffer
+	logger := captureWorktreeLogger(&logs)
+	second, err := PrepareLocalWorktree(LocalWorktreeParams{
+		LocalPath:       repo,
+		EnvRoot:         envRoot,
+		AgentName:       "J",
+		TaskID:          turnTwoTask,
+		ConversationKey: "NTSI-713-CONFLICT",
+		WorkspaceID:     owner.WorkspaceID,
+		AgentID:         owner.AgentID,
+		ConversationID:  owner.ConversationID,
+	}, logger)
+	if err != nil {
+		t.Fatalf("prepare conflicting follow-up: %v", err)
+	}
+	if len(second.ReplayConflicts) != 1 {
+		t.Fatalf("ReplayConflicts = %v, want one conflict", second.ReplayConflicts)
+	}
+	if _, err := second.Finalize(logger); err == nil {
+		t.Fatal("Finalize delivered a branch with an unresolved replay conflict")
+	}
+	output := logs.String()
+	if strings.Contains(output, marker) || strings.Contains(output, second.WorkDir) {
+		t.Fatalf("replay/finalize conflict logs exposed a private path: %s", output)
+	}
+	for _, field := range []string{"workdir_present=true", "conflict_count=1", "unmerged_count=1"} {
+		if !strings.Contains(output, field) {
+			t.Errorf("safe conflict diagnostic missing %q: %s", field, output)
+		}
+	}
+	if err := removeLocalWorktreeDir(repo, second.Path, worktreeTestLogger()); err != nil {
+		t.Fatalf("cleanup preserved conflict worktree: %v", err)
+	}
 }
 
 // testRepoTemplate is the repository newTestRepo hands out copies of. It is

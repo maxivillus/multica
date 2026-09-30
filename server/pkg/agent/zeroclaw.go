@@ -289,7 +289,7 @@ func (b *zeroclawBackend) Execute(ctx context.Context, prompt string, opts ExecO
 		_, _ = io.Copy(stderrSink, stderr)
 	}()
 
-	b.cfg.Logger.Info("zeroclaw acp started", "pid", cmd.Process.Pid, "cwd", opts.Cwd)
+	b.cfg.Logger.Info("zeroclaw acp started", "pid", cmd.Process.Pid, "cwd_present", opts.Cwd != "")
 
 	msgStream := newZeroclawMessageStream(256)
 	resCh := make(chan Result, 1)
@@ -408,7 +408,7 @@ func (b *zeroclawBackend) Execute(ctx context.Context, prompt string, opts ExecO
 		if opts.ResumeSessionID != "" && !zeroclawResumeSupported(initResult) {
 			b.cfg.Logger.Warn("zeroclaw persistence is unavailable; the daemon will retry from a rebuilt fresh-session context",
 				"backend", "zeroclaw",
-				"requested_session", opts.ResumeSessionID,
+				"requested_session_id_present", opts.ResumeSessionID != "",
 			)
 			resumeRejected = true
 			resCh <- Result{
@@ -433,7 +433,7 @@ func (b *zeroclawBackend) Execute(ctx context.Context, prompt string, opts ExecO
 				if isACPSessionNotFound(err) {
 					b.cfg.Logger.Warn("zeroclaw resumed session not found; the daemon will retry fresh",
 						"backend", "zeroclaw",
-						"requested_session", opts.ResumeSessionID,
+						"requested_session_id_present", opts.ResumeSessionID != "",
 					)
 					resumeRejected = true
 					resCh <- Result{Status: "failed", Error: fmt.Sprintf("zeroclaw session/resume failed: %v", err), DurationMs: time.Since(startTime).Milliseconds(), ResumeRejected: resumeRejected}
@@ -449,8 +449,8 @@ func (b *zeroclawBackend) Execute(ctx context.Context, prompt string, opts ExecO
 			if changed {
 				b.cfg.Logger.Warn("zeroclaw returned a different session id on resume — original was likely lost; continuing with the new id",
 					"backend", "zeroclaw",
-					"requested", opts.ResumeSessionID,
-					"actual", sessionID,
+					"requested_session_id_present", opts.ResumeSessionID != "",
+					"actual_session_id_present", sessionID != "",
 				)
 			}
 		} else {
@@ -492,7 +492,7 @@ func (b *zeroclawBackend) Execute(ctx context.Context, prompt string, opts ExecO
 		c.sessionID = sessionID
 		// Early session pin so a cancelled run still preserves resume pointer.
 		msgStream.send(Message{Type: MessageStatus, Status: "running", SessionID: sessionID})
-		b.cfg.Logger.Info("zeroclaw session ready", "session_id", sessionID)
+		b.cfg.Logger.Info("zeroclaw session ready", "session_id_present", sessionID != "")
 
 		userText := prompt
 		if opts.SystemPrompt != "" {
@@ -519,7 +519,7 @@ func (b *zeroclawBackend) Execute(ctx context.Context, prompt string, opts ExecO
 				if opts.ResumeSessionID != "" && isACPSessionNotFound(err) {
 					b.cfg.Logger.Warn("resumed session not found at prompt time; clearing session id so the daemon retries fresh",
 						"backend", "zeroclaw",
-						"session_id", sessionID,
+						"session_id_present", sessionID != "",
 					)
 					sessionID = ""
 					resumeRejected = true

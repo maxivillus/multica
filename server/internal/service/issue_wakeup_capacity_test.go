@@ -36,7 +36,10 @@ func TestIssueWakeupBusyRuleDoesNotBlockOtherWorkspace(t *testing.T) {
 			var key any
 			switch lock {
 			case "issue":
-				sql, key = "SELECT id FROM issue WHERE id=$1 FOR NO KEY UPDATE", issue
+				// Dispatch now serializes with issue status changes through this
+				// advisory lock. Taking an issue row lock first would invert that
+				// order and could deadlock with a status update.
+				sql, key = "SELECT pg_advisory_xact_lock(hashtextextended('multica.issue-task-lifecycle:' || $1::text, 0))", issue
 			case "rule":
 				sql, key = "SELECT id FROM issue_wakeup WHERE id=$1 FOR UPDATE", first.ID
 			case "task":

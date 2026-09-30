@@ -170,7 +170,7 @@ func (b *codebuddyBackend) Execute(ctx context.Context, prompt string, opts Exec
 		return nil, fmt.Errorf("start codebuddy: %w", err)
 	}
 
-	b.cfg.Logger.Info("codebuddy started", "pid", cmd.Process.Pid, "cwd", opts.Cwd, "model", opts.Model)
+	b.cfg.Logger.Info("codebuddy started", "pid", cmd.Process.Pid, "cwd_present", opts.Cwd != "", "model", opts.Model)
 
 	// cmd.Start() succeeded — transfer temp file ownership to the goroutine.
 	mcpFileCleanup = nil
@@ -351,8 +351,8 @@ func (b *codebuddyBackend) Execute(ctx context.Context, prompt string, opts Exec
 		reportedSessionID := resolveSessionID(opts.ResumeSessionID, sessionID, finalStatus == "failed", finalError, stderrTail)
 		if resumeRejected {
 			b.cfg.Logger.Info("codebuddy resume was rejected; dropping session id and signalling fresh-session retry",
-				"requested_resume", opts.ResumeSessionID,
-				"emitted_session", sessionID,
+				"requested_session_id_present", opts.ResumeSessionID != "",
+				"emitted_session_id_present", sessionID != "",
 			)
 		}
 
@@ -499,12 +499,12 @@ func (b *codebuddyBackend) handleControlRequest(msg codebuddySDKMessage, stdin i
 
 	data, err := json.Marshal(response)
 	if err != nil {
-		b.cfg.Logger.Warn("codebuddy: failed to marshal control response", "error", err)
+		b.cfg.Logger.Warn("codebuddy: failed to marshal control response", "error_present", err != nil)
 		return
 	}
 	data = append(data, '\n')
 	if _, err := stdin.Write(data); err != nil {
-		b.cfg.Logger.Warn("codebuddy: failed to write control response", "error", err)
+		b.cfg.Logger.Warn("codebuddy: failed to write control response", "error_present", err != nil)
 	}
 }
 

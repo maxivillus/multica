@@ -129,6 +129,25 @@ func IsCategory(value string) bool {
 	return ok
 }
 
+// AllowsAgentTask reports whether an issue status can hold agent work and its
+// card session. Built-in backlog, blocked, and cancelled remain parked; custom
+// statuses follow their lifecycle category, so custom unstarted/started/done
+// statuses can run while custom closed statuses cannot.
+func AllowsAgentTask(ctx context.Context, q Querier, workspaceID pgtype.UUID, status string) bool {
+	switch status {
+	case Backlog, Blocked, Cancelled:
+		return false
+	case Todo, InProgress, InReview, Done:
+		return true
+	}
+
+	category, err := CategoryWithError(ctx, q, workspaceID, status)
+	if err != nil {
+		return false
+	}
+	return category == CategoryUnstarted || category == CategoryStarted || category == CategoryDone
+}
+
 // CategoryRank returns the display rank of a category, or len(categoryOrder)
 // for an unrecognized one so it sorts last instead of colliding with rank 0.
 func CategoryRank(category string) int {

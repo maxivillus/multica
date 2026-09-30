@@ -176,6 +176,34 @@ func TestEffectiveMapsCustomStatusToItsCategory(t *testing.T) {
 	}
 }
 
+func TestAllowsAgentTaskPreservesBuiltInParkingAndCustomLifecycle(t *testing.T) {
+	q := newFakeQuerier(
+		custom("custom_unstarted", CategoryUnstarted),
+		custom("custom_started", CategoryStarted),
+		custom("custom_done", CategoryDone),
+		custom("custom_closed", CategoryClosed),
+	)
+	cases := map[string]bool{
+		Backlog:            false,
+		Todo:               true,
+		InProgress:         true,
+		InReview:           true,
+		Blocked:            false,
+		Done:               true,
+		Cancelled:          false,
+		"custom_unstarted": true,
+		"custom_started":   true,
+		"custom_done":      true,
+		"custom_closed":    false,
+		"unknown":          false,
+	}
+	for status, want := range cases {
+		if got := AllowsAgentTask(context.Background(), q, testWorkspace, status); got != want {
+			t.Errorf("AllowsAgentTask(%q) = %t, want %t", status, got, want)
+		}
+	}
+}
+
 // An unresolvable key must resolve to itself, not to a guess. Returning a
 // canonical key here would let an unknown status trigger an agent, finalize an
 // autopilot run, or be swept back to todo.

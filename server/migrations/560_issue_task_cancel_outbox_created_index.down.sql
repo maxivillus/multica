@@ -1,0 +1,1 @@
+DROP INDEX CONCURRENTLY IF EXISTS issue_task_cancel_outbox_created_at_idx;

@@ -755,6 +755,7 @@ func main() {
 	// work, so there is no separate queue TTL to tune: a busy runtime keeps its
 	// backlog, and a departed one retires everything it owned at once.
 	go runRuntimeSweeper(sweepCtx, queries, liveness, taskSvc, bus, runtimeReconnectGrace)
+	go runCardSessionSweeper(sweepCtx, taskSvc)
 	if telemetryWorker != nil {
 		go telemetryWorker.Run(sweepCtx)
 	}

@@ -20,12 +20,7 @@ import (
 // cursor_invocation_windows.go.
 func platformCopilotInvocation(lookedUp string, args []string, logger *slog.Logger) (string, []string, bool) {
 	if native := resolveCopilotNativeFromShim(lookedUp, os.Stat); native != "" {
-		if logger != nil {
-			logger.Info("copilot: spawning the bundled native binary to keep argv intact",
-				"shim", lookedUp,
-				"native", native,
-			)
-		}
+		logNativeBinaryResolution(logger, "copilot", lookedUp, native)
 		return native, args, true
 	}
 	return rewriteCmdToPS1("copilot", lookedUp, args, logger)

@@ -14,7 +14,10 @@
 package agent
 
 import (
+	"bytes"
 	"context"
+	"log/slog"
+	"os"
 	"path/filepath"
 	"strings"
 	"testing"
@@ -83,6 +86,50 @@ while IFS= read -r line; do
   esac
 done
 `
+}
+
+func acpNoModelsScript() string {
+	return `#!/bin/sh
+while IFS= read -r line; do
+  id=$(printf '%s' "$line" | sed -n 's/.*"id":\([0-9]*\).*/\1/p')
+  case "$line" in
+    *'"method":"initialize"'*)
+      printf '{"jsonrpc":"2.0","id":%s,"result":{"protocolVersion":1,"agentCapabilities":{}}}\n' "$id"
+      ;;
+    *'"method":"session/new"'*)
+      printf '{"jsonrpc":"2.0","id":%s,"result":{"sessionId":"model-discovery-private-session-marker"}}\n' "$id"
+      ;;
+  esac
+done
+`
+}
+
+func TestACPModelDiscoveryLogOmitsExecutablePath(t *testing.T) {
+	var logs bytes.Buffer
+	previousLogger := slog.Default()
+	slog.SetDefault(slog.New(slog.NewJSONHandler(&logs, &slog.HandlerOptions{Level: slog.LevelDebug})))
+	t.Cleanup(func() { slog.SetDefault(previousLogger) })
+
+	privatePath := filepath.Join(t.TempDir(), "model-discovery-private-path-marker", "codex")
+	if err := os.MkdirAll(filepath.Dir(privatePath), 0o700); err != nil {
+		t.Fatalf("create executable directory: %v", err)
+	}
+	writeTestExecutable(t, privatePath, []byte(acpNoModelsScript()))
+	_, err := discoverACPModels(context.Background(), Command{Path: privatePath}, acpDiscoveryProvider{
+		defaultBin:   "codex",
+		clientName:   "multica-model-discovery-test",
+		tmpdirPrefix: "multica-model-discovery-test-",
+		strictErrors: true,
+		timeout:      time.Second,
+	})
+	if err != nil {
+		t.Fatalf("discover empty ACP model catalog: %v", err)
+	}
+	if got := logs.String(); strings.Contains(got, privatePath) || strings.Contains(got, "model-discovery-private-path-marker") {
+		t.Fatalf("ACP discovery log exposed executable path: %s", got)
+	} else if !strings.Contains(got, `"binary":"codex"`) {
+		t.Fatalf("ACP discovery log omitted safe executable name: %s", got)
+	}
 }
 
 // TestDiscoverHermesModelsSurfacesSessionNewFailure is the regression this file

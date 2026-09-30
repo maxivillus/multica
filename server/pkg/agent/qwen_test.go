@@ -1,6 +1,7 @@
 package agent
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
 	"log/slog"
@@ -85,6 +86,14 @@ while [ "$#" -gt 0 ]; do
   shift
 done
 case "$QWEN_MODE" in
+  unsafe-path-event-type)
+    printf '%s\n' '{"type":"result","subtype":"success","session_id":"sess-qwen-1","result":"PONG"}'
+    printf '%s\n' '{"type":"/home/private/qwen-event-marker"}'
+    ;;
+  unsafe-id-event-type)
+    printf '%s\n' '{"type":"result","subtype":"success","session_id":"sess-qwen-1","result":"PONG"}'
+    printf '%s\n' '{"type":"71a53f20-9a20-4dc6-8c4b-86b503a6f21d"}'
+    ;;
   usage-resume)
     printf '%s\n' '{"type":"system","subtype":"init","session_id":"sess-qwen-1","model":"qwen-test"}'
     printf '%s\n' '{"type":"assistant","session_id":"sess-qwen-1","message":{"id":"current-message","model":"qwen-test","content":[{"type":"text","text":"done"}],"usage":{"input_tokens":100,"output_tokens":10}}}'
@@ -180,6 +189,43 @@ func TestQwenBackendStreamsNativeEvents(t *testing.T) {
 	}
 	if !thinking || !toolUse || !toolResult || !text {
 		t.Fatalf("missing native events thinking=%v toolUse=%v toolResult=%v text=%v; messages=%+v", thinking, toolUse, toolResult, text, messages)
+	}
+}
+
+func TestQwenBackendRedactsUnsafeEventTypeFromLogs(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("shell fixture is POSIX-only")
+	}
+
+	for _, tc := range []struct {
+		name   string
+		mode   string
+		marker string
+	}{
+		{name: "path-shaped", mode: "unsafe-path-event-type", marker: "/home/private/qwen-event-marker"},
+		{name: "session-id-shaped", mode: "unsafe-id-event-type", marker: "71a53f20-9a20-4dc6-8c4b-86b503a6f21d"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			var logs bytes.Buffer
+			logger := slog.New(slog.NewTextHandler(&logs, nil))
+			backend := newFakeQwenBackend(t, map[string]string{"QWEN_MODE": tc.mode})
+			backend.cfg.Logger = logger
+
+			session, err := backend.Execute(context.Background(), "reply PONG", ExecOptions{Model: "qwen-test", Timeout: 5 * time.Second})
+			if err != nil {
+				t.Fatalf("Execute: %v", err)
+			}
+			_, result := awaitQwenResult(t, session)
+			if result.Status != "completed" || result.Output != "PONG" {
+				t.Fatalf("unexpected result: %+v", result)
+			}
+			if strings.Contains(logs.String(), tc.marker) {
+				t.Fatalf("Qwen protocol log leaked event type marker %q: %s", tc.marker, logs.String())
+			}
+			if !strings.Contains(logs.String(), "last_event_type=unknown") {
+				t.Fatalf("Qwen protocol log lacks the sanitized event category: %s", logs.String())
+			}
+		})
 	}
 }
 

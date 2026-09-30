@@ -18,6 +18,7 @@ const workspaceRef = vi.hoisted(() => ({
     context: "",
     issue_prefix: "TES",
     repos: [] as { url: string }[],
+    settings: undefined as Record<string, unknown> | undefined,
   },
 }));
 const membersRef = vi.hoisted(() => ({
@@ -112,6 +113,7 @@ describe("WorkspaceTab — automatic updates", () => {
       context: "",
       issue_prefix: "TES",
       repos: [],
+      settings: undefined,
     };
     membersRef.current = [{ user_id: "user-1", role: "owner" }];
     mockUpdateWorkspace.mockImplementation(
@@ -179,6 +181,65 @@ describe("WorkspaceTab — automatic updates", () => {
       );
     });
     expect(mockInvalidateQueries).not.toHaveBeenCalled();
+  });
+
+  it("shows the default card session settings and their allowed ranges", () => {
+    render(<WorkspaceTab />, { wrapper: I18nWrapper });
+
+    const idleTimeout = screen.getByRole("spinbutton", {
+      name: "Session idle timeout (hours)",
+    }) as HTMLInputElement;
+    const maxOpenSessions = screen.getByRole("spinbutton", {
+      name: "Maximum open sessions",
+    }) as HTMLInputElement;
+
+    expect(idleTimeout.value).toBe("24");
+    expect(idleTimeout.min).toBe("1");
+    expect(idleTimeout.max).toBe("999");
+    expect(maxOpenSessions.value).toBe("100");
+    expect(maxOpenSessions.min).toBe("1");
+    expect(maxOpenSessions.max).toBe("10000");
+  });
+
+  it("auto-saves card session settings while preserving unrelated workspace settings", async () => {
+    const user = setupUser();
+    workspaceRef.current.settings = {
+      locale: "en",
+      card_sessions: {
+        idle_timeout_hours: 24,
+        max_open_sessions: 100,
+        post_done_retention_hours: 48,
+        token_stats_interval_minutes: 10,
+        provider_setting: "keep",
+      },
+    };
+    render(<WorkspaceTab />, { wrapper: I18nWrapper });
+
+    const idleTimeout = screen.getByRole("spinbutton", {
+      name: "Session idle timeout (hours)",
+    });
+    const maxOpenSessions = screen.getByRole("spinbutton", {
+      name: "Maximum open sessions",
+    });
+
+    await user.clear(idleTimeout);
+    await user.type(idleTimeout, "36");
+    await user.clear(maxOpenSessions);
+    await user.type(maxOpenSessions, "250");
+    await user.tab();
+
+    await waitFor(() => {
+      expect(mockUpdateWorkspace).toHaveBeenCalledWith("workspace-1", {
+        settings: {
+          locale: "en",
+          card_sessions: {
+            idle_timeout_hours: 36,
+            max_open_sessions: 250,
+            provider_setting: "keep",
+          },
+        },
+      });
+    });
   });
 
   it("asks for confirmation on prefix blur and persists only after confirmation", async () => {

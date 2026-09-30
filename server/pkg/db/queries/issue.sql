@@ -102,12 +102,14 @@ SELECT metadata, revision FROM issue
 WHERE id = $1 AND workspace_id = $2;
 
 -- name: LockIssueForChannelMediaBind :one
--- Channel media resolves after /issue creation. Hold a key-share lock while
+-- Channel media resolves after /issue creation. Hold a non-key-update lock while
 -- the attachment row is written so a concurrent issue delete cannot land
--- between the workspace-scoped validation and the attachment insert.
+-- between the workspace-scoped validation and the attachment insert. Use
+-- FOR NO KEY UPDATE so it also serializes with description edits while still
+-- remaining compatible with task creation's FOR KEY SHARE owner fence.
 SELECT id FROM issue
 WHERE id = $1 AND workspace_id = $2
-FOR KEY SHARE;
+FOR NO KEY UPDATE;
 
 -- name: LockIssueForAttachmentWrite :one
 -- Owner-first guard for a write to one of an issue's attachments: take the
@@ -129,10 +131,12 @@ FOR NO KEY UPDATE;
 -- Serialize field-baseline checks and combined attachment binding on the
 -- owner row. The handler merges channel media that landed after the editor's
 -- submitted base, updates the issue, and binds this request's attachments in
--- the same transaction while holding this lock.
+-- the same transaction while holding this lock. FOR NO KEY UPDATE still
+-- serializes non-key issue writers, while remaining compatible with the
+-- task-owner fence's FOR KEY SHARE lock during a concurrent task enqueue.
 SELECT * FROM issue
 WHERE id = $1 AND workspace_id = $2
-FOR UPDATE;
+FOR NO KEY UPDATE;
 
 -- name: MaterializeIssueChannelMediaMarkdown :one
 -- Detached channel media resolves after /issue creation. When the description
@@ -498,6 +502,21 @@ cleared_pr_automation AS (
 ),
 cleared_pr_exclusions AS (
     DELETE FROM issue_pull_request_exclusion WHERE issue_id IN (SELECT target.id FROM target)
+),
+deleted_card_sessions AS (
+    DELETE FROM card_session
+    WHERE issue_id IN (SELECT target.id FROM target)
+      AND workspace_id = $2
+    RETURNING id
+),
+cleared_card_session_task_bindings AS (
+    UPDATE agent_task_queue
+    SET card_session_id = NULL
+    WHERE card_session_id IN (SELECT id FROM deleted_card_sessions)
+),
+cleared_issue_task_cancellations AS (
+    DELETE FROM issue_task_cancel_outbox
+    WHERE issue_id IN (SELECT target.id FROM target)
 )
 DELETE FROM issue WHERE issue.id IN (SELECT target.id FROM target);
 

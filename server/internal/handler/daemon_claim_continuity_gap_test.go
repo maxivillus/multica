@@ -119,12 +119,19 @@ func TestClaimTaskByRuntime_RerunSourceRolloutMissingDisclosesGap(t *testing.T) 
 	})
 
 	// Source task whose Codex session was withheld (rollout missing).
+	var cardSessionID string
+	if err := testPool.QueryRow(ctx, `
+		INSERT INTO card_session (workspace_id, issue_id, agent_id, generation, state, provider)
+		VALUES ($1, $2, $3, 1, 'open', 'codex') RETURNING id
+	`, testWorkspaceID, issueID, agentID).Scan(&cardSessionID); err != nil {
+		t.Fatalf("insert open card session: %v", err)
+	}
 	var srcID string
 	if err := testPool.QueryRow(ctx, `
-		INSERT INTO agent_task_queue (agent_id, runtime_id, issue_id, status, priority, started_at, completed_at, session_rollout_missing)
-		VALUES ($1, $2, $3, 'completed', 0, now() - interval '2 minutes', now() - interval '2 minutes', TRUE)
+		INSERT INTO agent_task_queue (agent_id, runtime_id, issue_id, card_session_id, status, priority, started_at, completed_at, session_rollout_missing)
+		VALUES ($1, $2, $3, $4, 'completed', 0, now() - interval '2 minutes', now() - interval '2 minutes', TRUE)
 		RETURNING id
-	`, agentID, runtimeID, issueID).Scan(&srcID); err != nil {
+	`, agentID, runtimeID, issueID, cardSessionID).Scan(&srcID); err != nil {
 		t.Fatalf("insert source task: %v", err)
 	}
 

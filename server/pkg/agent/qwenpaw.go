@@ -124,7 +124,7 @@ func (b *qwenpawBackend) Execute(ctx context.Context, prompt string, opts ExecOp
 		_, _ = io.Copy(stderrSink, stderr)
 	}()
 
-	b.cfg.Logger.Info("qwenpaw acp started", "pid", cmd.Process.Pid, "cwd", opts.Cwd)
+	b.cfg.Logger.Info("qwenpaw acp started", "pid", cmd.Process.Pid, "cwd_present", opts.Cwd != "")
 
 	msgCh := make(chan Message, 256)
 	resCh := make(chan Result, 1)
@@ -239,8 +239,8 @@ func (b *qwenpawBackend) Execute(ctx context.Context, prompt string, opts ExecOp
 			if changed {
 				b.cfg.Logger.Warn("agent returned a different session id on resume — original was likely lost; continuing with the new id",
 					"backend", "qwenpaw",
-					"requested", opts.ResumeSessionID,
-					"actual", sessionID,
+					"requested_session_id_present", opts.ResumeSessionID != "",
+					"actual_session_id_present", sessionID != "",
 				)
 			}
 		} else {
@@ -287,7 +287,7 @@ func (b *qwenpawBackend) Execute(ctx context.Context, prompt string, opts ExecOp
 		}
 
 		c.sessionID = sessionID
-		b.cfg.Logger.Info("qwenpaw session created", "session_id", sessionID)
+		b.cfg.Logger.Info("qwenpaw session created", "session_id_present", sessionID != "")
 
 		// 3. Build the prompt content. If we have a system prompt, prepend it.
 		userText := prompt

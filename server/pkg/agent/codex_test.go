@@ -3319,8 +3319,8 @@ func TestCodexExecuteFirstItemWaitLifecycle(t *testing.T) {
 			"attempt":                     float64(1),
 			"active_launches":             float64(1),
 			"method":                      "turn/start",
-			"thread_id":                   "thr-first-item-ok",
-			"turn_id":                     "turn-first-item-ok",
+			"thread_id_present":           true,
+			"turn_id_present":             true,
 			"outcome":                     "progress",
 			"timeout":                     "4s",
 			"semantic_inactivity_timeout": "5s",
@@ -5088,6 +5088,23 @@ func TestEnsureCodexMcpConfigWritesManagedBlock(t *testing.T) {
 	}
 	if mode := fi.Mode().Perm(); mode != 0o600 {
 		t.Fatalf("expected mode 0o600 for secret-bearing config, got %o", mode)
+	}
+}
+
+func TestEnsureCodexMcpConfigLogOmitsConfigPath(t *testing.T) {
+	var logs bytes.Buffer
+	logger := slog.New(slog.NewJSONHandler(&logs, &slog.HandlerOptions{Level: slog.LevelDebug}))
+	configPath := filepath.Join(t.TempDir(), "codex-config-private-path-marker", "config.toml")
+	if err := os.MkdirAll(filepath.Dir(configPath), 0o700); err != nil {
+		t.Fatalf("create config directory: %v", err)
+	}
+	if err := ensureCodexMcpConfig(configPath, json.RawMessage(`{"mcpServers":{"safe":{"command":"agent"}}}`), logger); err != nil {
+		t.Fatalf("ensure config: %v", err)
+	}
+	if got := logs.String(); strings.Contains(got, configPath) || strings.Contains(got, "codex-config-private-path-marker") {
+		t.Fatalf("Codex config log exposed path: %s", got)
+	} else if !strings.Contains(got, `"config_path_present":true`) {
+		t.Fatalf("Codex config log omitted safe path marker: %s", got)
 	}
 }
 

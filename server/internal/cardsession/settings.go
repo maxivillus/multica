@@ -8,21 +8,18 @@ import (
 )
 
 const (
-	DefaultPostDoneRetentionHours    = 24
-	DefaultMaxOpenSessions           = 100
-	DefaultTokenStatsIntervalMinutes = 15
-	MaxPostDoneRetentionHours        = 24 * 30
-	MaxOpenSessions                  = 10_000
-	MaxTokenStatsIntervalMinutes     = 24 * 60
+	DefaultIdleTimeoutHours = 24
+	DefaultMaxOpenSessions  = 100
+	MaxIdleTimeoutHours     = 999
+	MaxOpenSessionsLimit    = 10_000
 )
 
 // Settings are stored under workspace.settings.card_sessions. Values are
 // deliberately bounded because this setting controls server-held provider
 // state and therefore memory, MCP processes, and workspace capacity.
 type Settings struct {
-	PostDoneRetentionHours    int
-	MaxOpenSessions           int
-	TokenStatsIntervalMinutes int
+	IdleTimeoutHours int
+	MaxOpenSessions  int
 }
 
 type rawSettings struct {
@@ -30,16 +27,15 @@ type rawSettings struct {
 }
 
 type rawCardSessionSettings struct {
-	PostDoneRetentionHours    *int `json:"post_done_retention_hours"`
-	MaxOpenSessions           *int `json:"max_open_sessions"`
-	TokenStatsIntervalMinutes *int `json:"token_stats_interval_minutes"`
+	IdleTimeoutHours             *int `json:"idle_timeout_hours"`
+	LegacyPostDoneRetentionHours *int `json:"post_done_retention_hours"`
+	MaxOpenSessions              *int `json:"max_open_sessions"`
 }
 
 func Defaults() Settings {
 	return Settings{
-		PostDoneRetentionHours:    DefaultPostDoneRetentionHours,
-		MaxOpenSessions:           DefaultMaxOpenSessions,
-		TokenStatsIntervalMinutes: DefaultTokenStatsIntervalMinutes,
+		IdleTimeoutHours: DefaultIdleTimeoutHours,
+		MaxOpenSessions:  DefaultMaxOpenSessions,
 	}
 }
 
@@ -57,14 +53,15 @@ func Parse(raw []byte) (Settings, error) {
 	if decoded.CardSessions == nil {
 		return settings, nil
 	}
-	if decoded.CardSessions.PostDoneRetentionHours != nil {
-		settings.PostDoneRetentionHours = *decoded.CardSessions.PostDoneRetentionHours
+	if decoded.CardSessions.IdleTimeoutHours != nil {
+		settings.IdleTimeoutHours = *decoded.CardSessions.IdleTimeoutHours
+	} else if decoded.CardSessions.LegacyPostDoneRetentionHours != nil {
+		// Existing workspaces used post-done retention as their session lifetime.
+		// Map that saved value to idle timeout until an explicit new value is set.
+		settings.IdleTimeoutHours = *decoded.CardSessions.LegacyPostDoneRetentionHours
 	}
 	if decoded.CardSessions.MaxOpenSessions != nil {
 		settings.MaxOpenSessions = *decoded.CardSessions.MaxOpenSessions
-	}
-	if decoded.CardSessions.TokenStatsIntervalMinutes != nil {
-		settings.TokenStatsIntervalMinutes = *decoded.CardSessions.TokenStatsIntervalMinutes
 	}
 	if err := settings.Validate(); err != nil {
 		return Settings{}, err
@@ -73,14 +70,11 @@ func Parse(raw []byte) (Settings, error) {
 }
 
 func (s Settings) Validate() error {
-	if s.PostDoneRetentionHours < 1 || s.PostDoneRetentionHours > MaxPostDoneRetentionHours {
-		return fmt.Errorf("card_sessions.post_done_retention_hours must be between 1 and %d", MaxPostDoneRetentionHours)
+	if s.IdleTimeoutHours < 1 || s.IdleTimeoutHours > MaxIdleTimeoutHours {
+		return fmt.Errorf("card_sessions.idle_timeout_hours must be between 1 and %d", MaxIdleTimeoutHours)
 	}
-	if s.MaxOpenSessions < 1 || s.MaxOpenSessions > MaxOpenSessions {
-		return fmt.Errorf("card_sessions.max_open_sessions must be between 1 and %d", MaxOpenSessions)
-	}
-	if s.TokenStatsIntervalMinutes < 1 || s.TokenStatsIntervalMinutes > MaxTokenStatsIntervalMinutes {
-		return fmt.Errorf("card_sessions.token_stats_interval_minutes must be between 1 and %d", MaxTokenStatsIntervalMinutes)
+	if s.MaxOpenSessions < 1 || s.MaxOpenSessions > MaxOpenSessionsLimit {
+		return fmt.Errorf("card_sessions.max_open_sessions must be between 1 and %d", MaxOpenSessionsLimit)
 	}
 	return nil
 }

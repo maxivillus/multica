@@ -162,24 +162,48 @@ func runPeriodicSweep(ctx context.Context, interval time.Duration, sweep func())
 // stale window — that is the original behavior.
 func runRuntimeSweeper(ctx context.Context, queries *db.Queries, liveness handler.LivenessStore, taskSvc *service.TaskService, bus *events.Bus, reconnectGrace time.Duration) {
 	runPeriodicSweep(ctx, sweepInterval, func() {
-		if expired, err := taskSvc.ExpireCardSessions(ctx); err != nil {
-			slog.Warn("card session expiry sweep failed", "error", err)
-		} else if expired > 0 {
-			slog.Info("card session expiry sweep completed", "count", expired)
-		}
-		if published, err := taskSvc.PublishDueCardSessionTokenStats(ctx); err != nil {
-			slog.Warn("card session token stats sweep failed", "error", err)
-		} else if published > 0 {
-			slog.Info("card session token stats sweep completed", "count", published)
-		}
 		// These stages retain their existing cadence and ordering. Runtime GC and
 		// delegated-failure recovery run in independent lower-frequency loops.
+		sweepIssueTaskCancellationOutbox(ctx, taskSvc)
 		sweepStaleRuntimes(ctx, queries, liveness, taskSvc, bus)
 		sweepOfflineRuntimeTasks(ctx, queries, taskSvc, reconnectGrace)
 		sweepExpiredRuntimeReconnectRetries(ctx, queries, taskSvc, reconnectGrace)
 		sweepStaleTasks(ctx, queries, taskSvc, bus, reconnectGrace)
 		sweepExpiredQueuedTasks(ctx, queries, taskSvc, reconnectGrace)
 		sweepDeferredChatFinalizations(ctx, queries, taskSvc)
+	})
+}
+
+func sweepIssueTaskCancellationOutbox(ctx context.Context, taskSvc *service.TaskService) {
+	result, err := taskSvc.RecoverPendingIssueTaskCancellations(ctx, pgtype.UUID{}, 100)
+	if err != nil {
+		slog.Warn("issue task cancellation outbox sweep failed",
+			"scanned", result.Scanned,
+			"completed", result.Completed,
+			"error", err,
+		)
+		return
+	}
+	if result.Completed > 0 {
+		slog.Info("issue task cancellation outbox sweep completed",
+			"completed", result.Completed,
+			"cancelled", result.Cancelled,
+		)
+	}
+}
+
+func runCardSessionSweeper(ctx context.Context, taskSvc *service.TaskService) {
+	runPeriodicSweep(ctx, time.Minute, func() {
+		if expired, err := taskSvc.ExpireCardSessions(ctx); err != nil {
+			slog.Warn("card session expiry sweep failed", "error", err)
+		} else if expired > 0 {
+			slog.Info("card session expiry sweep completed", "count", expired)
+		}
+		if refreshed, err := taskSvc.RecoverCardSessionTokenStats(ctx); err != nil {
+			slog.Warn("card session token stats recovery failed", "error", err)
+		} else if refreshed > 0 {
+			slog.Info("card session token stats recovery completed", "count", refreshed)
+		}
 	})
 }
 

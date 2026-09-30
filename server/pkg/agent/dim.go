@@ -237,7 +237,7 @@ func (b *dimBackend) Execute(ctx context.Context, prompt string, opts ExecOption
 		_, _ = io.Copy(stderrSink, stderr)
 	}()
 
-	b.cfg.Logger.Info("dim acp started", "pid", cmd.Process.Pid, "cwd", opts.Cwd)
+	b.cfg.Logger.Info("dim acp started", "pid", cmd.Process.Pid, "cwd_present", opts.Cwd != "")
 
 	msgStream := newDimMessageStream(256)
 	resCh := make(chan Result, 1)
@@ -437,7 +437,7 @@ func (b *dimBackend) Execute(ctx context.Context, prompt string, opts ExecOption
 				if isACPSessionNotFound(err) {
 					b.cfg.Logger.Warn("dim resumed session not found; the daemon will retry fresh",
 						"backend", "dim",
-						"requested_session", opts.ResumeSessionID,
+						"requested_session_id_present", opts.ResumeSessionID != "",
 					)
 					resumeRejected = true
 					resCh <- Result{Status: "failed", Error: fmt.Sprintf("dim session/load: %v", err), DurationMs: time.Since(startTime).Milliseconds(), ResumeRejected: resumeRejected}
@@ -462,8 +462,8 @@ func (b *dimBackend) Execute(ctx context.Context, prompt string, opts ExecOption
 			if changed {
 				b.cfg.Logger.Warn("dim returned a different session id on resume — original was likely lost; continuing with the new id",
 					"backend", "dim",
-					"requested", opts.ResumeSessionID,
-					"actual", sessionID,
+					"requested_session_id_present", opts.ResumeSessionID != "",
+					"actual_session_id_present", sessionID != "",
 				)
 			}
 			if effectiveModel == "" {
@@ -503,7 +503,7 @@ func (b *dimBackend) Execute(ctx context.Context, prompt string, opts ExecOption
 		}
 
 		c.sessionID = sessionID
-		b.cfg.Logger.Info("dim session ready", "session_id", sessionID, "resumed", !freshSession)
+		b.cfg.Logger.Info("dim session ready", "session_id_present", sessionID != "", "resumed", !freshSession)
 
 		// Dim's ACP server hardcodes a read-only permission preset at session
 		// creation. Raise it to full-access and pin agent mode. This runs on
@@ -537,7 +537,7 @@ func (b *dimBackend) Execute(ctx context.Context, prompt string, opts ExecOption
 				resCh <- Result{Status: finalStatus, Error: finalError, DurationMs: time.Since(startTime).Milliseconds(), SessionID: sessionID, ResumeRejected: resumeRejected}
 				return
 			}
-			b.cfg.Logger.Info("dim session config set", "config", cfgOpt.id, "value", cfgOpt.value, "session_id", sessionID)
+			b.cfg.Logger.Info("dim session config set", "config", cfgOpt.id, "value", cfgOpt.value, "session_id_present", sessionID != "")
 		}
 
 		if opts.Model != "" {
@@ -545,7 +545,7 @@ func (b *dimBackend) Execute(ctx context.Context, prompt string, opts ExecOption
 				"sessionId": sessionID,
 				"modelId":   opts.Model,
 			}); err != nil {
-				b.cfg.Logger.Warn("dim set_session_model failed", "error", err, "requested_model", opts.Model)
+				b.cfg.Logger.Warn("dim set_session_model failed", "error_present", err != nil, "requested_model", opts.Model)
 				finalStatus = "failed"
 				finalError = fmt.Sprintf("dim could not switch to model %q: %v", opts.Model, err)
 				// Close the session so a partially configured one (permission/mode

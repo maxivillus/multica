@@ -5,6 +5,22 @@ FROM workspace
 WHERE id = $1
 FOR UPDATE;
 
+-- name: LockIssueForCardSession :one
+-- Serialize generation allocation with issue deletion. DeleteIssue takes
+-- FOR UPDATE on the issue before removing card sessions; this key-share lock
+-- prevents a concurrent allocator from inserting an orphan after deletion.
+SELECT id
+FROM issue
+WHERE id = $1
+  AND workspace_id = $2
+FOR KEY SHARE;
+
+-- name: LockIssueTaskLifecycle :exec
+-- Shares the transaction-scoped lock used by the issue status trigger. Keep
+-- this as a separate statement before reading status so READ COMMITTED takes
+-- a fresh snapshot after any transition that held the lock first.
+SELECT lock_issue_task_lifecycle($1);
+
 -- name: GetResumableCardSession :one
 SELECT *
 FROM card_session
@@ -12,7 +28,6 @@ WHERE issue_id = $1
   AND agent_id = $2
   AND workspace_id = $3
   AND state <> 'closed'
-  AND (state = 'open' OR retain_until > now())
 ORDER BY generation DESC
 LIMIT 1;
 
@@ -29,10 +44,41 @@ LIMIT 1;
 SELECT COUNT(*)::bigint
 FROM card_session
 WHERE workspace_id = $1
-  AND (
-    state = 'open'
-    OR (state = 'done_retained' AND retain_until > now())
-  );
+  AND state = 'open';
+
+-- name: ListDueCardSessionCapacityWaitersForRuntimes :many
+-- Deferred issue tasks stay outside the claim queue until their workspace has
+-- room for the session they need. The runtime claim loop retries a bounded
+-- batch so a full workspace cannot turn one claim into unbounded database work.
+SELECT task.id,
+       task.issue_id,
+       task.agent_id,
+       issue.workspace_id,
+       agent.runtime_mode
+FROM agent_task_queue AS task
+JOIN issue ON issue.id = task.issue_id
+JOIN agent ON agent.id = task.agent_id
+WHERE task.runtime_id = ANY(@runtime_ids::uuid[])
+  AND task.status = 'deferred'
+  AND task.fire_at <= now()
+  AND task.context->>'card_session_capacity_pending' = 'true'
+  AND issue_status_allows_agent_task(issue.workspace_id, issue.status)
+ORDER BY task.priority DESC, task.created_at ASC, task.id ASC
+LIMIT sqlc.arg(waiter_limit)::integer;
+
+-- name: ReleaseCardSessionCapacityWaiter :execrows
+UPDATE agent_task_queue
+SET context = COALESCE(context, '{}'::jsonb) - 'card_session_capacity_pending'
+WHERE id = @id
+  AND status = 'deferred'
+  AND context->>'card_session_capacity_pending' = 'true';
+
+-- name: RetryCardSessionCapacityWaiter :execrows
+UPDATE agent_task_queue
+SET fire_at = now() + make_interval(secs => @retry_delay_seconds::double precision)
+WHERE id = @id
+  AND status = 'deferred'
+  AND context->>'card_session_capacity_pending' = 'true';
 
 -- name: CreateCardSession :one
 INSERT INTO card_session (
@@ -44,95 +90,119 @@ JOIN agent ON agent.id = @agent_id
 WHERE issue.id = @issue_id
   AND issue.workspace_id = @workspace_id
   AND agent.workspace_id = @workspace_id
-RETURNING *;
-
--- name: ReopenCardSession :one
-UPDATE card_session
-SET state = 'open',
-    done_at = NULL,
-    retain_until = NULL,
-    closed_at = NULL,
-    last_activity_at = now(),
-    updated_at = now()
-WHERE id = $1
-  AND state = 'done_retained'
-  AND retain_until > now()
+  AND issue_status_allows_agent_task(issue.workspace_id, issue.status)
 RETURNING *;
 
 -- name: TouchCardSession :one
 UPDATE card_session
-SET last_activity_at = now(), updated_at = now()
+SET state = 'open',
+    pause_reason = NULL,
+    last_activity_at = now(),
+    updated_at = now()
 WHERE id = $1
   AND state <> 'closed'
 RETURNING *;
 
--- name: MarkCardSessionsTerminal :many
--- Only a status transition handler may call this query. It moves sessions into
--- the retention state for either terminal category; physical close is a
--- separate expiry operation below.
-UPDATE card_session
-SET state = 'done_retained',
-    done_at = now(),
-    retain_until = now() + (sqlc.arg(retention_hours)::bigint * interval '1 hour'),
-    lease_owner = NULL,
-    lease_heartbeat_at = NULL,
+-- name: SyncCardSessionsForIssue :many
+-- The issue trigger is authoritative for direct SQL and webhook updates. This
+-- query pauses generations for inactive issues and previous assignees. Active
+-- assigned sessions are opened by EnsureCardSession after capacity checks.
+UPDATE card_session AS cs
+SET state = 'paused',
+    pause_reason = CASE
+        WHEN issue_status_allows_agent_task(issue.workspace_id, issue.status) THEN 'unassigned'
+        ELSE issue_effective_status(issue.workspace_id, issue.status)
+    END,
     last_activity_at = now(),
     updated_at = now()
-WHERE issue_id = $1
-  AND card_session.workspace_id = sqlc.arg(workspace_id)
-  AND state = 'open'
-  AND EXISTS (
-      SELECT 1
-      FROM issue
-      WHERE issue.id = card_session.issue_id
-        AND issue.workspace_id = card_session.workspace_id
-        AND issue_effective_status(issue.workspace_id, issue.status) IN ('done', 'cancelled')
+FROM issue
+WHERE cs.issue_id = $1
+  AND cs.workspace_id = sqlc.arg(workspace_id)
+  AND issue.id = cs.issue_id
+  AND issue.workspace_id = cs.workspace_id
+  AND cs.state <> 'closed'
+  AND (
+      NOT issue_status_allows_agent_task(issue.workspace_id, issue.status)
+      OR issue.assignee_type IS DISTINCT FROM 'agent'
+      OR issue.assignee_id IS NULL
+      OR cs.agent_id <> issue.assignee_id
   )
-RETURNING *;
-
--- name: ReopenCardSessionsForIssue :many
-UPDATE card_session
-SET state = 'open',
-    done_at = NULL,
-    retain_until = NULL,
-    closed_at = NULL,
-    last_activity_at = now(),
-    updated_at = now()
-WHERE issue_id = $1
-  AND card_session.workspace_id = sqlc.arg(workspace_id)
-  AND state = 'done_retained'
-  AND EXISTS (
-      SELECT 1
-      FROM issue
-      WHERE issue.id = card_session.issue_id
-        AND issue.workspace_id = card_session.workspace_id
-        AND issue_effective_status(issue.workspace_id, issue.status) NOT IN ('done', 'cancelled')
-  )
-  AND retain_until > now()
-RETURNING *;
+RETURNING cs.*;
 
 -- name: ExpireCardSessionsForWorkspace :many
--- The expiry worker is the only path allowed to close a session row. It can
--- never close an open work/review generation.
-UPDATE card_session
+UPDATE card_session AS cs
 SET state = 'closed',
+    pause_reason = NULL,
     closed_at = now(),
     updated_at = now()
-WHERE state = 'done_retained'
-  AND workspace_id = $1
-  AND retain_until <= now()
-RETURNING *;
+FROM workspace AS w
+WHERE cs.workspace_id = $1
+  AND w.id = cs.workspace_id
+  AND cs.state <> 'closed'
+  AND cs.last_activity_at <= now() - make_interval(hours => CASE
+      WHEN w.settings->'card_sessions'->>'idle_timeout_hours' ~ '^[0-9]{1,3}$'
+          THEN GREATEST(1, LEAST(999, (w.settings->'card_sessions'->>'idle_timeout_hours')::INTEGER))
+      ELSE 24
+  END)
+  AND NOT EXISTS (
+      SELECT 1
+      FROM agent_task_queue AS task
+      WHERE task.issue_id = cs.issue_id
+        AND task.agent_id = cs.agent_id
+        AND task.status IN ('dispatched', 'running', 'waiting_local_directory')
+  )
+  AND (
+      NOT EXISTS (
+          SELECT 1 FROM issue
+          WHERE issue.id = cs.issue_id
+            AND issue.workspace_id = cs.workspace_id
+            AND issue_status_allows_agent_task(issue.workspace_id, issue.status)
+      )
+      OR NOT EXISTS (
+          SELECT 1 FROM agent_task_queue AS task
+          WHERE task.issue_id = cs.issue_id
+            AND task.agent_id = cs.agent_id
+            AND task.status IN ('queued', 'deferred')
+      )
+  )
+RETURNING cs.*;
 
 -- name: ExpireCardSessions :many
--- Server-wide expiry pass. The state guard and close trigger ensure this can
--- only close rows that already completed their terminal retention window.
-UPDATE card_session
+UPDATE card_session AS cs
 SET state = 'closed',
+    pause_reason = NULL,
     closed_at = now(),
     updated_at = now()
-WHERE state = 'done_retained'
-  AND retain_until <= now()
-RETURNING *;
+FROM workspace AS w
+WHERE w.id = cs.workspace_id
+  AND cs.state <> 'closed'
+  AND cs.last_activity_at <= now() - make_interval(hours => CASE
+      WHEN w.settings->'card_sessions'->>'idle_timeout_hours' ~ '^[0-9]{1,3}$'
+          THEN GREATEST(1, LEAST(999, (w.settings->'card_sessions'->>'idle_timeout_hours')::INTEGER))
+      ELSE 24
+  END)
+  AND NOT EXISTS (
+      SELECT 1
+      FROM agent_task_queue AS task
+      WHERE task.issue_id = cs.issue_id
+        AND task.agent_id = cs.agent_id
+        AND task.status IN ('dispatched', 'running', 'waiting_local_directory')
+  )
+  AND (
+      NOT EXISTS (
+          SELECT 1 FROM issue
+          WHERE issue.id = cs.issue_id
+            AND issue.workspace_id = cs.workspace_id
+            AND issue_status_allows_agent_task(issue.workspace_id, issue.status)
+      )
+      OR NOT EXISTS (
+          SELECT 1 FROM agent_task_queue AS task
+          WHERE task.issue_id = cs.issue_id
+            AND task.agent_id = cs.agent_id
+            AND task.status IN ('queued', 'deferred')
+      )
+  )
+RETURNING cs.*;
 
 -- name: UpdateCardSessionProviderStateByTask :exec
 UPDATE card_session AS cs
@@ -140,47 +210,91 @@ SET provider_session_id = COALESCE(NULLIF(sqlc.arg(provider_session_id), ''), cs
     work_dir = COALESCE(NULLIF(sqlc.arg(work_dir), ''), cs.work_dir),
     last_activity_at = now(),
     updated_at = now()
-FROM agent_task_queue AS t
+FROM agent_task_queue AS t, workspace AS w
 WHERE t.id = $1
-  AND t.issue_id = cs.issue_id
-  AND t.agent_id = cs.agent_id
+  AND t.card_session_id = cs.id
+  AND w.id = cs.workspace_id
+  AND (
+      (t.status IN ('dispatched', 'running') AND cs.state = 'open')
+      OR (
+          t.status = 'cancelled'
+          AND cs.state = 'paused'
+          AND cs.pause_reason = 'cancelled'
+          AND cs.last_activity_at > now() - make_interval(hours => CASE
+              WHEN w.settings->'card_sessions'->>'idle_timeout_hours' ~ '^[0-9]{1,3}$'
+                  THEN GREATEST(1, LEAST(999, (w.settings->'card_sessions'->>'idle_timeout_hours')::INTEGER))
+              ELSE 24
+          END)
+      )
+  );
+
+-- name: TouchCardSessionsForTasks :exec
+-- Provider usage and committed task transitions advance activity after their
+-- owning transaction, avoiding a task-row -> card-session lock cycle.
+UPDATE card_session AS cs
+SET last_activity_at = now(),
+    updated_at = now()
+FROM agent_task_queue AS task
+WHERE task.id = ANY(sqlc.arg(task_ids)::uuid[])
+  AND task.card_session_id = cs.id
   AND cs.state <> 'closed';
 
--- Token snapshots are selected without locks first. The service then locks
--- the issue, workspace, and session in that order before creating the system
--- comment, matching the issue-status trigger's lock order and preventing two
--- concurrent sweepers from publishing the same interval snapshot.
--- The one-minute SQL floor keeps the candidate scan bounded while the Go
--- settings parser applies each workspace's configured interval.
--- name: ListOpenCardSessionTokenStatsCandidateIDs :many
-SELECT id, workspace_id, issue_id
-FROM card_session
-WHERE state = 'open'
-  AND (
-      last_token_stats_at IS NULL
-      OR last_token_stats_at <= now() - interval '1 minute'
+-- Session token totals are cached after each accepted provider usage report.
+-- The source remains task_usage so corrections are reflected on refresh. Closed
+-- generations remain eligible: a restart can close an idle session before its
+-- recovery sweep gets a chance to refresh the final persisted usage totals.
+-- name: ListCardSessionsWithStaleTokenStats :many
+SELECT cs.id
+  FROM card_session AS cs
+  WHERE EXISTS (
+      SELECT 1
+      FROM agent_task_queue AS task
+      JOIN task_usage AS usage ON usage.task_id = task.id
+      WHERE task.card_session_id = cs.id
+        AND usage.created_at >= cs.opened_at
+        AND (cs.last_token_stats_at IS NULL OR usage.updated_at > cs.last_token_stats_at)
   )
-ORDER BY last_token_stats_at NULLS FIRST, id
-LIMIT sqlc.arg('limit');
+ORDER BY cs.last_token_stats_at NULLS FIRST, cs.id
+LIMIT sqlc.arg('limit')::integer;
 
--- name: LockIssueForCardSessionTokenStats :one
-SELECT id
-FROM issue
-WHERE id = sqlc.arg(issue_id)
-  AND workspace_id = sqlc.arg(workspace_id)
-FOR UPDATE;
-
--- name: LockWorkspaceAndGetCardSessionTokenStats :one
-SELECT cs.*, w.settings AS workspace_settings
+-- name: LockCardSessionForTaskTokenStats :one
+SELECT cs.id
 FROM card_session AS cs
-JOIN workspace AS w ON w.id = cs.workspace_id
-WHERE cs.id = sqlc.arg(id)
-  AND cs.state = 'open'
+JOIN agent_task_queue AS task
+  ON task.card_session_id = cs.id
+WHERE task.id = sqlc.arg(task_id)
+ORDER BY cs.generation DESC
+LIMIT 1
 FOR UPDATE OF cs;
 
--- name: UpdateCardSessionTokenStatsAt :exec
+-- name: LockCardSessionTokenStats :one
+SELECT id
+FROM card_session
+WHERE id = sqlc.arg(card_session_id)
+FOR UPDATE;
+
+-- name: GetCardSessionTokenStats :one
+SELECT
+    COALESCE(SUM(usage.input_tokens), 0)::bigint AS input_tokens,
+    COALESCE(SUM(usage.output_tokens), 0)::bigint AS output_tokens,
+    COALESCE(SUM(usage.cache_read_tokens), 0)::bigint AS cache_read_tokens,
+    COALESCE(SUM(usage.cache_write_tokens), 0)::bigint AS cache_write_tokens,
+    COUNT(DISTINCT task.id)::bigint AS task_count,
+    COALESCE(MAX(usage.updated_at), now())::timestamptz AS latest_usage_at
+FROM card_session AS cs
+JOIN agent_task_queue AS task
+  ON task.card_session_id = cs.id
+JOIN task_usage AS usage ON usage.task_id = task.id
+WHERE cs.id = sqlc.arg(card_session_id)
+  AND usage.created_at >= cs.opened_at;
+
+-- name: UpdateCardSessionTokenStats :exec
 UPDATE card_session
-SET last_token_stats_at = sqlc.arg(published_at),
+SET token_input_tokens = sqlc.arg(input_tokens),
+    token_output_tokens = sqlc.arg(output_tokens),
+    token_cache_read_tokens = sqlc.arg(cache_read_tokens),
+    token_cache_write_tokens = sqlc.arg(cache_write_tokens),
+    token_task_count = sqlc.arg(task_count),
+    last_token_stats_at = sqlc.arg(latest_usage_at),
     updated_at = now()
-WHERE id = sqlc.arg(id)
-  AND state = 'open';
+WHERE id = sqlc.arg(card_session_id);

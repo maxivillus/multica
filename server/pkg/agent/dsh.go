@@ -273,7 +273,7 @@ func (b *dshBackend) Execute(ctx context.Context, prompt string, opts ExecOption
 		return nil, fmt.Errorf("send dsh execute command: %w", err)
 	}
 
-	b.cfg.Logger.Info("dsh started", "pid", cmd.Process.Pid, "cwd", opts.Cwd, "model", opts.Model)
+	b.cfg.Logger.Info("dsh started", "pid", cmd.Process.Pid, "cwd_present", opts.Cwd != "", "model", opts.Model)
 	msgCh := make(chan Message, 256)
 	resCh := make(chan Result, 1)
 	procDone := make(chan struct{})

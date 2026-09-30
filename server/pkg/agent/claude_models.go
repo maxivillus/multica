@@ -234,7 +234,7 @@ func discoverClaudeCatalog(ctx context.Context, runtimeCmd Command) Catalog {
 		rememberClaudeListModelsUnsupported(key)
 	}
 	if runtimeCmd.logger != nil {
-		runtimeCmd.logger.Debug("claude model discovery failed, using static catalog", "error", err)
+		runtimeCmd.logger.Debug("claude model discovery failed, using static catalog", "error_present", err != nil)
 	}
 	return claudeStaticCatalog(ctx, runtimeCmd)
 }
