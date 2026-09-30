@@ -45,8 +45,19 @@ generation.
 Persist each task's provider session ID and work directory on the exact
 generation linked to that task. Use provider-specific resume or rejoin after a
 daemon or process restart when supported, with a fresh-session fallback when
-resume fails. The generation survives restarts; it does not keep a provider
-process running for its entire lifetime.
+resume fails. The daemon records the provider state both when it first becomes
+visible and in the same transaction as terminal task settlement, so a follow-up
+comment cannot observe a completed turn without its conversation pointer. The
+generation survives restarts; it does not keep a provider process running for
+its entire lifetime.
+
+Use `lease_owner`, `lease_epoch`, and `lease_heartbeat_at` as a fencing
+contract for a live provider host. Start acquires the lease atomically with
+the task's running transition; a fresh same-owner replay is idempotent, while
+a stale takeover advances the epoch. Heartbeat is ownership-only and must not
+touch `last_activity_at`. Heartbeat/release operations require the exact
+owner and epoch, and lifecycle state changes clear the lease before a paused
+or closed generation can be reused.
 
 Refresh cumulative token totals in the background after each accepted provider
 usage update. Read totals from `task_usage`, scope them to the generation and
@@ -63,6 +74,8 @@ state remains scoped to one task and generation. Token totals update without
 creating new agent triggers.
 
 The implementation keeps using the existing task queue and provider resume
-paths. It does not add a separate always-running provider host. Lifecycle
-diagnostics remain separately configurable and avoid session identifiers,
-work directories, prompts, and token payloads in metric labels.
+paths. The lease API establishes the ownership boundary for a separate
+always-running provider host, but this slice does not yet replace the
+one-shot backend execution path with that host. Lifecycle diagnostics remain
+separately configurable and avoid session identifiers, work directories,
+prompts, and token payloads in metric labels.
