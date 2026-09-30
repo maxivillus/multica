@@ -258,6 +258,35 @@ func (q *Queries) ExpireCardSessionsForWorkspace(ctx context.Context, workspaceI
 	return items, nil
 }
 
+const finalizeCardSessionProviderStateByTask = `-- name: FinalizeCardSessionProviderStateByTask :exec
+UPDATE card_session AS cs
+SET provider_session_id = COALESCE(NULLIF($1, ''), cs.provider_session_id),
+    work_dir = COALESCE(NULLIF($2, ''), cs.work_dir),
+    last_activity_at = now(),
+    updated_at = now()
+FROM agent_task_queue AS t
+WHERE t.id = $3
+  AND t.card_session_id = cs.id
+  AND cs.state <> 'closed'
+  AND t.status IN ('completed', 'failed', 'cancelled')
+`
+
+type FinalizeCardSessionProviderStateByTaskParams struct {
+	ProviderSessionID interface{} `json:"provider_session_id"`
+	WorkDir           interface{} `json:"work_dir"`
+	TaskID            pgtype.UUID `json:"task_id"`
+}
+
+// The provider can reveal its session only in the terminal result. Persist
+// that pointer in the same transaction as the task transition so the next
+// comment cannot claim the card between completion and the asynchronous pin.
+// Empty values intentionally preserve the last known pointer: a provider
+// turn may finish without repeating its stable session id.
+func (q *Queries) FinalizeCardSessionProviderStateByTask(ctx context.Context, arg FinalizeCardSessionProviderStateByTaskParams) error {
+	_, err := q.db.Exec(ctx, finalizeCardSessionProviderStateByTask, arg.ProviderSessionID, arg.WorkDir, arg.TaskID)
+	return err
+}
+
 const getCardSessionTokenStats = `-- name: GetCardSessionTokenStats :one
 SELECT
     COALESCE(SUM(usage.input_tokens), 0)::bigint AS input_tokens,

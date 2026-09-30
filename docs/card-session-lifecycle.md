@@ -68,6 +68,9 @@ When a task is pinned, Multica stores its provider session ID and work directory
 on the exact card generation linked to that task. On a later task, the runtime
 uses the provider's resume or rejoin mechanism when it is available. If the
 provider cannot resume that state, Multica can start a fresh provider session.
-The durable generation remains available across daemon or process restarts,
-but the implementation does not keep a provider process alive for the entire
-idle window.
+The daemon pins the same state as soon as it is observed and repeats the pin in
+the transaction that completes or fails a task. This closes the hand-off window
+where a follow-up comment could be claimed after the task ended but before an
+asynchronous pin reached the database. The durable generation remains
+available across daemon or process restarts, but the implementation does not
+keep a provider process alive for the entire idle window.

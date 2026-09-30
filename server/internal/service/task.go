@@ -4745,6 +4745,17 @@ func (s *TaskService) CompleteTaskWithTransition(ctx context.Context, taskID pgt
 		if err := SettleTerminalTaskState(ctx, qtx, t); err != nil {
 			return err
 		}
+		// A provider may expose its conversation id only in the terminal result.
+		// Persist it beside the task transition, rather than relying solely on
+		// the best-effort mid-turn pin: the next comment must see the same card
+		// session even when the process exits before emitting an early status.
+		if err := qtx.FinalizeCardSessionProviderStateByTask(ctx, db.FinalizeCardSessionProviderStateByTaskParams{
+			TaskID:            t.ID,
+			ProviderSessionID: sessionID,
+			WorkDir:           workDir,
+		}); err != nil {
+			return fmt.Errorf("finalize card session provider state: %w", err)
+		}
 
 		if t.ChatSessionID.Valid {
 			// Pin the chat_session's runtime_id alongside the session_id so the
@@ -5240,6 +5251,15 @@ func (s *TaskService) FailTaskWithTransition(ctx context.Context, taskID pgtype.
 		// never looked at the covering task's status either.
 		if err := SettleTerminalTaskState(ctx, qtx, t); err != nil {
 			return err
+		}
+		// Keep the card's durable conversation pointer in sync with the terminal
+		// task even when no earlier provider status was available to pin it.
+		if err := qtx.FinalizeCardSessionProviderStateByTask(ctx, db.FinalizeCardSessionProviderStateByTaskParams{
+			TaskID:            t.ID,
+			ProviderSessionID: sessionID,
+			WorkDir:           workDir,
+		}); err != nil {
+			return fmt.Errorf("finalize card session provider state: %w", err)
 		}
 
 		// Keep resume-unsafe sessions on the task row for observability, but

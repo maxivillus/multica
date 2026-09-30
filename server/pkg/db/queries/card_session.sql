@@ -228,6 +228,23 @@ WHERE t.id = $1
       )
   );
 
+-- name: FinalizeCardSessionProviderStateByTask :exec
+-- The provider can reveal its session only in the terminal result. Persist
+-- that pointer in the same transaction as the task transition so the next
+-- comment cannot claim the card between completion and the asynchronous pin.
+-- Empty values intentionally preserve the last known pointer: a provider
+-- turn may finish without repeating its stable session id.
+UPDATE card_session AS cs
+SET provider_session_id = COALESCE(NULLIF(sqlc.arg(provider_session_id), ''), cs.provider_session_id),
+    work_dir = COALESCE(NULLIF(sqlc.arg(work_dir), ''), cs.work_dir),
+    last_activity_at = now(),
+    updated_at = now()
+FROM agent_task_queue AS t
+WHERE t.id = sqlc.arg(task_id)
+  AND t.card_session_id = cs.id
+  AND cs.state <> 'closed'
+  AND t.status IN ('completed', 'failed', 'cancelled');
+
 -- name: TouchCardSessionsForTasks :exec
 -- Provider usage and committed task transitions advance activity after their
 -- owning transaction, avoiding a task-row -> card-session lock cycle.
