@@ -306,9 +306,9 @@ func (b *hermesBackend) Execute(ctx context.Context, prompt string, opts ExecOpt
 			agentsMDPresent = true
 		}
 	}
-	b.cfg.Logger.Info("hermes acp starting", "cwd", opts.Cwd, "agents_md_present", agentsMDPresent)
+	b.cfg.Logger.Info("hermes acp starting", "cwd_present", opts.Cwd != "", "agents_md_present", agentsMDPresent)
 	if opts.SystemPrompt != "" {
-		b.cfg.Logger.Debug("hermes ignoring ExecOptions.SystemPrompt; using cwd-scoped context files", "cwd", opts.Cwd)
+		b.cfg.Logger.Debug("hermes ignoring ExecOptions.SystemPrompt; using cwd-scoped context files", "cwd_present", opts.Cwd != "")
 	}
 
 	env := buildEnv(b.cfg.Env)
@@ -362,7 +362,7 @@ func (b *hermesBackend) Execute(ctx context.Context, prompt string, opts ExecOpt
 		_, _ = io.Copy(stderrSink, stderr)
 	}()
 
-	b.cfg.Logger.Info("hermes acp started", "pid", cmd.Process.Pid, "cwd", opts.Cwd)
+	b.cfg.Logger.Info("hermes acp started", "pid", cmd.Process.Pid, "cwd_present", opts.Cwd != "")
 
 	msgCh := make(chan Message, 256)
 	resCh := make(chan Result, 1)
@@ -558,8 +558,8 @@ func (b *hermesBackend) Execute(ctx context.Context, prompt string, opts ExecOpt
 			if !resumeLanded {
 				b.cfg.Logger.Warn("agent returned a different session id on resume — original was likely lost; continuing with the new id",
 					"backend", "hermes",
-					"requested", opts.ResumeSessionID,
-					"actual", sessionID,
+					"requested_session_id_present", opts.ResumeSessionID != "",
+					"actual_session_id_present", sessionID != "",
 				)
 			}
 			sessionCurrentModel = extractACPCurrentModelID(result)
@@ -589,7 +589,7 @@ func (b *hermesBackend) Execute(ctx context.Context, prompt string, opts ExecOpt
 		}
 
 		c.sessionID = sessionID
-		b.cfg.Logger.Info("hermes session created", "session_id", sessionID)
+		b.cfg.Logger.Info("hermes session created", "session_id_present", sessionID != "")
 		// 3. If the caller picked a model (via agent.model from the
 		// UI dropdown), ask hermes to switch the session to it
 		// before we send any prompt. Hermes' _build_model_state
@@ -621,14 +621,14 @@ func (b *hermesBackend) Execute(ctx context.Context, prompt string, opts ExecOpt
 			b.cfg.Logger.Info("hermes session already on requested model; skipping redundant set_model",
 				"model", opts.Model,
 				"session_model", sessionCurrentModel,
-				"session_id", sessionID,
+				"session_id_present", sessionID != "",
 			)
 		} else if opts.Model != "" {
 			if _, err := c.request(runCtx, "session/set_model", map[string]any{
 				"sessionId": sessionID,
 				"modelId":   opts.Model,
 			}); err != nil {
-				b.cfg.Logger.Warn("hermes set_session_model failed", "error", err, "requested_model", opts.Model)
+				b.cfg.Logger.Warn("hermes set_session_model failed", "error_present", err != nil, "requested_model", opts.Model)
 				finalStatus = "failed"
 				finalError = fmt.Sprintf("hermes could not switch to model %q: %v", opts.Model, err)
 				if setupFailureWithholdsSessionID(opts) {
@@ -640,7 +640,7 @@ func (b *hermesBackend) Execute(ctx context.Context, prompt string, opts ExecOpt
 					// the daemon's resume-failure fallback retries fresh.
 					b.cfg.Logger.Warn("resumed session not found at set_model time; clearing session id so the daemon retries fresh",
 						"backend", "hermes",
-						"session_id", sessionID,
+						"session_id_present", sessionID != "",
 					)
 					sessionID = ""
 					resumeRejected = true
@@ -722,7 +722,7 @@ func (b *hermesBackend) Execute(ctx context.Context, prompt string, opts ExecOpt
 					// same way.
 					b.cfg.Logger.Warn("resumed session not found at prompt time; clearing session id so the daemon retries fresh",
 						"backend", "hermes",
-						"session_id", sessionID,
+						"session_id_present", sessionID != "",
 					)
 					sessionID = ""
 					resumeRejected = true
@@ -827,7 +827,7 @@ func (b *hermesBackend) Execute(ctx context.Context, prompt string, opts ExecOpt
 		if hermesResumeSessionLost(opts.ResumeSessionID, promptStopReason, turnActivity.Load()) {
 			b.cfg.Logger.Warn("resumed session refused with no agent activity; treating it as gone and clearing the session id so the daemon retries fresh",
 				"backend", "hermes",
-				"session_id", sessionID,
+				"session_id_present", sessionID != "",
 			)
 			if finalStatus == "completed" {
 				finalStatus = "failed"
@@ -1316,7 +1316,7 @@ func (c *hermesClient) writeAgentRequestResponse(method string, resp map[string]
 		if logger == nil {
 			logger = slog.Default()
 		}
-		logger.Warn("marshal agent-request response", "method", method, "error", err)
+		logger.Warn("marshal agent-request response", "method", method, "error_present", err != nil)
 		return
 	}
 	data = append(data, '\n')
@@ -1325,7 +1325,7 @@ func (c *hermesClient) writeAgentRequestResponse(method string, resp map[string]
 		if logger == nil {
 			logger = slog.Default()
 		}
-		logger.Warn("write agent-request response", "method", method, "error", err)
+		logger.Warn("write agent-request response", "method", method, "error_present", err != nil)
 	}
 }
 
@@ -2481,7 +2481,7 @@ func buildACPMcpServers(raw json.RawMessage, logger *slog.Logger) ([]any, error)
 		entry, err := convertACPMcpServer(name, parsed.McpServers[name])
 		if err != nil {
 			if logger != nil {
-				logger.Warn("skipping invalid mcp_config entry", "name", name, "error", err)
+				logger.Warn("skipping invalid mcp_config entry", "name", name, "error_present", err != nil)
 			}
 			continue
 		}

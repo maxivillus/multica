@@ -176,8 +176,8 @@ func mountHermesSessionDB(hermesHome, storeDir string, logger *slog.Logger) (her
 	}
 	if err := hermesSessionLink(target, staged); err != nil {
 		logger.Warn("execenv: hermes session store not mounted; conversation history stays task-local",
-			"store", storeDir,
-			"error", err,
+			"store_present", storeDir != "",
+			"error_present", true,
 		)
 		return hermesSessionMount{}, nil
 	}
@@ -269,11 +269,11 @@ func migrateHermesTaskSessionDB(hermesHome, storeDir string, logger *slog.Logger
 		return err
 	}
 	if !promoted {
-		logger.Info("execenv: another task published this conversation's session store first; keeping it", "store", storeDir)
+		logger.Info("execenv: another task published this conversation's session store first; keeping it", "store_present", storeDir != "")
 		return nil
 	}
 	logger.Info("execenv: migrated task-local hermes session db into conversation store",
-		"store", storeDir,
+		"store_present", storeDir != "",
 		"files", len(family),
 	)
 	return nil
@@ -375,7 +375,7 @@ func removeHermesSessionDBFamily(dir string) error {
 func touchHermesSessionStore(storeDir string, logger *slog.Logger) {
 	now := time.Now()
 	if err := os.Chtimes(storeDir, now, now); err != nil {
-		logger.Warn("execenv: refresh hermes session store activity failed", "store", storeDir, "error", err)
+		logger.Warn("execenv: refresh hermes session store activity failed", "store_present", storeDir != "", "error_present", true)
 	}
 }
 
@@ -455,7 +455,7 @@ func PruneHermesSessionStores(daemonProfile string, retention time.Duration, now
 					commit()
 				}
 				if err != nil {
-					logger.Warn("execenv: prune hermes session store failed", "store", storeDir, "error", err)
+					logger.Warn("execenv: prune hermes session store failed", "store_present", true, "error_present", true)
 					kept++
 					continue
 				}

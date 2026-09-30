@@ -18,8 +18,6 @@ type RegistryOptions struct {
 	DaemonWS    *daemonws.Metrics
 	Version     string
 	Commit      string
-	// CardSessionObservability gates the experimental card-session diagnostic
-	// collector independently of the rest of the /metrics registry.
 	CardSessionObservability bool
 }
 
@@ -30,8 +28,8 @@ type Registry struct {
 	ChannelMedia *ChannelMediaReconcilerMetrics
 	ChannelLease *ChannelLeaseMetrics
 	Wecom        *WecomMetrics
-	CardSession  *CardSessionMetrics
 	DBRouting    *DBRoutingMetrics
+	CardSession  *CardSessionMetrics
 }
 
 func NewRegistry(opts RegistryOptions) *Registry {
@@ -62,7 +60,6 @@ func NewRegistry(opts RegistryOptions) *Registry {
 	reg.MustRegister(wecomMetrics.Collectors()...)
 	dbRoutingMetrics := NewDBRoutingMetrics()
 	reg.MustRegister(dbRoutingMetrics.Collectors()...)
-
 	var cardSessionMetrics *CardSessionMetrics
 	if opts.CardSessionObservability {
 		cardSessionMetrics = NewCardSessionMetrics()
@@ -86,8 +83,8 @@ func NewRegistry(opts RegistryOptions) *Registry {
 		ChannelMedia: channelMedia,
 		ChannelLease: channelLease,
 		Wecom:        wecomMetrics,
-		CardSession:  cardSessionMetrics,
 		DBRouting:    dbRoutingMetrics,
+		CardSession:  cardSessionMetrics,
 	}
 }
 

@@ -214,14 +214,11 @@ func NewRouter(pool *pgxpool.Pool, hub *realtime.Hub, bus *events.Bus, analytics
 }
 
 type RouterOptions struct {
-	HTTPMetrics        *obsmetrics.HTTPMetrics
-	BusinessMetrics    *obsmetrics.BusinessMetrics
-	CardSessionMetrics *obsmetrics.CardSessionMetrics
-	// CardSessionObservabilityEnabled gates the experimental card-session
-	// diagnostic logs. Metrics are separately absent when CardSessionMetrics is
-	// nil, so deployments can disable the whole diagnostic surface together.
+	HTTPMetrics         *obsmetrics.HTTPMetrics
+	BusinessMetrics     *obsmetrics.BusinessMetrics
+	CardSessionMetrics  *obsmetrics.CardSessionMetrics
 	CardSessionObservabilityEnabled bool
-	ChannelLeaseMetrics             *obsmetrics.ChannelLeaseMetrics
+	ChannelLeaseMetrics *obsmetrics.ChannelLeaseMetrics
 	// ChannelLeaseRedis is a dedicated non-blocking Redis client/pool. It is
 	// required only when CHANNEL_WS_LEASE_BACKEND=redis.
 	ChannelLeaseRedis redis.UniversalClient

@@ -23,19 +23,37 @@ import (
 // session is a cold start, and a cold start has no delta to report.
 func seedPriorRunWithSnapshot(t *testing.T, agentID, runtimeID, issueID, snapshot string) {
 	t.Helper()
-	cols := testutil.Cols{
-		"runtime_id":   runtimeID,
-		"issue_id":     issueID,
-		"status":       "completed",
-		"session_id":   "prior-run-session-" + issueID,
-		"work_dir":     "/tmp/prior-run-workdir",
-		"started_at":   testutil.Raw("now() - interval '1 hour'"),
-		"completed_at": testutil.Raw("now() - interval '50 minutes'"),
+	const workDir = "/tmp/prior-run-workdir"
+	sessionID := "prior-run-session-" + issueID
+	var taskID, cardSessionID string
+	if err := testPool.QueryRow(context.Background(), `
+		INSERT INTO agent_task_queue (
+			agent_id, runtime_id, issue_id, status, session_id, work_dir,
+			started_at, completed_at, issue_snapshot
+		)
+		VALUES ($1, $2, $3, 'completed', $4, $5,
+			now() - interval '1 hour', now() - interval '50 minutes', NULLIF($6, '')::jsonb)
+		RETURNING id`, agentID, runtimeID, issueID, sessionID, workDir, snapshot).Scan(&taskID); err != nil {
+		t.Fatalf("insert prior task with snapshot: %v", err)
 	}
-	if snapshot != "" {
-		cols["issue_snapshot"] = snapshot
+	dbfx.Cleanup(t, `DELETE FROM agent_task_queue WHERE id = $1`, taskID)
+	if err := testPool.QueryRow(context.Background(), `
+		INSERT INTO card_session (
+			workspace_id, issue_id, agent_id, generation, state, provider,
+			provider_session_id, work_dir
+		)
+		SELECT issue.workspace_id, issue.id, agent.id, 1, 'open', runtime.provider, $3, $4
+		FROM issue
+		JOIN agent ON agent.id = $2
+		JOIN agent_runtime AS runtime ON runtime.id = agent.runtime_id
+		WHERE issue.id = $1
+		RETURNING id`, issueID, agentID, sessionID, workDir).Scan(&cardSessionID); err != nil {
+		t.Fatalf("insert prior card-session generation: %v", err)
 	}
-	dbfx.Task(t, agentID, cols)
+	dbfx.Cleanup(t, `DELETE FROM card_session WHERE id = $1`, cardSessionID)
+	if _, err := testPool.Exec(context.Background(), `UPDATE agent_task_queue SET card_session_id = $2 WHERE id = $1`, taskID, cardSessionID); err != nil {
+		t.Fatalf("bind prior task to card-session generation: %v", err)
+	}
 }
 
 // issueSnapshotJSON renders a stored snapshot for the issue fixture, letting a
@@ -291,10 +309,21 @@ func TestClaimTaskByRuntime_DeltasDateFromTheResumedRun(t *testing.T) {
 			runtimeID := createClaimReclaimRuntime(t, ctx, "resumed anchor runtime "+label)
 			name := "resumed anchor agent " + label
 			agentID, issueID := createClaimReclaimAgentAndIssue(t, ctx, runtimeID, name)
+			var sourceCardSessionID string
+			if manualRerun {
+				if err := testPool.QueryRow(ctx, `
+					INSERT INTO card_session (
+						workspace_id, issue_id, agent_id, generation, state, provider,
+						provider_session_id, work_dir
+					) VALUES ($1, $2, $3, 1, 'open', 'codex', 'older-healthy-session', '/tmp/resumed-anchor-workdir')
+					RETURNING id`, testWorkspaceID, issueID, agentID).Scan(&sourceCardSessionID); err != nil {
+					t.Fatalf("create source card-session generation: %v", err)
+				}
+			}
 
 			// The run we will resume. Its snapshot says the description was
 			// "older instructions" — which is NOT what the issue says now.
-			olderID := dbfx.Task(t, agentID, testutil.Cols{
+			olderTask := testutil.Cols{
 				"runtime_id": runtimeID,
 				"issue_id":   issueID,
 				// Completed: it finished a turn, so it proved its prompt
@@ -305,7 +334,11 @@ func TestClaimTaskByRuntime_DeltasDateFromTheResumedRun(t *testing.T) {
 				"started_at":     testutil.Raw("now() - interval '2 hours'"),
 				"completed_at":   testutil.Raw("now() - interval '110 minutes'"),
 				"issue_snapshot": issueSnapshotJSON(t, issueSnapshotVersion, name+" issue", "older instructions"),
-			})
+			}
+			if sourceCardSessionID != "" {
+				olderTask["card_session_id"] = sourceCardSessionID
+			}
+			olderID := dbfx.Task(t, agentID, olderTask)
 			// A NEWER run that saw the issue as it is now. Anchoring here is the
 			// bug: its session is not the one being resumed.
 			newer := testutil.Cols{
@@ -574,6 +607,25 @@ func TestClaimTaskByRuntime_StartedRetryWithoutProviderMustNotWaiveReads(t *test
 		"completed_at":       testutil.Raw("now() - interval '110 minutes'"),
 		"issue_snapshot":     issueSnapshotJSON(t, issueSnapshotVersion, name+" issue", "old requirements"),
 	})
+	var parentCardSessionID string
+	if err := testPool.QueryRow(ctx, `
+		INSERT INTO card_session (
+			workspace_id, issue_id, agent_id, generation, state, provider,
+			provider_session_id, work_dir
+		)
+		SELECT issue.workspace_id, issue.id, agent.id, 1, 'open', runtime.provider,
+		       'session-before-edit', '/tmp/before-provider-snapshot'
+		FROM issue
+		JOIN agent ON agent.id = $2
+		JOIN agent_runtime AS runtime ON runtime.id = agent.runtime_id
+		WHERE issue.id = $1
+		RETURNING id`, issueID, agentID).Scan(&parentCardSessionID); err != nil {
+		t.Fatalf("insert retry card-session generation: %v", err)
+	}
+	dbfx.Cleanup(t, `DELETE FROM card_session WHERE id = $1`, parentCardSessionID)
+	if _, err := testPool.Exec(ctx, `UPDATE agent_task_queue SET card_session_id = $2 WHERE id = $1`, parentID, parentCardSessionID); err != nil {
+		t.Fatalf("bind prior retry task to card-session generation: %v", err)
+	}
 	// A comment that session never saw.
 	dbfx.Comment(t, issueID, "instructions the old session has never seen", testutil.Cols{
 		"created_at": testutil.Raw("now() - interval '30 minutes'"),

@@ -49,11 +49,7 @@ func rewriteCmdToPS1(toolName, lookedUp string, args []string, logger *slog.Logg
 	full = append(full, args...)
 
 	if logger != nil {
-		logger.Info(toolName+": routing through powershell -File to preserve argv tokens",
-			"powershell", psExe,
-			"ps1", ps1,
-			"original", lookedUp,
-		)
+		logPowerShellRoute(logger, toolName, "File", psExe, ps1, lookedUp)
 	}
 	return psExe, full, true
 }

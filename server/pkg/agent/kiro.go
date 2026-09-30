@@ -103,7 +103,7 @@ func (b *kiroBackend) Execute(ctx context.Context, prompt string, opts ExecOptio
 		_, _ = io.Copy(stderrSink, stderr)
 	}()
 
-	b.cfg.Logger.Info("kiro acp started", "pid", cmd.Process.Pid, "cwd", opts.Cwd)
+	b.cfg.Logger.Info("kiro acp started", "pid", cmd.Process.Pid, "cwd_present", opts.Cwd != "")
 
 	msgCh := make(chan Message, 256)
 	resCh := make(chan Result, 1)
@@ -290,8 +290,8 @@ func (b *kiroBackend) Execute(ctx context.Context, prompt string, opts ExecOptio
 			if changed {
 				b.cfg.Logger.Warn("agent returned a different session id on resume — original was likely lost; continuing with the new id",
 					"backend", "kiro",
-					"requested", opts.ResumeSessionID,
-					"actual", sessionID,
+					"requested_session_id_present", opts.ResumeSessionID != "",
+					"actual_session_id_present", sessionID != "",
 				)
 			}
 			if effectiveModel == "" {
@@ -321,14 +321,14 @@ func (b *kiroBackend) Execute(ctx context.Context, prompt string, opts ExecOptio
 		}
 
 		c.sessionID = sessionID
-		b.cfg.Logger.Info("kiro session created", "session_id", sessionID)
+		b.cfg.Logger.Info("kiro session created", "session_id_present", sessionID != "")
 
 		if opts.Model != "" {
 			if _, err := c.request(runCtx, "session/set_model", map[string]any{
 				"sessionId": sessionID,
 				"modelId":   opts.Model,
 			}); err != nil {
-				b.cfg.Logger.Warn("kiro set_session_model failed", "error", err, "requested_model", opts.Model)
+				b.cfg.Logger.Warn("kiro set_session_model failed", "error_present", err != nil, "requested_model", opts.Model)
 				finalStatus = "failed"
 				finalError = fmt.Sprintf("kiro could not switch to model %q: %v", opts.Model, err)
 				if setupFailureWithholdsSessionID(opts) {
@@ -340,7 +340,7 @@ func (b *kiroBackend) Execute(ctx context.Context, prompt string, opts ExecOptio
 					// the daemon's resume-failure fallback retries fresh.
 					b.cfg.Logger.Warn("resumed session not found at set_model time; clearing session id so the daemon retries fresh",
 						"backend", "kiro",
-						"session_id", sessionID,
+						"session_id_present", sessionID != "",
 					)
 					sessionID = ""
 					resumeRejected = true
@@ -396,7 +396,7 @@ func (b *kiroBackend) Execute(ctx context.Context, prompt string, opts ExecOptio
 				lastFinishing := lastFinishingResultStatus
 				finishingMu.Unlock()
 				if lastFinishing == "completed" && isKiroGoalCompleteCloseError(err) {
-					b.cfg.Logger.Warn("kiro session/prompt failed after a completed finishing-tool result; preserving completed task status", "error", err)
+					b.cfg.Logger.Warn("kiro session/prompt failed after a completed finishing-tool result; preserving completed task status", "error_present", err != nil)
 					finalStatus = "completed"
 					finalError = ""
 				} else if opts.ResumeSessionID != "" && isACPSessionNotFound(err) {
@@ -408,7 +408,7 @@ func (b *kiroBackend) Execute(ctx context.Context, prompt string, opts ExecOptio
 					// store the replacement id.
 					b.cfg.Logger.Warn("resumed session not found at prompt time; clearing session id so the daemon retries fresh",
 						"backend", "kiro",
-						"session_id", sessionID,
+						"session_id_present", sessionID != "",
 					)
 					sessionID = ""
 					resumeRejected = true
@@ -427,7 +427,7 @@ func (b *kiroBackend) Execute(ctx context.Context, prompt string, opts ExecOptio
 					// successful fresh retry overwrites it with the new id.
 					b.cfg.Logger.Warn("resumed session has an oversized historical image the provider rejects; signaling resume rejection so the daemon retries with a fresh session",
 						"backend", "kiro",
-						"session_id", sessionID,
+						"session_id_present", sessionID != "",
 					)
 					resumeRejected = true
 				}

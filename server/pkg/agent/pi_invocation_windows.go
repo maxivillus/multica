@@ -36,11 +36,7 @@ func rewriteCmdToPS1Command(toolName, lookedUp string, args []string, logger *sl
 	full := piPowerShellCommandArgs(ps1, args)
 
 	if logger != nil {
-		logger.Info(toolName+": routing through powershell -Command to preserve stdin",
-			"powershell", psExe,
-			"ps1", ps1,
-			"original", lookedUp,
-		)
+		logPowerShellRoute(logger, toolName, "Command", psExe, ps1, lookedUp)
 	}
 	return psExe, full, true
 }

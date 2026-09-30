@@ -74,6 +74,7 @@ var workspaceDeletionManifest = map[string]workspaceDeleteAction{
 	"issue":                              workspaceDelete,
 	"issue_wakeup":                       workspaceDelete,
 	"issue_wakeup_receipt":               workspaceDelete,
+	"issue_task_cancel_outbox":           workspaceDelete,
 	"issue_view":                         workspaceDelete,
 	"issue_view_preference":              workspaceDelete,
 	"issue_dependency":                   workspaceDelete,

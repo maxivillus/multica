@@ -155,7 +155,7 @@ func (b *traecliBackend) Execute(ctx context.Context, prompt string, opts ExecOp
 		_, _ = io.Copy(stderrSink, stderr)
 	}()
 
-	b.cfg.Logger.Info("traecli acp started", "pid", cmd.Process.Pid, "cwd", opts.Cwd)
+	b.cfg.Logger.Info("traecli acp started", "pid", cmd.Process.Pid, "cwd_present", opts.Cwd != "")
 
 	msgStream := newTraecliMessageStream(256)
 	resCh := make(chan Result, 1)
@@ -286,8 +286,8 @@ func (b *traecliBackend) Execute(ctx context.Context, prompt string, opts ExecOp
 			if changed {
 				b.cfg.Logger.Warn("agent returned a different session id on resume — original was likely lost; continuing with the new id",
 					"backend", "traecli",
-					"requested", opts.ResumeSessionID,
-					"actual", sessionID,
+					"requested_session_id_present", opts.ResumeSessionID != "",
+					"actual_session_id_present", sessionID != "",
 				)
 			}
 			if effectiveModel == "" {
@@ -317,14 +317,14 @@ func (b *traecliBackend) Execute(ctx context.Context, prompt string, opts ExecOp
 		}
 
 		c.sessionID = sessionID
-		b.cfg.Logger.Info("traecli session created", "session_id", sessionID)
+		b.cfg.Logger.Info("traecli session created", "session_id_present", sessionID != "")
 
 		if opts.Model != "" {
 			if _, err := c.request(runCtx, "session/set_model", map[string]any{
 				"sessionId": sessionID,
 				"modelId":   opts.Model,
 			}); err != nil {
-				b.cfg.Logger.Warn("traecli set_session_model failed", "error", err, "requested_model", opts.Model)
+				b.cfg.Logger.Warn("traecli set_session_model failed", "error_present", err != nil, "requested_model", opts.Model)
 				finalStatus = "failed"
 				finalError = fmt.Sprintf("traecli could not switch to model %q: %v", opts.Model, err)
 				if setupFailureWithholdsSessionID(opts) {
@@ -332,7 +332,7 @@ func (b *traecliBackend) Execute(ctx context.Context, prompt string, opts ExecOp
 				} else if isACPSessionNotFound(err) {
 					b.cfg.Logger.Warn("resumed session not found at set_model time; clearing session id so the daemon retries fresh",
 						"backend", "traecli",
-						"session_id", sessionID,
+						"session_id_present", sessionID != "",
 					)
 					sessionID = ""
 					resumeRejected = true
@@ -374,7 +374,7 @@ func (b *traecliBackend) Execute(ctx context.Context, prompt string, opts ExecOp
 				if opts.ResumeSessionID != "" && isACPSessionNotFound(err) {
 					b.cfg.Logger.Warn("resumed session not found at prompt time; clearing session id so the daemon retries fresh",
 						"backend", "traecli",
-						"session_id", sessionID,
+						"session_id_present", sessionID != "",
 					)
 					sessionID = ""
 					resumeRejected = true

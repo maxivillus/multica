@@ -15,10 +15,7 @@ const countOpenCardSessions = `-- name: CountOpenCardSessions :one
 SELECT COUNT(*)::bigint
 FROM card_session
 WHERE workspace_id = $1
-  AND (
-    state = 'open'
-    OR (state = 'done_retained' AND retain_until > now())
-  )
+  AND state = 'open'
 `
 
 func (q *Queries) CountOpenCardSessions(ctx context.Context, workspaceID pgtype.UUID) (int64, error) {
@@ -38,7 +35,8 @@ JOIN agent ON agent.id = $4
 WHERE issue.id = $5
   AND issue.workspace_id = $1
   AND agent.workspace_id = $1
-RETURNING id, workspace_id, issue_id, agent_id, generation, state, provider, provider_session_id, work_dir, opened_at, last_activity_at, done_at, retain_until, closed_at, lease_owner, lease_epoch, lease_heartbeat_at, created_at, updated_at, last_token_stats_at
+  AND issue_status_allows_agent_task(issue.workspace_id, issue.status)
+RETURNING id, workspace_id, issue_id, agent_id, generation, state, provider, provider_session_id, work_dir, opened_at, last_activity_at, done_at, retain_until, closed_at, lease_owner, lease_epoch, lease_heartbeat_at, created_at, updated_at, last_token_stats_at, pause_reason, token_input_tokens, token_output_tokens, token_cache_read_tokens, token_cache_write_tokens, token_task_count
 `
 
 type CreateCardSessionParams struct {
@@ -79,22 +77,54 @@ func (q *Queries) CreateCardSession(ctx context.Context, arg CreateCardSessionPa
 		&i.CreatedAt,
 		&i.UpdatedAt,
 		&i.LastTokenStatsAt,
+		&i.PauseReason,
+		&i.TokenInputTokens,
+		&i.TokenOutputTokens,
+		&i.TokenCacheReadTokens,
+		&i.TokenCacheWriteTokens,
+		&i.TokenTaskCount,
 	)
 	return i, err
 }
 
 const expireCardSessions = `-- name: ExpireCardSessions :many
-UPDATE card_session
+UPDATE card_session AS cs
 SET state = 'closed',
+    pause_reason = NULL,
     closed_at = now(),
     updated_at = now()
-WHERE state = 'done_retained'
-  AND retain_until <= now()
-RETURNING id, workspace_id, issue_id, agent_id, generation, state, provider, provider_session_id, work_dir, opened_at, last_activity_at, done_at, retain_until, closed_at, lease_owner, lease_epoch, lease_heartbeat_at, created_at, updated_at, last_token_stats_at
+FROM workspace AS w
+WHERE w.id = cs.workspace_id
+  AND cs.state <> 'closed'
+  AND cs.last_activity_at <= now() - make_interval(hours => CASE
+      WHEN w.settings->'card_sessions'->>'idle_timeout_hours' ~ '^[0-9]{1,3}$'
+          THEN GREATEST(1, LEAST(999, (w.settings->'card_sessions'->>'idle_timeout_hours')::INTEGER))
+      ELSE 24
+  END)
+  AND NOT EXISTS (
+      SELECT 1
+      FROM agent_task_queue AS task
+      WHERE task.issue_id = cs.issue_id
+        AND task.agent_id = cs.agent_id
+        AND task.status IN ('dispatched', 'running', 'waiting_local_directory')
+  )
+  AND (
+      NOT EXISTS (
+          SELECT 1 FROM issue
+          WHERE issue.id = cs.issue_id
+            AND issue.workspace_id = cs.workspace_id
+            AND issue_status_allows_agent_task(issue.workspace_id, issue.status)
+      )
+      OR NOT EXISTS (
+          SELECT 1 FROM agent_task_queue AS task
+          WHERE task.issue_id = cs.issue_id
+            AND task.agent_id = cs.agent_id
+            AND task.status IN ('queued', 'deferred')
+      )
+  )
+RETURNING cs.id, cs.workspace_id, cs.issue_id, cs.agent_id, cs.generation, cs.state, cs.provider, cs.provider_session_id, cs.work_dir, cs.opened_at, cs.last_activity_at, cs.done_at, cs.retain_until, cs.closed_at, cs.lease_owner, cs.lease_epoch, cs.lease_heartbeat_at, cs.created_at, cs.updated_at, cs.last_token_stats_at, cs.pause_reason, cs.token_input_tokens, cs.token_output_tokens, cs.token_cache_read_tokens, cs.token_cache_write_tokens, cs.token_task_count
 `
 
-// Server-wide expiry pass. The state guard and close trigger ensure this can
-// only close rows that already completed their terminal retention window.
 func (q *Queries) ExpireCardSessions(ctx context.Context) ([]CardSession, error) {
 	rows, err := q.db.Query(ctx, expireCardSessions)
 	if err != nil {
@@ -125,6 +155,12 @@ func (q *Queries) ExpireCardSessions(ctx context.Context) ([]CardSession, error)
 			&i.CreatedAt,
 			&i.UpdatedAt,
 			&i.LastTokenStatsAt,
+			&i.PauseReason,
+			&i.TokenInputTokens,
+			&i.TokenOutputTokens,
+			&i.TokenCacheReadTokens,
+			&i.TokenCacheWriteTokens,
+			&i.TokenTaskCount,
 		); err != nil {
 			return nil, err
 		}
@@ -137,18 +173,44 @@ func (q *Queries) ExpireCardSessions(ctx context.Context) ([]CardSession, error)
 }
 
 const expireCardSessionsForWorkspace = `-- name: ExpireCardSessionsForWorkspace :many
-UPDATE card_session
+UPDATE card_session AS cs
 SET state = 'closed',
+    pause_reason = NULL,
     closed_at = now(),
     updated_at = now()
-WHERE state = 'done_retained'
-  AND workspace_id = $1
-  AND retain_until <= now()
-RETURNING id, workspace_id, issue_id, agent_id, generation, state, provider, provider_session_id, work_dir, opened_at, last_activity_at, done_at, retain_until, closed_at, lease_owner, lease_epoch, lease_heartbeat_at, created_at, updated_at, last_token_stats_at
+FROM workspace AS w
+WHERE cs.workspace_id = $1
+  AND w.id = cs.workspace_id
+  AND cs.state <> 'closed'
+  AND cs.last_activity_at <= now() - make_interval(hours => CASE
+      WHEN w.settings->'card_sessions'->>'idle_timeout_hours' ~ '^[0-9]{1,3}$'
+          THEN GREATEST(1, LEAST(999, (w.settings->'card_sessions'->>'idle_timeout_hours')::INTEGER))
+      ELSE 24
+  END)
+  AND NOT EXISTS (
+      SELECT 1
+      FROM agent_task_queue AS task
+      WHERE task.issue_id = cs.issue_id
+        AND task.agent_id = cs.agent_id
+        AND task.status IN ('dispatched', 'running', 'waiting_local_directory')
+  )
+  AND (
+      NOT EXISTS (
+          SELECT 1 FROM issue
+          WHERE issue.id = cs.issue_id
+            AND issue.workspace_id = cs.workspace_id
+            AND issue_status_allows_agent_task(issue.workspace_id, issue.status)
+      )
+      OR NOT EXISTS (
+          SELECT 1 FROM agent_task_queue AS task
+          WHERE task.issue_id = cs.issue_id
+            AND task.agent_id = cs.agent_id
+            AND task.status IN ('queued', 'deferred')
+      )
+  )
+RETURNING cs.id, cs.workspace_id, cs.issue_id, cs.agent_id, cs.generation, cs.state, cs.provider, cs.provider_session_id, cs.work_dir, cs.opened_at, cs.last_activity_at, cs.done_at, cs.retain_until, cs.closed_at, cs.lease_owner, cs.lease_epoch, cs.lease_heartbeat_at, cs.created_at, cs.updated_at, cs.last_token_stats_at, cs.pause_reason, cs.token_input_tokens, cs.token_output_tokens, cs.token_cache_read_tokens, cs.token_cache_write_tokens, cs.token_task_count
 `
 
-// The expiry worker is the only path allowed to close a session row. It can
-// never close an open work/review generation.
 func (q *Queries) ExpireCardSessionsForWorkspace(ctx context.Context, workspaceID pgtype.UUID) ([]CardSession, error) {
 	rows, err := q.db.Query(ctx, expireCardSessionsForWorkspace, workspaceID)
 	if err != nil {
@@ -179,6 +241,12 @@ func (q *Queries) ExpireCardSessionsForWorkspace(ctx context.Context, workspaceI
 			&i.CreatedAt,
 			&i.UpdatedAt,
 			&i.LastTokenStatsAt,
+			&i.PauseReason,
+			&i.TokenInputTokens,
+			&i.TokenOutputTokens,
+			&i.TokenCacheReadTokens,
+			&i.TokenCacheWriteTokens,
+			&i.TokenTaskCount,
 		); err != nil {
 			return nil, err
 		}
@@ -190,8 +258,47 @@ func (q *Queries) ExpireCardSessionsForWorkspace(ctx context.Context, workspaceI
 	return items, nil
 }
 
+const getCardSessionTokenStats = `-- name: GetCardSessionTokenStats :one
+SELECT
+    COALESCE(SUM(usage.input_tokens), 0)::bigint AS input_tokens,
+    COALESCE(SUM(usage.output_tokens), 0)::bigint AS output_tokens,
+    COALESCE(SUM(usage.cache_read_tokens), 0)::bigint AS cache_read_tokens,
+    COALESCE(SUM(usage.cache_write_tokens), 0)::bigint AS cache_write_tokens,
+    COUNT(DISTINCT task.id)::bigint AS task_count,
+    COALESCE(MAX(usage.updated_at), now())::timestamptz AS latest_usage_at
+FROM card_session AS cs
+JOIN agent_task_queue AS task
+  ON task.card_session_id = cs.id
+JOIN task_usage AS usage ON usage.task_id = task.id
+WHERE cs.id = $1
+  AND usage.created_at >= cs.opened_at
+`
+
+type GetCardSessionTokenStatsRow struct {
+	InputTokens      int64              `json:"input_tokens"`
+	OutputTokens     int64              `json:"output_tokens"`
+	CacheReadTokens  int64              `json:"cache_read_tokens"`
+	CacheWriteTokens int64              `json:"cache_write_tokens"`
+	TaskCount        int64              `json:"task_count"`
+	LatestUsageAt    pgtype.Timestamptz `json:"latest_usage_at"`
+}
+
+func (q *Queries) GetCardSessionTokenStats(ctx context.Context, cardSessionID pgtype.UUID) (GetCardSessionTokenStatsRow, error) {
+	row := q.db.QueryRow(ctx, getCardSessionTokenStats, cardSessionID)
+	var i GetCardSessionTokenStatsRow
+	err := row.Scan(
+		&i.InputTokens,
+		&i.OutputTokens,
+		&i.CacheReadTokens,
+		&i.CacheWriteTokens,
+		&i.TaskCount,
+		&i.LatestUsageAt,
+	)
+	return i, err
+}
+
 const getLatestCardSession = `-- name: GetLatestCardSession :one
-SELECT id, workspace_id, issue_id, agent_id, generation, state, provider, provider_session_id, work_dir, opened_at, last_activity_at, done_at, retain_until, closed_at, lease_owner, lease_epoch, lease_heartbeat_at, created_at, updated_at, last_token_stats_at
+SELECT id, workspace_id, issue_id, agent_id, generation, state, provider, provider_session_id, work_dir, opened_at, last_activity_at, done_at, retain_until, closed_at, lease_owner, lease_epoch, lease_heartbeat_at, created_at, updated_at, last_token_stats_at, pause_reason, token_input_tokens, token_output_tokens, token_cache_read_tokens, token_cache_write_tokens, token_task_count
 FROM card_session
 WHERE issue_id = $1
   AND agent_id = $2
@@ -230,18 +337,23 @@ func (q *Queries) GetLatestCardSession(ctx context.Context, arg GetLatestCardSes
 		&i.CreatedAt,
 		&i.UpdatedAt,
 		&i.LastTokenStatsAt,
+		&i.PauseReason,
+		&i.TokenInputTokens,
+		&i.TokenOutputTokens,
+		&i.TokenCacheReadTokens,
+		&i.TokenCacheWriteTokens,
+		&i.TokenTaskCount,
 	)
 	return i, err
 }
 
 const getResumableCardSession = `-- name: GetResumableCardSession :one
-SELECT id, workspace_id, issue_id, agent_id, generation, state, provider, provider_session_id, work_dir, opened_at, last_activity_at, done_at, retain_until, closed_at, lease_owner, lease_epoch, lease_heartbeat_at, created_at, updated_at, last_token_stats_at
+SELECT id, workspace_id, issue_id, agent_id, generation, state, provider, provider_session_id, work_dir, opened_at, last_activity_at, done_at, retain_until, closed_at, lease_owner, lease_epoch, lease_heartbeat_at, created_at, updated_at, last_token_stats_at, pause_reason, token_input_tokens, token_output_tokens, token_cache_read_tokens, token_cache_write_tokens, token_task_count
 FROM card_session
 WHERE issue_id = $1
   AND agent_id = $2
   AND workspace_id = $3
   AND state <> 'closed'
-  AND (state = 'open' OR retain_until > now())
 ORDER BY generation DESC
 LIMIT 1
 `
@@ -276,44 +388,105 @@ func (q *Queries) GetResumableCardSession(ctx context.Context, arg GetResumableC
 		&i.CreatedAt,
 		&i.UpdatedAt,
 		&i.LastTokenStatsAt,
+		&i.PauseReason,
+		&i.TokenInputTokens,
+		&i.TokenOutputTokens,
+		&i.TokenCacheReadTokens,
+		&i.TokenCacheWriteTokens,
+		&i.TokenTaskCount,
 	)
 	return i, err
 }
 
-const listOpenCardSessionTokenStatsCandidateIDs = `-- name: ListOpenCardSessionTokenStatsCandidateIDs :many
-SELECT id, workspace_id, issue_id
-FROM card_session
-WHERE state = 'open'
-  AND (
-      last_token_stats_at IS NULL
-      OR last_token_stats_at <= now() - interval '1 minute'
+const listCardSessionsWithStaleTokenStats = `-- name: ListCardSessionsWithStaleTokenStats :many
+SELECT cs.id
+  FROM card_session AS cs
+  WHERE EXISTS (
+      SELECT 1
+      FROM agent_task_queue AS task
+      JOIN task_usage AS usage ON usage.task_id = task.id
+      WHERE task.card_session_id = cs.id
+        AND usage.created_at >= cs.opened_at
+        AND (cs.last_token_stats_at IS NULL OR usage.updated_at > cs.last_token_stats_at)
   )
-ORDER BY last_token_stats_at NULLS FIRST, id
-LIMIT $1
+ORDER BY cs.last_token_stats_at NULLS FIRST, cs.id
+LIMIT $1::integer
 `
 
-type ListOpenCardSessionTokenStatsCandidateIDsRow struct {
-	ID          pgtype.UUID `json:"id"`
-	WorkspaceID pgtype.UUID `json:"workspace_id"`
-	IssueID     pgtype.UUID `json:"issue_id"`
-}
-
-// Token snapshots are selected without locks first. The service then locks
-// the issue, workspace, and session in that order before creating the system
-// comment, matching the issue-status trigger's lock order and preventing two
-// concurrent sweepers from publishing the same interval snapshot.
-// The one-minute SQL floor keeps the candidate scan bounded while the Go
-// settings parser applies each workspace's configured interval.
-func (q *Queries) ListOpenCardSessionTokenStatsCandidateIDs(ctx context.Context, limit int32) ([]ListOpenCardSessionTokenStatsCandidateIDsRow, error) {
-	rows, err := q.db.Query(ctx, listOpenCardSessionTokenStatsCandidateIDs, limit)
+// Session token totals are cached after each accepted provider usage report.
+// The source remains task_usage so corrections are reflected on refresh. Closed
+// generations remain eligible: a restart can close an idle session before its
+// recovery sweep gets a chance to refresh the final persisted usage totals.
+func (q *Queries) ListCardSessionsWithStaleTokenStats(ctx context.Context, limit int32) ([]pgtype.UUID, error) {
+	rows, err := q.db.Query(ctx, listCardSessionsWithStaleTokenStats, limit)
 	if err != nil {
 		return nil, err
 	}
 	defer rows.Close()
-	items := []ListOpenCardSessionTokenStatsCandidateIDsRow{}
+	items := []pgtype.UUID{}
 	for rows.Next() {
-		var i ListOpenCardSessionTokenStatsCandidateIDsRow
-		if err := rows.Scan(&i.ID, &i.WorkspaceID, &i.IssueID); err != nil {
+		var id pgtype.UUID
+		if err := rows.Scan(&id); err != nil {
+			return nil, err
+		}
+		items = append(items, id)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
+	return items, nil
+}
+
+const listDueCardSessionCapacityWaitersForRuntimes = `-- name: ListDueCardSessionCapacityWaitersForRuntimes :many
+SELECT task.id,
+       task.issue_id,
+       task.agent_id,
+       issue.workspace_id,
+       agent.runtime_mode
+FROM agent_task_queue AS task
+JOIN issue ON issue.id = task.issue_id
+JOIN agent ON agent.id = task.agent_id
+WHERE task.runtime_id = ANY($1::uuid[])
+  AND task.status = 'deferred'
+  AND task.fire_at <= now()
+  AND task.context->>'card_session_capacity_pending' = 'true'
+  AND issue_status_allows_agent_task(issue.workspace_id, issue.status)
+ORDER BY task.priority DESC, task.created_at ASC, task.id ASC
+LIMIT $2::integer
+`
+
+type ListDueCardSessionCapacityWaitersForRuntimesParams struct {
+	RuntimeIds  []pgtype.UUID `json:"runtime_ids"`
+	WaiterLimit int32         `json:"waiter_limit"`
+}
+
+type ListDueCardSessionCapacityWaitersForRuntimesRow struct {
+	ID          pgtype.UUID `json:"id"`
+	IssueID     pgtype.UUID `json:"issue_id"`
+	AgentID     pgtype.UUID `json:"agent_id"`
+	WorkspaceID pgtype.UUID `json:"workspace_id"`
+	RuntimeMode string      `json:"runtime_mode"`
+}
+
+// Deferred issue tasks stay outside the claim queue until their workspace has
+// room for the session they need. The runtime claim loop retries a bounded
+// batch so a full workspace cannot turn one claim into unbounded database work.
+func (q *Queries) ListDueCardSessionCapacityWaitersForRuntimes(ctx context.Context, arg ListDueCardSessionCapacityWaitersForRuntimesParams) ([]ListDueCardSessionCapacityWaitersForRuntimesRow, error) {
+	rows, err := q.db.Query(ctx, listDueCardSessionCapacityWaitersForRuntimes, arg.RuntimeIds, arg.WaiterLimit)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	items := []ListDueCardSessionCapacityWaitersForRuntimesRow{}
+	for rows.Next() {
+		var i ListDueCardSessionCapacityWaitersForRuntimesRow
+		if err := rows.Scan(
+			&i.ID,
+			&i.IssueID,
+			&i.AgentID,
+			&i.WorkspaceID,
+			&i.RuntimeMode,
+		); err != nil {
 			return nil, err
 		}
 		items = append(items, i)
@@ -324,86 +497,71 @@ func (q *Queries) ListOpenCardSessionTokenStatsCandidateIDs(ctx context.Context,
 	return items, nil
 }
 
-const lockIssueForCardSessionTokenStats = `-- name: LockIssueForCardSessionTokenStats :one
-SELECT id
-FROM issue
-WHERE id = $1
-  AND workspace_id = $2
-FOR UPDATE
+const lockCardSessionForTaskTokenStats = `-- name: LockCardSessionForTaskTokenStats :one
+SELECT cs.id
+FROM card_session AS cs
+JOIN agent_task_queue AS task
+  ON task.card_session_id = cs.id
+WHERE task.id = $1
+ORDER BY cs.generation DESC
+LIMIT 1
+FOR UPDATE OF cs
 `
 
-type LockIssueForCardSessionTokenStatsParams struct {
-	IssueID     pgtype.UUID `json:"issue_id"`
-	WorkspaceID pgtype.UUID `json:"workspace_id"`
-}
-
-func (q *Queries) LockIssueForCardSessionTokenStats(ctx context.Context, arg LockIssueForCardSessionTokenStatsParams) (pgtype.UUID, error) {
-	row := q.db.QueryRow(ctx, lockIssueForCardSessionTokenStats, arg.IssueID, arg.WorkspaceID)
+func (q *Queries) LockCardSessionForTaskTokenStats(ctx context.Context, taskID pgtype.UUID) (pgtype.UUID, error) {
+	row := q.db.QueryRow(ctx, lockCardSessionForTaskTokenStats, taskID)
 	var id pgtype.UUID
 	err := row.Scan(&id)
 	return id, err
 }
 
-const lockWorkspaceAndGetCardSessionTokenStats = `-- name: LockWorkspaceAndGetCardSessionTokenStats :one
-SELECT cs.id, cs.workspace_id, cs.issue_id, cs.agent_id, cs.generation, cs.state, cs.provider, cs.provider_session_id, cs.work_dir, cs.opened_at, cs.last_activity_at, cs.done_at, cs.retain_until, cs.closed_at, cs.lease_owner, cs.lease_epoch, cs.lease_heartbeat_at, cs.created_at, cs.updated_at, cs.last_token_stats_at, w.settings AS workspace_settings
-FROM card_session AS cs
-JOIN workspace AS w ON w.id = cs.workspace_id
-WHERE cs.id = $1
-  AND cs.state = 'open'
-FOR UPDATE OF cs
+const lockCardSessionTokenStats = `-- name: LockCardSessionTokenStats :one
+SELECT id
+FROM card_session
+WHERE id = $1
+FOR UPDATE
 `
 
-type LockWorkspaceAndGetCardSessionTokenStatsRow struct {
-	ID                pgtype.UUID        `json:"id"`
-	WorkspaceID       pgtype.UUID        `json:"workspace_id"`
-	IssueID           pgtype.UUID        `json:"issue_id"`
-	AgentID           pgtype.UUID        `json:"agent_id"`
-	Generation        int64              `json:"generation"`
-	State             string             `json:"state"`
-	Provider          string             `json:"provider"`
-	ProviderSessionID pgtype.Text        `json:"provider_session_id"`
-	WorkDir           pgtype.Text        `json:"work_dir"`
-	OpenedAt          pgtype.Timestamptz `json:"opened_at"`
-	LastActivityAt    pgtype.Timestamptz `json:"last_activity_at"`
-	DoneAt            pgtype.Timestamptz `json:"done_at"`
-	RetainUntil       pgtype.Timestamptz `json:"retain_until"`
-	ClosedAt          pgtype.Timestamptz `json:"closed_at"`
-	LeaseOwner        pgtype.Text        `json:"lease_owner"`
-	LeaseEpoch        int64              `json:"lease_epoch"`
-	LeaseHeartbeatAt  pgtype.Timestamptz `json:"lease_heartbeat_at"`
-	CreatedAt         pgtype.Timestamptz `json:"created_at"`
-	UpdatedAt         pgtype.Timestamptz `json:"updated_at"`
-	LastTokenStatsAt  pgtype.Timestamptz `json:"last_token_stats_at"`
-	WorkspaceSettings []byte             `json:"workspace_settings"`
+func (q *Queries) LockCardSessionTokenStats(ctx context.Context, cardSessionID pgtype.UUID) (pgtype.UUID, error) {
+	row := q.db.QueryRow(ctx, lockCardSessionTokenStats, cardSessionID)
+	var id pgtype.UUID
+	err := row.Scan(&id)
+	return id, err
 }
 
-func (q *Queries) LockWorkspaceAndGetCardSessionTokenStats(ctx context.Context, id pgtype.UUID) (LockWorkspaceAndGetCardSessionTokenStatsRow, error) {
-	row := q.db.QueryRow(ctx, lockWorkspaceAndGetCardSessionTokenStats, id)
-	var i LockWorkspaceAndGetCardSessionTokenStatsRow
-	err := row.Scan(
-		&i.ID,
-		&i.WorkspaceID,
-		&i.IssueID,
-		&i.AgentID,
-		&i.Generation,
-		&i.State,
-		&i.Provider,
-		&i.ProviderSessionID,
-		&i.WorkDir,
-		&i.OpenedAt,
-		&i.LastActivityAt,
-		&i.DoneAt,
-		&i.RetainUntil,
-		&i.ClosedAt,
-		&i.LeaseOwner,
-		&i.LeaseEpoch,
-		&i.LeaseHeartbeatAt,
-		&i.CreatedAt,
-		&i.UpdatedAt,
-		&i.LastTokenStatsAt,
-		&i.WorkspaceSettings,
-	)
-	return i, err
+const lockIssueForCardSession = `-- name: LockIssueForCardSession :one
+SELECT id
+FROM issue
+WHERE id = $1
+  AND workspace_id = $2
+FOR KEY SHARE
+`
+
+type LockIssueForCardSessionParams struct {
+	ID          pgtype.UUID `json:"id"`
+	WorkspaceID pgtype.UUID `json:"workspace_id"`
+}
+
+// Serialize generation allocation with issue deletion. DeleteIssue takes
+// FOR UPDATE on the issue before removing card sessions; this key-share lock
+// prevents a concurrent allocator from inserting an orphan after deletion.
+func (q *Queries) LockIssueForCardSession(ctx context.Context, arg LockIssueForCardSessionParams) (pgtype.UUID, error) {
+	row := q.db.QueryRow(ctx, lockIssueForCardSession, arg.ID, arg.WorkspaceID)
+	var id pgtype.UUID
+	err := row.Scan(&id)
+	return id, err
+}
+
+const lockIssueTaskLifecycle = `-- name: LockIssueTaskLifecycle :exec
+SELECT lock_issue_task_lifecycle($1)
+`
+
+// Shares the transaction-scoped lock used by the issue status trigger. Keep
+// this as a separate statement before reading status so READ COMMITTED takes
+// a fresh snapshot after any transition that held the lock first.
+func (q *Queries) LockIssueTaskLifecycle(ctx context.Context, pIssueID pgtype.UUID) error {
+	_, err := q.db.Exec(ctx, lockIssueTaskLifecycle, pIssueID)
+	return err
 }
 
 const lockWorkspaceForCardSession = `-- name: LockWorkspaceForCardSession :one
@@ -426,149 +584,77 @@ func (q *Queries) LockWorkspaceForCardSession(ctx context.Context, id pgtype.UUI
 	return i, err
 }
 
-const markCardSessionsTerminal = `-- name: MarkCardSessionsTerminal :many
-UPDATE card_session
-SET state = 'done_retained',
-    done_at = now(),
-    retain_until = now() + ($2::bigint * interval '1 hour'),
-    lease_owner = NULL,
-    lease_heartbeat_at = NULL,
-    last_activity_at = now(),
-    updated_at = now()
-WHERE issue_id = $1
-  AND card_session.workspace_id = $3
-  AND state = 'open'
-  AND EXISTS (
-      SELECT 1
-      FROM issue
-      WHERE issue.id = card_session.issue_id
-        AND issue.workspace_id = card_session.workspace_id
-        AND issue_effective_status(issue.workspace_id, issue.status) IN ('done', 'cancelled')
-  )
-RETURNING id, workspace_id, issue_id, agent_id, generation, state, provider, provider_session_id, work_dir, opened_at, last_activity_at, done_at, retain_until, closed_at, lease_owner, lease_epoch, lease_heartbeat_at, created_at, updated_at, last_token_stats_at
-`
-
-type MarkCardSessionsTerminalParams struct {
-	IssueID        pgtype.UUID `json:"issue_id"`
-	RetentionHours int64       `json:"retention_hours"`
-	WorkspaceID    pgtype.UUID `json:"workspace_id"`
-}
-
-// Only a status transition handler may call this query. It moves sessions into
-// the retention state for either terminal category; physical close is a
-// separate expiry operation below.
-func (q *Queries) MarkCardSessionsTerminal(ctx context.Context, arg MarkCardSessionsTerminalParams) ([]CardSession, error) {
-	rows, err := q.db.Query(ctx, markCardSessionsTerminal, arg.IssueID, arg.RetentionHours, arg.WorkspaceID)
-	if err != nil {
-		return nil, err
-	}
-	defer rows.Close()
-	items := []CardSession{}
-	for rows.Next() {
-		var i CardSession
-		if err := rows.Scan(
-			&i.ID,
-			&i.WorkspaceID,
-			&i.IssueID,
-			&i.AgentID,
-			&i.Generation,
-			&i.State,
-			&i.Provider,
-			&i.ProviderSessionID,
-			&i.WorkDir,
-			&i.OpenedAt,
-			&i.LastActivityAt,
-			&i.DoneAt,
-			&i.RetainUntil,
-			&i.ClosedAt,
-			&i.LeaseOwner,
-			&i.LeaseEpoch,
-			&i.LeaseHeartbeatAt,
-			&i.CreatedAt,
-			&i.UpdatedAt,
-			&i.LastTokenStatsAt,
-		); err != nil {
-			return nil, err
-		}
-		items = append(items, i)
-	}
-	if err := rows.Err(); err != nil {
-		return nil, err
-	}
-	return items, nil
-}
-
-const reopenCardSession = `-- name: ReopenCardSession :one
-UPDATE card_session
-SET state = 'open',
-    done_at = NULL,
-    retain_until = NULL,
-    closed_at = NULL,
-    last_activity_at = now(),
-    updated_at = now()
+const releaseCardSessionCapacityWaiter = `-- name: ReleaseCardSessionCapacityWaiter :execrows
+UPDATE agent_task_queue
+SET context = COALESCE(context, '{}'::jsonb) - 'card_session_capacity_pending'
 WHERE id = $1
-  AND state = 'done_retained'
-  AND retain_until > now()
-RETURNING id, workspace_id, issue_id, agent_id, generation, state, provider, provider_session_id, work_dir, opened_at, last_activity_at, done_at, retain_until, closed_at, lease_owner, lease_epoch, lease_heartbeat_at, created_at, updated_at, last_token_stats_at
+  AND status = 'deferred'
+  AND context->>'card_session_capacity_pending' = 'true'
 `
 
-func (q *Queries) ReopenCardSession(ctx context.Context, id pgtype.UUID) (CardSession, error) {
-	row := q.db.QueryRow(ctx, reopenCardSession, id)
-	var i CardSession
-	err := row.Scan(
-		&i.ID,
-		&i.WorkspaceID,
-		&i.IssueID,
-		&i.AgentID,
-		&i.Generation,
-		&i.State,
-		&i.Provider,
-		&i.ProviderSessionID,
-		&i.WorkDir,
-		&i.OpenedAt,
-		&i.LastActivityAt,
-		&i.DoneAt,
-		&i.RetainUntil,
-		&i.ClosedAt,
-		&i.LeaseOwner,
-		&i.LeaseEpoch,
-		&i.LeaseHeartbeatAt,
-		&i.CreatedAt,
-		&i.UpdatedAt,
-		&i.LastTokenStatsAt,
-	)
-	return i, err
+func (q *Queries) ReleaseCardSessionCapacityWaiter(ctx context.Context, id pgtype.UUID) (int64, error) {
+	result, err := q.db.Exec(ctx, releaseCardSessionCapacityWaiter, id)
+	if err != nil {
+		return 0, err
+	}
+	return result.RowsAffected(), nil
 }
 
-const reopenCardSessionsForIssue = `-- name: ReopenCardSessionsForIssue :many
-UPDATE card_session
-SET state = 'open',
-    done_at = NULL,
-    retain_until = NULL,
-    closed_at = NULL,
-    last_activity_at = now(),
-    updated_at = now()
-WHERE issue_id = $1
-  AND card_session.workspace_id = $2
-  AND state = 'done_retained'
-  AND EXISTS (
-      SELECT 1
-      FROM issue
-      WHERE issue.id = card_session.issue_id
-        AND issue.workspace_id = card_session.workspace_id
-        AND issue_effective_status(issue.workspace_id, issue.status) NOT IN ('done', 'cancelled')
-  )
-  AND retain_until > now()
-RETURNING id, workspace_id, issue_id, agent_id, generation, state, provider, provider_session_id, work_dir, opened_at, last_activity_at, done_at, retain_until, closed_at, lease_owner, lease_epoch, lease_heartbeat_at, created_at, updated_at, last_token_stats_at
+const retryCardSessionCapacityWaiter = `-- name: RetryCardSessionCapacityWaiter :execrows
+UPDATE agent_task_queue
+SET fire_at = now() + make_interval(secs => $1::double precision)
+WHERE id = $2
+  AND status = 'deferred'
+  AND context->>'card_session_capacity_pending' = 'true'
 `
 
-type ReopenCardSessionsForIssueParams struct {
+type RetryCardSessionCapacityWaiterParams struct {
+	RetryDelaySeconds float64     `json:"retry_delay_seconds"`
+	ID                pgtype.UUID `json:"id"`
+}
+
+func (q *Queries) RetryCardSessionCapacityWaiter(ctx context.Context, arg RetryCardSessionCapacityWaiterParams) (int64, error) {
+	result, err := q.db.Exec(ctx, retryCardSessionCapacityWaiter, arg.RetryDelaySeconds, arg.ID)
+	if err != nil {
+		return 0, err
+	}
+	return result.RowsAffected(), nil
+}
+
+const syncCardSessionsForIssue = `-- name: SyncCardSessionsForIssue :many
+UPDATE card_session AS cs
+SET state = 'paused',
+    pause_reason = CASE
+        WHEN issue_status_allows_agent_task(issue.workspace_id, issue.status) THEN 'unassigned'
+        ELSE issue_effective_status(issue.workspace_id, issue.status)
+    END,
+    last_activity_at = now(),
+    updated_at = now()
+FROM issue
+WHERE cs.issue_id = $1
+  AND cs.workspace_id = $2
+  AND issue.id = cs.issue_id
+  AND issue.workspace_id = cs.workspace_id
+  AND cs.state <> 'closed'
+  AND (
+      NOT issue_status_allows_agent_task(issue.workspace_id, issue.status)
+      OR issue.assignee_type IS DISTINCT FROM 'agent'
+      OR issue.assignee_id IS NULL
+      OR cs.agent_id <> issue.assignee_id
+  )
+RETURNING cs.id, cs.workspace_id, cs.issue_id, cs.agent_id, cs.generation, cs.state, cs.provider, cs.provider_session_id, cs.work_dir, cs.opened_at, cs.last_activity_at, cs.done_at, cs.retain_until, cs.closed_at, cs.lease_owner, cs.lease_epoch, cs.lease_heartbeat_at, cs.created_at, cs.updated_at, cs.last_token_stats_at, cs.pause_reason, cs.token_input_tokens, cs.token_output_tokens, cs.token_cache_read_tokens, cs.token_cache_write_tokens, cs.token_task_count
+`
+
+type SyncCardSessionsForIssueParams struct {
 	IssueID     pgtype.UUID `json:"issue_id"`
 	WorkspaceID pgtype.UUID `json:"workspace_id"`
 }
 
-func (q *Queries) ReopenCardSessionsForIssue(ctx context.Context, arg ReopenCardSessionsForIssueParams) ([]CardSession, error) {
-	rows, err := q.db.Query(ctx, reopenCardSessionsForIssue, arg.IssueID, arg.WorkspaceID)
+// The issue trigger is authoritative for direct SQL and webhook updates. This
+// query pauses generations for inactive issues and previous assignees. Active
+// assigned sessions are opened by EnsureCardSession after capacity checks.
+func (q *Queries) SyncCardSessionsForIssue(ctx context.Context, arg SyncCardSessionsForIssueParams) ([]CardSession, error) {
+	rows, err := q.db.Query(ctx, syncCardSessionsForIssue, arg.IssueID, arg.WorkspaceID)
 	if err != nil {
 		return nil, err
 	}
@@ -597,6 +683,12 @@ func (q *Queries) ReopenCardSessionsForIssue(ctx context.Context, arg ReopenCard
 			&i.CreatedAt,
 			&i.UpdatedAt,
 			&i.LastTokenStatsAt,
+			&i.PauseReason,
+			&i.TokenInputTokens,
+			&i.TokenOutputTokens,
+			&i.TokenCacheReadTokens,
+			&i.TokenCacheWriteTokens,
+			&i.TokenTaskCount,
 		); err != nil {
 			return nil, err
 		}
@@ -610,10 +702,13 @@ func (q *Queries) ReopenCardSessionsForIssue(ctx context.Context, arg ReopenCard
 
 const touchCardSession = `-- name: TouchCardSession :one
 UPDATE card_session
-SET last_activity_at = now(), updated_at = now()
+SET state = 'open',
+    pause_reason = NULL,
+    last_activity_at = now(),
+    updated_at = now()
 WHERE id = $1
   AND state <> 'closed'
-RETURNING id, workspace_id, issue_id, agent_id, generation, state, provider, provider_session_id, work_dir, opened_at, last_activity_at, done_at, retain_until, closed_at, lease_owner, lease_epoch, lease_heartbeat_at, created_at, updated_at, last_token_stats_at
+RETURNING id, workspace_id, issue_id, agent_id, generation, state, provider, provider_session_id, work_dir, opened_at, last_activity_at, done_at, retain_until, closed_at, lease_owner, lease_epoch, lease_heartbeat_at, created_at, updated_at, last_token_stats_at, pause_reason, token_input_tokens, token_output_tokens, token_cache_read_tokens, token_cache_write_tokens, token_task_count
 `
 
 func (q *Queries) TouchCardSession(ctx context.Context, id pgtype.UUID) (CardSession, error) {
@@ -640,8 +735,31 @@ func (q *Queries) TouchCardSession(ctx context.Context, id pgtype.UUID) (CardSes
 		&i.CreatedAt,
 		&i.UpdatedAt,
 		&i.LastTokenStatsAt,
+		&i.PauseReason,
+		&i.TokenInputTokens,
+		&i.TokenOutputTokens,
+		&i.TokenCacheReadTokens,
+		&i.TokenCacheWriteTokens,
+		&i.TokenTaskCount,
 	)
 	return i, err
+}
+
+const touchCardSessionsForTasks = `-- name: TouchCardSessionsForTasks :exec
+UPDATE card_session AS cs
+SET last_activity_at = now(),
+    updated_at = now()
+FROM agent_task_queue AS task
+WHERE task.id = ANY($1::uuid[])
+  AND task.card_session_id = cs.id
+  AND cs.state <> 'closed'
+`
+
+// Provider usage and committed task transitions advance activity after their
+// owning transaction, avoiding a task-row -> card-session lock cycle.
+func (q *Queries) TouchCardSessionsForTasks(ctx context.Context, taskIds []pgtype.UUID) error {
+	_, err := q.db.Exec(ctx, touchCardSessionsForTasks, taskIds)
+	return err
 }
 
 const updateCardSessionProviderStateByTask = `-- name: UpdateCardSessionProviderStateByTask :exec
@@ -650,11 +768,23 @@ SET provider_session_id = COALESCE(NULLIF($2, ''), cs.provider_session_id),
     work_dir = COALESCE(NULLIF($3, ''), cs.work_dir),
     last_activity_at = now(),
     updated_at = now()
-FROM agent_task_queue AS t
+FROM agent_task_queue AS t, workspace AS w
 WHERE t.id = $1
-  AND t.issue_id = cs.issue_id
-  AND t.agent_id = cs.agent_id
-  AND cs.state <> 'closed'
+  AND t.card_session_id = cs.id
+  AND w.id = cs.workspace_id
+  AND (
+      (t.status IN ('dispatched', 'running') AND cs.state = 'open')
+      OR (
+          t.status = 'cancelled'
+          AND cs.state = 'paused'
+          AND cs.pause_reason = 'cancelled'
+          AND cs.last_activity_at > now() - make_interval(hours => CASE
+              WHEN w.settings->'card_sessions'->>'idle_timeout_hours' ~ '^[0-9]{1,3}$'
+                  THEN GREATEST(1, LEAST(999, (w.settings->'card_sessions'->>'idle_timeout_hours')::INTEGER))
+              ELSE 24
+          END)
+      )
+  )
 `
 
 type UpdateCardSessionProviderStateByTaskParams struct {
@@ -668,20 +798,37 @@ func (q *Queries) UpdateCardSessionProviderStateByTask(ctx context.Context, arg 
 	return err
 }
 
-const updateCardSessionTokenStatsAt = `-- name: UpdateCardSessionTokenStatsAt :exec
+const updateCardSessionTokenStats = `-- name: UpdateCardSessionTokenStats :exec
 UPDATE card_session
-SET last_token_stats_at = $1,
+SET token_input_tokens = $1,
+    token_output_tokens = $2,
+    token_cache_read_tokens = $3,
+    token_cache_write_tokens = $4,
+    token_task_count = $5,
+    last_token_stats_at = $6,
     updated_at = now()
-WHERE id = $2
-  AND state = 'open'
+WHERE id = $7
 `
 
-type UpdateCardSessionTokenStatsAtParams struct {
-	PublishedAt pgtype.Timestamptz `json:"published_at"`
-	ID          pgtype.UUID        `json:"id"`
+type UpdateCardSessionTokenStatsParams struct {
+	InputTokens      int64              `json:"input_tokens"`
+	OutputTokens     int64              `json:"output_tokens"`
+	CacheReadTokens  int64              `json:"cache_read_tokens"`
+	CacheWriteTokens int64              `json:"cache_write_tokens"`
+	TaskCount        int64              `json:"task_count"`
+	LatestUsageAt    pgtype.Timestamptz `json:"latest_usage_at"`
+	CardSessionID    pgtype.UUID        `json:"card_session_id"`
 }
 
-func (q *Queries) UpdateCardSessionTokenStatsAt(ctx context.Context, arg UpdateCardSessionTokenStatsAtParams) error {
-	_, err := q.db.Exec(ctx, updateCardSessionTokenStatsAt, arg.PublishedAt, arg.ID)
+func (q *Queries) UpdateCardSessionTokenStats(ctx context.Context, arg UpdateCardSessionTokenStatsParams) error {
+	_, err := q.db.Exec(ctx, updateCardSessionTokenStats,
+		arg.InputTokens,
+		arg.OutputTokens,
+		arg.CacheReadTokens,
+		arg.CacheWriteTokens,
+		arg.TaskCount,
+		arg.LatestUsageAt,
+		arg.CardSessionID,
+	)
 	return err
 }

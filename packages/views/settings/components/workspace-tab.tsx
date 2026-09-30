@@ -54,15 +54,13 @@ interface WorkspaceDetailsDraft {
 }
 
 interface CardSessionSettingsDraft {
-  postDoneRetentionHours: string;
+  idleTimeoutHours: string;
   maxOpenSessions: string;
-  tokenStatsIntervalMinutes: string;
 }
 
 const defaultCardSessionSettings: CardSessionSettingsDraft = {
-  postDoneRetentionHours: "24",
+  idleTimeoutHours: "24",
   maxOpenSessions: "100",
-  tokenStatsIntervalMinutes: "15",
 };
 
 function readCardSessionSettings(workspace: Workspace | null): CardSessionSettingsDraft {
@@ -71,22 +69,21 @@ function readCardSessionSettings(workspace: Workspace | null): CardSessionSettin
     return defaultCardSessionSettings;
   }
   const settings = raw as Record<string, unknown>;
+  const idleTimeoutHours =
+    typeof settings.idle_timeout_hours === "number" &&
+    Number.isFinite(settings.idle_timeout_hours)
+      ? settings.idle_timeout_hours
+      : settings.post_done_retention_hours;
   return {
-    postDoneRetentionHours:
-      typeof settings.post_done_retention_hours === "number" &&
-      Number.isFinite(settings.post_done_retention_hours)
-        ? String(settings.post_done_retention_hours)
-        : defaultCardSessionSettings.postDoneRetentionHours,
+    idleTimeoutHours:
+      typeof idleTimeoutHours === "number" && Number.isFinite(idleTimeoutHours)
+        ? String(idleTimeoutHours)
+        : defaultCardSessionSettings.idleTimeoutHours,
     maxOpenSessions:
       typeof settings.max_open_sessions === "number" &&
       Number.isFinite(settings.max_open_sessions)
         ? String(settings.max_open_sessions)
         : defaultCardSessionSettings.maxOpenSessions,
-    tokenStatsIntervalMinutes:
-      typeof settings.token_stats_interval_minutes === "number" &&
-      Number.isFinite(settings.token_stats_interval_minutes)
-        ? String(settings.token_stats_interval_minutes)
-        : defaultCardSessionSettings.tokenStatsIntervalMinutes,
   };
 }
 
@@ -95,9 +92,8 @@ function cardSessionSettingsEqual(
   right: CardSessionSettingsDraft,
 ) {
   return (
-    left.postDoneRetentionHours === right.postDoneRetentionHours &&
-    left.maxOpenSessions === right.maxOpenSessions &&
-    left.tokenStatsIntervalMinutes === right.tokenStatsIntervalMinutes
+    left.idleTimeoutHours === right.idleTimeoutHours &&
+    left.maxOpenSessions === right.maxOpenSessions
   );
 }
 
@@ -179,14 +175,11 @@ export function WorkspaceTab() {
   const [description, setDescription] = useState(workspace?.description ?? "");
   const [context, setContext] = useState(workspace?.context ?? "");
   const [issuePrefix, setIssuePrefix] = useState(workspace?.issue_prefix ?? "");
-  const [postDoneRetentionHours, setPostDoneRetentionHours] = useState(
-    readCardSessionSettings(workspace).postDoneRetentionHours,
+  const [idleTimeoutHours, setIdleTimeoutHours] = useState(
+    readCardSessionSettings(workspace).idleTimeoutHours,
   );
   const [maxOpenSessions, setMaxOpenSessions] = useState(
     readCardSessionSettings(workspace).maxOpenSessions,
-  );
-  const [tokenStatsIntervalMinutes, setTokenStatsIntervalMinutes] = useState(
-    readCardSessionSettings(workspace).tokenStatsIntervalMinutes,
   );
   const [prefixSaveStatus, setPrefixSaveStatus] =
     useState<SettingsSaveStatus>("idle");
@@ -220,9 +213,8 @@ export function WorkspaceTab() {
     setContext(workspace?.context ?? "");
     setIssuePrefix(workspace?.issue_prefix ?? "");
     const cardSessionSettings = readCardSessionSettings(workspace);
-    setPostDoneRetentionHours(cardSessionSettings.postDoneRetentionHours);
+    setIdleTimeoutHours(cardSessionSettings.idleTimeoutHours);
     setMaxOpenSessions(cardSessionSettings.maxOpenSessions);
-    setTokenStatsIntervalMinutes(cardSessionSettings.tokenStatsIntervalMinutes);
     // eslint-disable-next-line react-hooks/exhaustive-deps -- intentionally keyed on id only; see comment above
   }, [workspace?.id]);
 
@@ -278,12 +270,12 @@ export function WorkspaceTab() {
   });
 
   const cardSessionDraft = useMemo(
-    () => ({ postDoneRetentionHours, maxOpenSessions, tokenStatsIntervalMinutes }),
-    [maxOpenSessions, postDoneRetentionHours, tokenStatsIntervalMinutes],
+    () => ({ idleTimeoutHours, maxOpenSessions }),
+    [idleTimeoutHours, maxOpenSessions],
   );
   const savedCardSessionSettings = useMemo(
     () => readCardSessionSettings(workspace),
-    [workspace?.settings],
+    [workspace],
   );
   const saveCardSessionSettings = useCallback(
     async (next: CardSessionSettingsDraft) => {
@@ -295,14 +287,20 @@ export function WorkspaceTab() {
         !Array.isArray(currentSettings.card_sessions)
           ? (currentSettings.card_sessions as Record<string, unknown>)
           : {};
+      const retainedCardSessionSettings = Object.fromEntries(
+        Object.entries(currentCardSessionSettings).filter(
+          ([key]) =>
+            key !== "post_done_retention_hours" &&
+            key !== "token_stats_interval_minutes",
+        ),
+      );
       const updated = await api.updateWorkspace(workspace.id, {
         settings: {
           ...currentSettings,
           card_sessions: {
-            ...currentCardSessionSettings,
-            post_done_retention_hours: Number(next.postDoneRetentionHours),
+            ...retainedCardSessionSettings,
+            idle_timeout_hours: Number(next.idleTimeoutHours),
             max_open_sessions: Number(next.maxOpenSessions),
-            token_stats_interval_minutes: Number(next.tokenStatsIntervalMinutes),
           },
         },
       });
@@ -591,19 +589,19 @@ export function WorkspaceTab() {
       >
         <SettingsCard>
           <SettingsRow
-            label={t(($) => $.workspace.post_done_retention_label)}
-            description={t(($) => $.workspace.post_done_retention_hint)}
+            label={t(($) => $.workspace.idle_timeout_label)}
+            description={t(($) => $.workspace.idle_timeout_hint)}
             size="code"
           >
             <Input
               type="number"
-              name="workspace-post-done-retention-hours"
+              name="workspace-session-idle-timeout-hours"
               min={1}
-              max={720}
+              max={999}
               step={1}
-              aria-label={t(($) => $.workspace.post_done_retention_label)}
-              value={postDoneRetentionHours}
-              onChange={(event) => setPostDoneRetentionHours(event.target.value)}
+              aria-label={t(($) => $.workspace.idle_timeout_label)}
+              value={idleTimeoutHours}
+              onChange={(event) => setIdleTimeoutHours(event.target.value)}
               onBlur={cardSessionAutoSave.flush}
               disabled={!canManageWorkspace}
               className="font-mono"
@@ -623,25 +621,6 @@ export function WorkspaceTab() {
               aria-label={t(($) => $.workspace.max_open_sessions_label)}
               value={maxOpenSessions}
               onChange={(event) => setMaxOpenSessions(event.target.value)}
-              onBlur={cardSessionAutoSave.flush}
-              disabled={!canManageWorkspace}
-              className="font-mono"
-            />
-          </SettingsRow>
-          <SettingsRow
-            label={t(($) => $.workspace.token_stats_interval_label)}
-            description={t(($) => $.workspace.token_stats_interval_hint)}
-            size="code"
-          >
-            <Input
-              type="number"
-              name="workspace-token-stats-interval-minutes"
-              min={1}
-              max={1440}
-              step={1}
-              aria-label={t(($) => $.workspace.token_stats_interval_label)}
-              value={tokenStatsIntervalMinutes}
-              onChange={(event) => setTokenStatsIntervalMinutes(event.target.value)}
               onBlur={cardSessionAutoSave.flush}
               disabled={!canManageWorkspace}
               className="font-mono"

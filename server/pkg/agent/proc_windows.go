@@ -116,7 +116,7 @@ func startOwnedProcessTree(cmd *exec.Cmd, logger *slog.Logger) error {
 		// that cancellation on this host is back to killing the leader alone.
 		logger.Warn("could not take ownership of the agent process tree; cancelling or timing out this "+
 			"process will kill only the direct child and can leave its descendants running",
-			"error", err, "pid", cmd.Process.Pid, "executable", cmd.Path)
+			"error_present", err != nil, "pid", cmd.Process.Pid, "executable_configured", cmd.Path != "")
 	}
 
 	if err := resumeProcess(cmd.Process.Pid); err != nil {

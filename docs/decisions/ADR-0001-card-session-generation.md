@@ -5,45 +5,64 @@
 
 ### Context
 
-Card follow-up comments should continue the same logical generation instead of
-rebuilding a card context for every turn. A provider process can still be
-evicted or restarted, so a provider session ID alone cannot be the source of
-truth. The lifecycle must also protect a work/review generation from arbitrary
-close requests and bound retained resources.
+Card follow-up work should continue a durable per-issue generation. A provider
+process can still be evicted or restarted, so a provider session ID alone cannot
+be the source of truth. The lifecycle also needs to bound retained resources and
+preserve queued work when a workspace reaches its session limit.
 
 ### Decision
 
-Store a server-owned `card_session` generation per issue and agent. Keep it
-open through the work/review flow, retain it for a workspace-configured period
-after `done` or `cancelled`, and reopen the same generation when a comment
-moves the issue to `in_review`. Enforce the workspace open-generation cap under
-a workspace row lock. Make the comment reopen and issue activity update one
-database operation, and enforce status-to-generation synchronization with a
-database trigger so non-HTTP status writers follow the same contract.
+Store a server-owned `card_session` generation per issue and agent. Open it when
+an assigned issue enters `todo`; keep it open through `todo`, `in_progress`,
+`in_review`, and `done`. Do not create a generation for a new issue in
+`backlog`. Pause the generation in `backlog`, `blocked`, and `cancelled`; resume
+the same generation when the issue returns to active work before the idle
+timeout expires.
 
-Persist the latest provider session/workdir pointer when the daemon pins a
-task session. Use provider-specific rejoin/resume when available and retain a
-fresh-session fallback for rejected or poisoned sessions. Do not keep an
-unbounded provider process alive merely because the logical generation is
-retained.
+Do not backfill empty generations for issues already assigned to `todo` during
+upgrade. The next task start or comment lazily allocates the first generation.
 
-While a generation is open, publish cumulative token statistics to the card at
-the workspace-configured interval. Store the publication watermark on the
-generation and commit it with the system comment so concurrent runtime
-sweepers cannot duplicate a snapshot. Scope usage to the generation's opening
-time and matching issue/agent rather than mixing previous generations.
+Moving an issue to `cancelled` immediately cancels its unfinished tasks. The
+cancelled generation stays paused with its provider resume data until expiry.
+A follow-up comment on `done` or `cancelled` moves the issue to `in_review` and
+resumes the same generation when it is still within the idle timeout.
+
+Use one workspace setting, `idle_timeout_hours`, with a default of 24 hours and
+a range of 1–999. Never expire a generation with `running`, `dispatched`, or
+`waiting_local_directory` work. In an active status, queued or deferred work
+also protects the generation. A paused generation for `backlog`, `blocked`, or
+`cancelled` may expire with queued or deferred work; that work remains queued
+and starts a new generation when the issue returns to an active status. A
+capacity-paused generation on an active issue keeps its generation while
+queued or deferred work remains. Use `max_open_sessions` to limit open
+generations; its default is 100. Keep capacity-blocked tasks deferred until a
+slot becomes available. Generation allocation and issue-driven lifecycle
+changes serialize on the workspace row lock. The global idle-expiry sweeper
+does not acquire that lock; its guarded update and close trigger reject expiry
+when the idle deadline has not passed or unfinished work still protects the
+generation.
+
+Persist each task's provider session ID and work directory on the exact
+generation linked to that task. Use provider-specific resume or rejoin after a
+daemon or process restart when supported, with a fresh-session fallback when
+resume fails. The generation survives restarts; it does not keep a provider
+process running for its entire lifetime.
+
+Refresh cumulative token totals in the background after each accepted provider
+usage update. Read totals from `task_usage`, scope them to the generation and
+its tasks, and use a recovery sweep after restart. Do not publish token
+statistics as card comments or agent input. The feature does not require an
+agent final-summary comment and does not include token-savings measurement.
 
 ### Consequences
 
-The same generation survives `done → in_review`, daemon restarts, and provider
-resume attempts while the retention window is valid. Expiry, capacity, and
-intermediate token usage are observable and bounded. The first slice does not
-yet provide a long-lived provider host or token-savings measurement; those
-remain a separate runtime implementation and evaluation step.
+The same generation survives active status changes and can resume after a
+temporary pause. A stale generation is closed before a new one is allocated;
+active and queued work is not interrupted or lost to idle expiry. Provider
+state remains scoped to one task and generation. Token totals update without
+creating new agent triggers.
 
-The experimental lifecycle also has a separately toggleable diagnostic layer:
-`MULTICA_CARD_SESSION_OBSERVABILITY_ENABLED` gates structured lifecycle logs
-and the `multica_card_session_*` Prometheus families. It uses bounded labels
-and excludes prompts, provider session IDs, work directories, and token
-payloads, so disabling the layer does not alter lifecycle state or ordinary
-task metrics.
+The implementation keeps using the existing task queue and provider resume
+paths. It does not add a separate always-running provider host. Lifecycle
+diagnostics remain separately configurable and avoid session identifiers,
+work directories, prompts, and token payloads in metric labels.
