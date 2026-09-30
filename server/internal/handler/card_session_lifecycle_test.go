@@ -108,6 +108,64 @@ func TestCardSessionDoneStaysOpenAndCancelledPausesUntilComment(t *testing.T) {
 	}
 }
 
+func TestTerminalTaskPersistsCardSessionProviderState(t *testing.T) {
+	if testHandler == nil || testPool == nil {
+		t.Skip("database not available")
+	}
+
+	ctx := context.Background()
+	_, runtimeID, agentID, _, issueID := createCardSessionCapacityFixture(t, ctx)
+	issue, err := testHandler.Queries.GetIssue(ctx, util.MustParseUUID(issueID))
+	if err != nil {
+		t.Fatalf("load issue: %v", err)
+	}
+	agent, err := testHandler.Queries.GetAgent(ctx, util.MustParseUUID(agentID))
+	if err != nil {
+		t.Fatalf("load agent: %v", err)
+	}
+	session, err := testHandler.TaskService.EnsureCardSession(ctx, issue.ID, issue.WorkspaceID, agent.ID, agent.RuntimeMode)
+	if err != nil {
+		t.Fatalf("open card session: %v", err)
+	}
+
+	var taskID pgtype.UUID
+	if err := testPool.QueryRow(ctx, `
+		INSERT INTO agent_task_queue (
+			agent_id, runtime_id, issue_id, card_session_id, status, priority, started_at
+		)
+		VALUES ($1, $2, $3, $4, 'running', 0, now())
+		RETURNING id`, agentID, runtimeID, issueID, session.ID).Scan(&taskID); err != nil {
+		t.Fatalf("insert running task: %v", err)
+	}
+	t.Cleanup(func() {
+		_, _ = testPool.Exec(context.Background(), `DELETE FROM agent_task_queue WHERE id = $1`, taskID)
+	})
+
+	if _, err := testHandler.TaskService.CompleteTask(
+		ctx,
+		taskID,
+		[]byte(`{"output":"terminal turn"}`),
+		"terminal-provider-session",
+		"/tmp/terminal-card-session",
+		"",
+		false,
+		"",
+		"",
+	); err != nil {
+		t.Fatalf("complete task: %v", err)
+	}
+
+	var providerSessionID, workDir string
+	if err := testPool.QueryRow(ctx, `
+		SELECT provider_session_id, work_dir
+		FROM card_session WHERE id = $1`, session.ID).Scan(&providerSessionID, &workDir); err != nil {
+		t.Fatalf("read terminal card session pointer: %v", err)
+	}
+	if providerSessionID != "terminal-provider-session" || workDir != "/tmp/terminal-card-session" {
+		t.Fatalf("terminal card session pointer = (%q, %q), want final provider state", providerSessionID, workDir)
+	}
+}
+
 func TestCancelledIssueCancelsOnlyItsTasksAfterRequestDisconnect(t *testing.T) {
 	if testHandler == nil || testPool == nil {
 		t.Skip("database not available")
