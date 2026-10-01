@@ -226,18 +226,31 @@ func (q *Queries) CountNewCommentsSince(ctx context.Context, arg CountNewComment
 const createComment = `-- name: CreateComment :one
 WITH touched_issue AS (
     UPDATE issue SET
+        status = CASE
+            WHEN issue_effective_status(issue.workspace_id, issue.status) IN ('done', 'cancelled') THEN 'in_review'
+            ELSE issue.status
+        END,
+        position = CASE
+            WHEN issue_effective_status(issue.workspace_id, issue.status) IN ('done', 'cancelled') THEN (
+                SELECT COALESCE(MIN(target.position), 0) - 1
+                FROM issue AS target
+                WHERE target.workspace_id = issue.workspace_id
+                  AND target.status = 'in_review'
+            )
+            ELSE issue.position
+        END,
         updated_at = now(),
         revision = revision + 1,
         last_activity_at = GREATEST(COALESCE(last_activity_at, updated_at), now())
     WHERE issue.id = $1 AND issue.workspace_id = $2
-    RETURNING issue.id, issue.workspace_id, issue.revision
+    RETURNING issue.id, issue.workspace_id, issue.revision, issue.status
 ), inserted_comment AS (
     INSERT INTO comment (issue_id, workspace_id, author_type, author_id, content, type, parent_id, source_task_id, quick_action_id, via_plugin_id, suppressed_agent_ids, id)
     SELECT ti.id, ti.workspace_id, $3, $4, $5, $6, $7, $8, $9, $10, $11::uuid[], COALESCE($12::uuid, gen_random_uuid())
     FROM touched_issue ti
     RETURNING id, issue_id, author_type, author_id, content, type, created_at, updated_at, parent_id, workspace_id, resolved_at, resolved_by_type, resolved_by_id, source_task_id, quick_action_id, via_plugin_id, revision, recovery_settled_at, deleted_at, suppressed_agent_ids
 )
-SELECT inserted_comment.id, inserted_comment.issue_id, inserted_comment.author_type, inserted_comment.author_id, inserted_comment.content, inserted_comment.type, inserted_comment.created_at, inserted_comment.updated_at, inserted_comment.parent_id, inserted_comment.workspace_id, inserted_comment.resolved_at, inserted_comment.resolved_by_type, inserted_comment.resolved_by_id, inserted_comment.source_task_id, inserted_comment.quick_action_id, inserted_comment.via_plugin_id, inserted_comment.revision, inserted_comment.recovery_settled_at, inserted_comment.deleted_at, inserted_comment.suppressed_agent_ids, touched_issue.revision AS issue_revision
+SELECT inserted_comment.id, inserted_comment.issue_id, inserted_comment.author_type, inserted_comment.author_id, inserted_comment.content, inserted_comment.type, inserted_comment.created_at, inserted_comment.updated_at, inserted_comment.parent_id, inserted_comment.workspace_id, inserted_comment.resolved_at, inserted_comment.resolved_by_type, inserted_comment.resolved_by_id, inserted_comment.source_task_id, inserted_comment.quick_action_id, inserted_comment.via_plugin_id, inserted_comment.revision, inserted_comment.recovery_settled_at, inserted_comment.deleted_at, inserted_comment.suppressed_agent_ids, touched_issue.revision AS issue_revision, touched_issue.status AS issue_status
 FROM inserted_comment
 JOIN touched_issue ON touched_issue.id = inserted_comment.issue_id
 `
@@ -279,12 +292,13 @@ type CreateCommentRow struct {
 	DeletedAt          pgtype.Timestamptz `json:"deleted_at"`
 	SuppressedAgentIds []pgtype.UUID      `json:"suppressed_agent_ids"`
 	IssueRevision      int64              `json:"issue_revision"`
+	IssueStatus        string             `json:"issue_status"`
 }
 
 // A new comment counts as activity on its issue, so the same statement bumps
 // the parent issue's updated_at and last_activity_at. The touch is a leading data-modifying CTE and
 // the INSERT selects the issue/workspace back out of it, which makes the two
-// inseparable and gives two query-level guarantees:
+// inseparable and gives three query-level guarantees:
 //   - atomicity — the insert and the timestamp bump commit or roll back
 //     together, so an issue is never left with a stale updated_at after a
 //     comment persists; and
@@ -293,6 +307,10 @@ type CreateCommentRow struct {
 //     pair matches 0 rows in the CTE, the dependent INSERT then selects nothing,
 //     and the :one query returns pgx.ErrNoRows. A wrong workspace can therefore
 //     never leave a mis-attributed comment or a silently un-touched issue.
+//   - terminal reopen — a comment is the supported follow-up after Done or
+//     Cancelled, so the same statement changes a terminal-category issue to
+//     in_review. The issue status trigger reopens the retained card generation
+//     in that transaction.
 //
 // Centralizing this here means every comment entrypoint inherits both
 // guarantees regardless of what a caller passes. The "Updated date" sort and
@@ -335,6 +353,7 @@ func (q *Queries) CreateComment(ctx context.Context, arg CreateCommentParams) (C
 		&i.DeletedAt,
 		&i.SuppressedAgentIds,
 		&i.IssueRevision,
+		&i.IssueStatus,
 	)
 	return i, err
 }

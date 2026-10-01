@@ -10,6 +10,7 @@ import (
 	"log/slog"
 	"os"
 	"os/exec"
+	"path/filepath"
 	"regexp"
 	"sort"
 	"strings"
@@ -2176,7 +2177,7 @@ func discoverACPModels(ctx context.Context, runtimeCmd Command, p acpDiscoveryPr
 		// really has no models". Log the top-level keys only — never the
 		// response body, which carries session ids and account-shaped data.
 		slog.Debug("ACP model discovery found no models in session/new response",
-			"binary", runtimeCmd.Path,
+			"binary", filepath.Base(runtimeCmd.Path),
 			"result_keys", strings.Join(acpResultTopLevelKeys(sessionResult), ","),
 		)
 	}
@@ -2479,7 +2480,7 @@ func discoverGrokModels(ctx context.Context, runtimeCmd Command) (Catalog, error
 	})
 	if err != nil || len(models) == 0 {
 		if err != nil {
-			slog.Debug("grok model discovery fell back to static catalog", "error", err)
+			slog.Debug("grok model discovery fell back to static catalog", "error_present", err != nil)
 		}
 		return Catalog{Models: grokStaticModels(), Fallback: true}, nil
 	}
@@ -2911,7 +2912,7 @@ func discoverCodebuddyModels(ctx context.Context, runtimeCmd Command) (Catalog, 
 	})
 	if err != nil || len(models) == 0 {
 		if err != nil {
-			slog.Debug("codebuddy model discovery fell back to static catalog", "error", err)
+			slog.Debug("codebuddy model discovery fell back to static catalog", "error_present", err != nil)
 		}
 		return codebuddyFallbackCatalog(), nil
 	}
@@ -2995,7 +2996,7 @@ func discoverDimModels(ctx context.Context, runtimeCmd Command) (Catalog, error)
 	})
 	if err != nil || len(models) == 0 {
 		if err != nil {
-			slog.Debug("dim model discovery failed; falling back to manual entry", "error", err)
+			slog.Debug("dim model discovery failed; falling back to manual entry", "error_present", err != nil)
 		}
 		return Catalog{Models: []Model{}, Fallback: true}, nil
 	}

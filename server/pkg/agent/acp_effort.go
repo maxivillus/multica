@@ -279,7 +279,7 @@ func applyACPEffortOption(
 			"config_id", option.ConfigID,
 			"requested_level", level,
 			"effective_level", "unchanged",
-			"error", err,
+			"error_present", err != nil,
 		)
 		return
 	}

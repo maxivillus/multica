@@ -16,6 +16,7 @@ import (
 	"github.com/jackc/pgx/v5/pgconn"
 	"github.com/jackc/pgx/v5/pgtype"
 	"github.com/multica-ai/multica/server/internal/analytics"
+	"github.com/multica-ai/multica/server/internal/cardsession"
 	"github.com/multica-ai/multica/server/internal/issuestatus"
 	"github.com/multica-ai/multica/server/internal/logger"
 	obsmetrics "github.com/multica-ai/multica/server/internal/metrics"
@@ -412,7 +413,15 @@ func (h *Handler) UpdateWorkspace(w http.ResponseWriter, r *http.Request) {
 			}
 			reconcilePRMergeSettings(stored, incoming)
 		}
-		s, _ := json.Marshal(req.Settings)
+		s, err := json.Marshal(req.Settings)
+		if err != nil {
+			writeError(w, http.StatusBadRequest, "invalid workspace settings")
+			return
+		}
+		if _, err := cardsession.Parse(s); err != nil {
+			writeError(w, http.StatusBadRequest, err.Error())
+			return
+		}
 		params.Settings = s
 	}
 	if req.Repos != nil {

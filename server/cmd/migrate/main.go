@@ -143,6 +143,12 @@ var concurrentIndexCleanups = map[string]string{
 	"563_search_index_change_changed_at_index":                  "idx_search_index_change_changed_at",
 	"562_search_index_change_workspace_index":                   "idx_search_index_change_workspace_xid",
 	"552_agent_task_history_page_index":                         "idx_agent_task_queue_history_page",
+	"568_card_session_workspace_activity_index":                 "card_session_workspace_activity_idx",
+	"570_agent_task_card_session_index":                         "agent_task_queue_card_session_idx",
+	"571_card_session_one_resumable_per_issue_agent":            "card_session_one_resumable_per_issue_agent",
+	"572_card_session_workspace_state_index":                    "card_session_workspace_state_idx",
+	"573_card_session_issue_index":                              "card_session_issue_idx",
+	"576_issue_task_cancel_outbox_created_index":                "issue_task_cancel_outbox_created_at_idx",
 	"535_github_pr_address_index":                               "idx_github_pull_request_pr_owner_repo",
 	"539_task_supplement_request_index":                         "task_supplement_task_request_uidx",
 	"540_task_supplement_capability_index":                      "task_supplement_capability_task_uidx",
@@ -452,6 +458,13 @@ func refuseChannelChatRouteHistoryRollbackWith(ctx context.Context, query rowQue
 }
 
 var upMigrationConditions = map[string]migrationCondition{
+	// The fork previously used numeric prefixes 420–422 for card-session
+	// migrations. The schema ledger stores full migration names, so apply the
+	// renumbered migrations on fresh databases but preserve their existing DDL
+	// when an older fork ledger already records the corresponding version.
+	"564_card_sessions":                 skipIfMigrationRecorded("420_card_sessions"),
+	"565_card_session_token_stats":      skipIfMigrationRecorded("421_card_session_token_stats"),
+	"566_card_session_cancel_retention": skipIfMigrationRecorded("422_card_session_cancel_retention"),
 	// Preserve applied history; pending 469 is superseded by the bounded expand
 	// migration. SaaS backfills separately; self-host converges in 491.
 	"469_issue_status_lifecycle_categories": skipMigration("superseded by 478 expansion and 491 convergence (MUL-7365)"),
@@ -478,6 +491,12 @@ var upMigrationConditions = map[string]migrationCondition{
 // Migration 463 independently restores the optional issue-description bigram;
 // migration 464's portable trigram rollback is unconditional.
 var downMigrationConditions = map[string]migrationCondition{
+	// A skipped legacy migration must also remain intact during rollback: the
+	// new ledger rows are removed, while the old fork's schema and ledger rows
+	// stay at their original versions.
+	"564_card_sessions":                     skipIfMigrationRecorded("420_card_sessions"),
+	"565_card_session_token_stats":          skipIfMigrationRecorded("421_card_session_token_stats"),
+	"566_card_session_cancel_retention":     skipIfMigrationRecorded("422_card_session_cancel_retention"),
 	"454_drop_comment_content_bigm_index":   whenOperatorClassAvailable(pgBigmOperatorClass),
 	"455_drop_comment_content_trgm_index":   whenOperatorClassUnavailable(pgBigmOperatorClass),
 	"463_drop_issue_description_bigm_index": whenOperatorClassAvailable(pgBigmOperatorClass),
@@ -523,6 +542,23 @@ func conditionsForDirection(direction string) map[string]migrationCondition {
 func skipMigration(reason string) migrationCondition {
 	return func(context.Context, *pgxpool.Conn) (bool, string, error) {
 		return false, reason, nil
+	}
+}
+
+func skipIfMigrationRecorded(legacyVersion string) migrationCondition {
+	return func(ctx context.Context, conn *pgxpool.Conn) (bool, string, error) {
+		var legacyApplied bool
+		if err := conn.QueryRow(ctx, `
+			SELECT EXISTS (
+				SELECT 1 FROM schema_migrations WHERE version = $1
+			)
+		`, legacyVersion).Scan(&legacyApplied); err != nil {
+			return false, "", fmt.Errorf("check legacy migration %q: %w", legacyVersion, err)
+		}
+		if legacyApplied {
+			return false, "legacy migration " + legacyVersion + " is already recorded", nil
+		}
+		return true, "", nil
 	}
 }
 

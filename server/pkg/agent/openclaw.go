@@ -115,7 +115,7 @@ func (b *openclawBackend) Execute(ctx context.Context, prompt string, opts ExecO
 		return nil, fmt.Errorf("start openclaw: %w", err)
 	}
 
-	b.cfg.Logger.Info("openclaw started", "pid", cmd.Process.Pid, "cwd", opts.Cwd, "model", opts.Model)
+	b.cfg.Logger.Info("openclaw started", "pid", cmd.Process.Pid, "cwd_present", opts.Cwd != "", "model", opts.Model)
 
 	msgCh := make(chan Message, 256)
 	resCh := make(chan Result, 1)
@@ -485,7 +485,7 @@ func (b *openclawBackend) processOutput(r io.Reader, ch chan<- Message) openclaw
 				})
 			case "error":
 				errMsg := event.errorMessage()
-				b.cfg.Logger.Warn("openclaw error event", "error", errMsg)
+				b.cfg.Logger.Warn("openclaw error event", "error_present", errMsg != "")
 				trySend(ch, Message{Type: MessageError, Content: errMsg})
 				finalStatus = "failed"
 				finalError = errMsg
@@ -493,7 +493,7 @@ func (b *openclawBackend) processOutput(r io.Reader, ch chan<- Message) openclaw
 				phase := event.Phase
 				if phase == "error" || phase == "failed" || phase == "cancelled" {
 					errMsg := event.errorMessage()
-					b.cfg.Logger.Warn("openclaw lifecycle failure", "phase", phase, "error", errMsg)
+					b.cfg.Logger.Warn("openclaw lifecycle failure", "phase", phase, "error_present", errMsg != "")
 					trySend(ch, Message{Type: MessageError, Content: errMsg})
 					finalStatus = "failed"
 					finalError = errMsg
@@ -530,8 +530,9 @@ func (b *openclawBackend) processOutput(r io.Reader, ch chan<- Message) openclaw
 			continue
 		}
 
-		// Not JSON — treat as log line.
-		b.cfg.Logger.Debug("[openclaw:stdout] " + line)
+		// Not JSON — treat as log line without retaining provider text, which
+		// can contain opaque session IDs, local paths, or raw error details.
+		b.cfg.Logger.Debug("[openclaw:stdout] provider output received", "bytes", len(line))
 		rawLines = append(rawLines, line)
 	}
 

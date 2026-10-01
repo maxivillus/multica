@@ -141,7 +141,7 @@ func (b *qwenBackend) Execute(ctx context.Context, prompt string, opts ExecOptio
 	}
 	// cmd.Start succeeded; result goroutine now owns cleanup.
 	mcpFileCleanup = nil
-	b.cfg.Logger.Info("qwen started", "pid", cmd.Process.Pid, "cwd", opts.Cwd, "model", opts.Model)
+	b.cfg.Logger.Info("qwen started", "pid", cmd.Process.Pid, "cwd_present", opts.Cwd != "", "model", opts.Model)
 
 	// The prompt is delivered on stdin (see buildQwenArgs). Write it from its
 	// own goroutine so it cannot deadlock against the stdout reader below: a
@@ -189,7 +189,7 @@ func (b *qwenBackend) Execute(ctx context.Context, prompt string, opts ExecOptio
 				continue
 			}
 			state.eventCount++
-			state.lastEventType = event.Type
+			state.lastEventType = safeQwenEventType(event.Type)
 			handleQwenEvent(event, msgCh, &state)
 		}
 		scanErr := scanner.Err()
@@ -281,6 +281,15 @@ type qwenStreamState struct {
 	resumed                                                             bool
 	eventCount, invalidEventCount, assistantEventCount, toolUseCount    int
 	unreadableAssistantCount                                            int
+}
+
+func safeQwenEventType(eventType string) string {
+	switch eventType {
+	case "system", "assistant", "user", "result", "error":
+		return eventType
+	default:
+		return "unknown"
+	}
 }
 
 func handleQwenEvent(event qwenStreamEvent, ch chan<- Message, state *qwenStreamState) {

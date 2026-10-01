@@ -66,7 +66,7 @@ func (b *cursorBackend) Execute(ctx context.Context, prompt string, opts ExecOpt
 		return nil, fmt.Errorf("start cursor-agent: %w", err)
 	}
 
-	b.cfg.Logger.Info("cursor-agent started", "pid", cmd.Process.Pid, "cwd", opts.Cwd, "model", opts.Model)
+	b.cfg.Logger.Info("cursor-agent started", "pid", cmd.Process.Pid, "cwd_present", opts.Cwd != "", "model", opts.Model)
 
 	msgCh := make(chan Message, 256)
 	resCh := make(chan Result, 1)
@@ -157,7 +157,7 @@ func (b *cursorBackend) Execute(ctx context.Context, prompt string, opts ExecOpt
 				continue
 			}
 			eventCount++
-			lastEventType = observedCursorEventType(evt.Type)
+			lastEventType = safeCursorEventType(evt.Type)
 
 			if sid := evt.readSessionID(); sid != "" {
 				sessionID = sid
@@ -482,9 +482,21 @@ func cursorFailureDiagnostic(message string, exitErr, scanErr error, eventCount,
 		scanErr != nil,
 		eventCount,
 		invalidEventCount,
-		lastEventType,
+		safeCursorEventType(lastEventType),
 		cursorIncompleteFinalizationWarning,
 	)
+}
+
+// safeCursorEventType returns only event labels understood by the Cursor
+// parser. Unknown values may be provider-controlled session IDs or paths, so
+// they must never enter logs, error diagnostics, or the unhandled-type tally.
+func safeCursorEventType(value string) string {
+	switch strings.TrimSpace(value) {
+	case "system", "assistant", "thinking", "tool_call", "tool_use", "tool_result", "result", "error", "text", "step_finish", "user", "connection", "retry":
+		return strings.TrimSpace(value)
+	default:
+		return "unknown"
+	}
 }
 
 // observedCursorEventType keeps protocol diagnostics bounded and content-free.
@@ -575,7 +587,7 @@ func (t *cursorUnhandledTypeTally) observe(eventType string) {
 	if t.counts == nil {
 		t.counts = make(map[string]int, 4)
 	}
-	key := observedCursorEventType(eventType)
+	key := safeCursorEventType(eventType)
 	if _, seen := t.counts[key]; !seen && len(t.counts) >= cursorUnhandledTypeCardinalityCap {
 		key = cursorUnhandledTypeOverflowKey
 	}

@@ -849,7 +849,7 @@ func TestCursorUnhandledTypeTallySummary(t *testing.T) {
 	for _, eventType := range []string{"tool_calls", "reasoning", "tool_calls", "reasoning", "tool_calls"} {
 		tally.observe(eventType)
 	}
-	if want := "reasoning=2,tool_calls=3"; tally.summary() != want {
+	if want := "unknown=5"; tally.summary() != want {
 		t.Errorf("summary = %q, want %q", tally.summary(), want)
 	}
 	if tally.total != 5 {
@@ -858,9 +858,8 @@ func TestCursorUnhandledTypeTallySummary(t *testing.T) {
 }
 
 // TestCursorUnhandledTypeTallyNormalizesKeys keeps the tally content-free: a type
-// value carrying punctuation or arbitrary length must not be copied into daemon
-// logs verbatim, it collapses to the same bounded labels observedCursorEventType
-// produces everywhere else.
+// value outside Cursor's known event labels must not be copied into daemon logs
+// verbatim; all such values collapse to one safe label.
 func TestCursorUnhandledTypeTallyNormalizesKeys(t *testing.T) {
 	t.Parallel()
 
@@ -870,15 +869,14 @@ func TestCursorUnhandledTypeTallyNormalizesKeys(t *testing.T) {
 	tally.observe("tool call with spaces")
 	tally.observe(strings.Repeat("x", 65))
 
-	if want := "invalid=2,unknown=2"; tally.summary() != want {
+	if want := "unknown=4"; tally.summary() != want {
 		t.Errorf("summary = %q, want %q", tally.summary(), want)
 	}
 }
 
 // TestCursorUnhandledTypeTallyBoundsCardinality guards the daemon against a
-// stream that emits an unbounded set of novel type names: the map must stop
-// growing at the cap and fold the rest into the overflow bucket, while the
-// total still counts every event.
+// stream that emits an unbounded set of novel type names: the strict allowlist
+// collapses all of them to one bounded label while the total counts every event.
 func TestCursorUnhandledTypeTallyBoundsCardinality(t *testing.T) {
 	t.Parallel()
 
@@ -888,24 +886,23 @@ func TestCursorUnhandledTypeTallyBoundsCardinality(t *testing.T) {
 		tally.observe(fmt.Sprintf("type-%03d", i))
 	}
 
-	if len(tally.counts) != cursorUnhandledTypeCardinalityCap+1 {
-		t.Errorf("distinct keys = %d, want %d (cap + overflow bucket)",
-			len(tally.counts), cursorUnhandledTypeCardinalityCap+1)
+	if len(tally.counts) != 1 {
+		t.Errorf("distinct keys = %d, want one safe label", len(tally.counts))
 	}
-	if got := tally.counts[cursorUnhandledTypeOverflowKey]; got != extra {
-		t.Errorf("overflow bucket = %d, want %d", got, extra)
+	if got := tally.counts["unknown"]; got != cursorUnhandledTypeCardinalityCap+extra {
+		t.Errorf("unknown bucket = %d, want %d", got, cursorUnhandledTypeCardinalityCap+extra)
 	}
 	if tally.total != cursorUnhandledTypeCardinalityCap+extra {
 		t.Errorf("total = %d, want %d", tally.total, cursorUnhandledTypeCardinalityCap+extra)
 	}
-	// A capped key already in the map keeps accumulating under its own name.
+	// Additional unknown values keep accumulating under the same safe label.
 	tally.observe("type-000")
-	if got := tally.counts["type-000"]; got != 2 {
-		t.Errorf("known key count = %d, want 2", got)
+	if got := tally.counts["unknown"]; got != cursorUnhandledTypeCardinalityCap+extra+1 {
+		t.Errorf("unknown key count = %d, want %d", got, cursorUnhandledTypeCardinalityCap+extra+1)
 	}
-	// The overflow label cannot be produced by normalizing a real type name, so
-	// a stream cannot forge counts into the bucket.
-	if observedCursorEventType(cursorUnhandledTypeOverflowKey) != "invalid" {
+	// The overflow label cannot be produced by the strict event allowlist, so a
+	// stream cannot forge counts into the bucket.
+	if safeCursorEventType(cursorUnhandledTypeOverflowKey) == cursorUnhandledTypeOverflowKey {
 		t.Errorf("overflow key %q is collidable with a real type name", cursorUnhandledTypeOverflowKey)
 	}
 }

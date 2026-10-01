@@ -64,6 +64,50 @@ interface WorkspaceDetailsDraft {
   context: string;
 }
 
+interface CardSessionSettingsDraft {
+  idleTimeoutHours: string;
+  maxOpenSessions: string;
+}
+
+const defaultCardSessionSettings: CardSessionSettingsDraft = {
+  idleTimeoutHours: "24",
+  maxOpenSessions: "100",
+};
+
+function readCardSessionSettings(workspace: Workspace | null): CardSessionSettingsDraft {
+  const raw = workspace?.settings?.card_sessions;
+  if (!raw || typeof raw !== "object" || Array.isArray(raw)) {
+    return defaultCardSessionSettings;
+  }
+  const settings = raw as Record<string, unknown>;
+  const idleTimeoutHours =
+    typeof settings.idle_timeout_hours === "number" &&
+    Number.isFinite(settings.idle_timeout_hours)
+      ? settings.idle_timeout_hours
+      : settings.post_done_retention_hours;
+  return {
+    idleTimeoutHours:
+      typeof idleTimeoutHours === "number" && Number.isFinite(idleTimeoutHours)
+        ? String(idleTimeoutHours)
+        : defaultCardSessionSettings.idleTimeoutHours,
+    maxOpenSessions:
+      typeof settings.max_open_sessions === "number" &&
+      Number.isFinite(settings.max_open_sessions)
+        ? String(settings.max_open_sessions)
+        : defaultCardSessionSettings.maxOpenSessions,
+  };
+}
+
+function cardSessionSettingsEqual(
+  left: CardSessionSettingsDraft,
+  right: CardSessionSettingsDraft,
+) {
+  return (
+    left.idleTimeoutHours === right.idleTimeoutHours &&
+    left.maxOpenSessions === right.maxOpenSessions
+  );
+}
+
 function workspaceDetailsEqual(
   left: WorkspaceDetailsDraft,
   right: WorkspaceDetailsDraft,
@@ -142,6 +186,12 @@ export function WorkspaceTab() {
   const [description, setDescription] = useState(workspace?.description ?? "");
   const [context, setContext] = useState(workspace?.context ?? "");
   const [prefixDraft, setPrefixDraft] = useState<string | null>(null);
+  const [idleTimeoutHours, setIdleTimeoutHours] = useState(
+    readCardSessionSettings(workspace).idleTimeoutHours,
+  );
+  const [maxOpenSessions, setMaxOpenSessions] = useState(
+    readCardSessionSettings(workspace).maxOpenSessions,
+  );
   const [prefixSaveStatus, setPrefixSaveStatus] =
     useState<SettingsSaveStatus>("idle");
   const [actionId, setActionId] = useState<string | null>(null);
@@ -173,6 +223,9 @@ export function WorkspaceTab() {
     setDescription(workspace?.description ?? "");
     setContext(workspace?.context ?? "");
     setPrefixDraft(null);
+    const cardSessionSettings = readCardSessionSettings(workspace);
+    setIdleTimeoutHours(cardSessionSettings.idleTimeoutHours);
+    setMaxOpenSessions(cardSessionSettings.maxOpenSessions);
     // eslint-disable-next-line react-hooks/exhaustive-deps -- intentionally keyed on id only; see comment above
   }, [workspace?.id]);
 
@@ -221,6 +274,65 @@ export function WorkspaceTab() {
       ),
     enabled: !!workspace && canManageWorkspace && !!name.trim(),
     isEqual: workspaceDetailsEqual,
+  });
+
+  const cardSessionDraft = useMemo(
+    () => ({ idleTimeoutHours, maxOpenSessions }),
+    [idleTimeoutHours, maxOpenSessions],
+  );
+  const savedCardSessionSettings = useMemo(
+    () => readCardSessionSettings(workspace),
+    [workspace],
+  );
+  const saveCardSessionSettings = useCallback(
+    async (next: CardSessionSettingsDraft) => {
+      if (!workspace) return;
+      const currentSettings = (workspace.settings ?? {}) as Record<string, unknown>;
+      const currentCardSessionSettings =
+        currentSettings.card_sessions &&
+        typeof currentSettings.card_sessions === "object" &&
+        !Array.isArray(currentSettings.card_sessions)
+          ? (currentSettings.card_sessions as Record<string, unknown>)
+          : {};
+      const retainedCardSessionSettings = Object.fromEntries(
+        Object.entries(currentCardSessionSettings).filter(
+          ([key]) =>
+            key !== "post_done_retention_hours" &&
+            key !== "token_stats_interval_minutes",
+        ),
+      );
+      const updated = await api.updateWorkspace(workspace.id, {
+        settings: {
+          ...currentSettings,
+          card_sessions: {
+            ...retainedCardSessionSettings,
+            idle_timeout_hours: Number(next.idleTimeoutHours),
+            max_open_sessions: Number(next.maxOpenSessions),
+          },
+        },
+      });
+      qc.setQueryData(workspaceKeys.list(), (old: Workspace[] | undefined) =>
+        old?.map((ws) => (ws.id === updated.id ? updated : ws)),
+      );
+    },
+    [qc, workspace],
+  );
+  const cardSessionAutoSave = useAutoSave({
+    value: cardSessionDraft,
+    savedValue: savedCardSessionSettings,
+    onSave: saveCardSessionSettings,
+    onSuccess: () =>
+      toast.success(t(($) => $.workspace.toast_saved), {
+        id: "settings-auto-save",
+      }),
+    onError: (error) =>
+      toast.error(
+        error instanceof Error
+          ? error.message
+          : t(($) => $.workspace.toast_save_failed),
+      ),
+    enabled: !!workspace && canManageWorkspace,
+    isEqual: cardSessionSettingsEqual,
   });
 
   const performPrefixSave = async (nextPrefix: string) => {
@@ -473,6 +585,59 @@ export function WorkspaceTab() {
                 </Button>
               ) : null}
             </span>
+          </SettingsRow>
+        </SettingsCard>
+      </SettingsSection>
+
+      <SettingsSection
+        title={t(($) => $.workspace.section_card_sessions)}
+        action={
+          <SettingsSaveState
+            status={cardSessionAutoSave.status}
+            savingLabel={t(($) => $.auto_save.saving)}
+            savedLabel={t(($) => $.auto_save.saved)}
+            errorLabel={t(($) => $.auto_save.failed)}
+          />
+        }
+      >
+        <SettingsCard>
+          <SettingsRow
+            label={t(($) => $.workspace.idle_timeout_label)}
+            description={t(($) => $.workspace.idle_timeout_hint)}
+            size="code"
+          >
+            <Input
+              type="number"
+              name="workspace-session-idle-timeout-hours"
+              min={1}
+              max={999}
+              step={1}
+              aria-label={t(($) => $.workspace.idle_timeout_label)}
+              value={idleTimeoutHours}
+              onChange={(event) => setIdleTimeoutHours(event.target.value)}
+              onBlur={cardSessionAutoSave.flush}
+              disabled={!canManageWorkspace}
+              className="font-mono"
+            />
+          </SettingsRow>
+          <SettingsRow
+            label={t(($) => $.workspace.max_open_sessions_label)}
+            description={t(($) => $.workspace.max_open_sessions_hint)}
+            size="code"
+          >
+            <Input
+              type="number"
+              name="workspace-max-open-sessions"
+              min={1}
+              max={10000}
+              step={1}
+              aria-label={t(($) => $.workspace.max_open_sessions_label)}
+              value={maxOpenSessions}
+              onChange={(event) => setMaxOpenSessions(event.target.value)}
+              onBlur={cardSessionAutoSave.flush}
+              disabled={!canManageWorkspace}
+              className="font-mono"
+            />
           </SettingsRow>
         </SettingsCard>
       </SettingsSection>
