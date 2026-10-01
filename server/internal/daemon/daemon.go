@@ -7710,6 +7710,16 @@ func logFreshSessionStartFailure(taskLog *slog.Logger, err error) {
 	taskLog.Error("fresh session also failed to start; keeping the original poisoned result", "error_present", err != nil)
 }
 
+// cardSessionIDForTurn uses the start acknowledgement as the authoritative
+// card binding. Claims are assembled before StartTask lazily binds an issue to
+// its generation, so the claimed Task often has no card session id yet.
+func cardSessionIDForTurn(task Task, lease CardSessionLease) string {
+	if lease.CardSessionID != "" {
+		return lease.CardSessionID
+	}
+	return task.CardSessionID
+}
+
 func (d *Daemon) runTask(ctx context.Context, task Task, provider string, slot int, taskLog *slog.Logger) (taskResult TaskResult, returnErr error) {
 	phaseRecorder := taskPhaseRecorderFromContext(ctx)
 	phaseRecorder.Mark(taskPhasePrepareStarted)
@@ -8452,6 +8462,10 @@ func (d *Daemon) runTask(ctx context.Context, task Task, provider string, slot i
 		stopPrepareLease()
 		return TaskResult{}, fmt.Errorf("start task failed: %w", err)
 	}
+	// The claim is created before the server binds an issue task to its card
+	// session generation. Therefore task.CardSessionID is normally empty here;
+	// the start response is the authoritative binding for this turn.
+	cardSessionID := cardSessionIDForTurn(task, cardSessionLease)
 	// A card-session start response carries a server-issued fencing epoch. The
 	// lease belongs to the live host, so its heartbeat must outlive this task's
 	// terminal callback and continue through the idle window. The legacy zero
@@ -8865,7 +8879,7 @@ func (d *Daemon) runTask(ctx context.Context, task Task, provider string, slot i
 	var msgSeq atomic.Int32
 	var executeTurn func(context.Context, string, agent.ExecOptions) (*agent.Session, error)
 	executeTurn = backend.Execute
-	if task.CardSessionID != "" {
+	if cardSessionID != "" {
 		if d.cardSessionHosts == nil {
 			d.cardSessionHosts = newCardSessionHostRegistry(d.logger)
 		}
@@ -8877,7 +8891,7 @@ func (d *Daemon) runTask(ctx context.Context, task Task, provider string, slot i
 		if cardSessionLease.IdleTimeoutHours > 0 {
 			idleTimeout = time.Duration(cardSessionLease.IdleTimeoutHours) * time.Hour
 		}
-		openedHost, hostErr := d.cardSessionHosts.acquire(d.daemonLifecycleCtx(), task.CardSessionID, backend, execOpts, idleTimeout)
+		openedHost, hostErr := d.cardSessionHosts.acquire(d.daemonLifecycleCtx(), cardSessionID, backend, execOpts, idleTimeout)
 		if hostErr != nil {
 			return TaskResult{}, hostErr
 		}
@@ -8919,7 +8933,7 @@ func (d *Daemon) runTask(ctx context.Context, task Task, provider string, slot i
 		}
 		executeTurn = openedHost.execute
 		taskLog.Info("using persistent card-session host",
-			"card_session_id", task.CardSessionID,
+			"card_session_id", cardSessionID,
 			"pid", cardHost.session.ProcessID(),
 		)
 	}

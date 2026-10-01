@@ -4529,6 +4529,9 @@ func (s *TaskService) startTask(ctx context.Context, taskID pgtype.UUID, leaseOw
 		if err != nil {
 			return nil, fmt.Errorf("start task: %w", err)
 		}
+		if task.CardSessionID.Valid && strings.TrimSpace(leaseOwner) == "" {
+			return nil, ErrCardSessionLeaseOwner
+		}
 		s.taskStarted(ctx, task)
 		return &task, nil
 	}
@@ -4549,7 +4552,10 @@ func (s *TaskService) startTask(ctx context.Context, taskID pgtype.UUID, leaseOw
 	if err != nil {
 		return nil, err
 	}
-	if strings.TrimSpace(leaseOwner) != "" && task.CardSessionID.Valid {
+	if task.CardSessionID.Valid {
+		if strings.TrimSpace(leaseOwner) == "" {
+			return nil, ErrCardSessionLeaseOwner
+		}
 		if _, err := s.acquireCardSessionLeaseWithQueries(ctx, qtx, task.ID, leaseOwner); err != nil {
 			return nil, err
 		}
@@ -4603,7 +4609,10 @@ func (s *TaskService) startTaskForClaim(ctx context.Context, claim db.LockAgentT
 			return nil, err
 		}
 	}
-	if strings.TrimSpace(leaseOwner) != "" && task.CardSessionID.Valid {
+	if task.CardSessionID.Valid {
+		if strings.TrimSpace(leaseOwner) == "" {
+			return nil, ErrCardSessionLeaseOwner
+		}
 		if _, err := s.acquireCardSessionLeaseWithQueries(ctx, qtx, task.ID, leaseOwner); err != nil {
 			return nil, err
 		}

@@ -166,6 +166,27 @@ func (h *Handler) requireDaemonTaskAccessWithWorkspace(w http.ResponseWriter, r 
 	return task, wsID, true
 }
 
+// daemonLeaseOwnerForTask resolves the owner used by card-session fencing.
+// Daemon-token requests already carry the authenticated daemon id. PAT/JWT
+// fallback requests do not, so derive the same stable machine identity from
+// the task's server-side runtime instead of leaving a card session unfenced.
+func (h *Handler) daemonLeaseOwnerForTask(ctx context.Context, task db.AgentTaskQueue) (string, error) {
+	if owner := strings.TrimSpace(middleware.DaemonIDFromContext(ctx)); owner != "" {
+		return owner, nil
+	}
+	if !task.RuntimeID.Valid {
+		return "", nil
+	}
+	runtime, err := h.getAgentRuntime(ctx, obsmetrics.RuntimeLookupSourceDaemonAPI, task.RuntimeID)
+	if err != nil {
+		return "", fmt.Errorf("load task runtime for card-session lease: %w", err)
+	}
+	if !runtime.DaemonID.Valid {
+		return "", nil
+	}
+	return strings.TrimSpace(runtime.DaemonID.String), nil
+}
+
 // verifyDaemonWorkspaceAccess checks workspace access without writing an HTTP error.
 // Used in loops where individual items may be skipped silently.
 func (h *Handler) verifyDaemonWorkspaceAccess(r *http.Request, workspaceID string) bool {
@@ -4154,8 +4175,14 @@ func (h *Handler) StartTask(w http.ResponseWriter, r *http.Request) {
 	taskID := chi.URLParam(r, "taskId")
 
 	// Verify the caller owns this task's workspace.
-	_, workspaceID, ok := h.requireDaemonTaskAccessWithWorkspace(w, r, taskID)
+	accessTask, workspaceID, ok := h.requireDaemonTaskAccessWithWorkspace(w, r, taskID)
 	if !ok {
+		return
+	}
+	leaseOwner, leaseOwnerErr := h.daemonLeaseOwnerForTask(r.Context(), accessTask)
+	if leaseOwnerErr != nil {
+		slog.Warn("resolve card-session lease owner failed", "task_id", taskID, "error", leaseOwnerErr)
+		writeError(w, http.StatusInternalServerError, "failed to load task runtime")
 		return
 	}
 
@@ -4171,7 +4198,6 @@ func (h *Handler) StartTask(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 	enableTaskSupplement := slices.Contains(req.Capabilities, protocol.DaemonCapabilityTaskSupplementV1)
-	leaseOwner := middleware.DaemonIDFromContext(r.Context())
 	var task *db.AgentTaskQueue
 	var err error
 	legacy := req.RuntimeID == "" && req.DispatchedAt == ""
@@ -4198,6 +4224,10 @@ func (h *Handler) StartTask(w http.ResponseWriter, r *http.Request) {
 		slog.Warn("start task failed", "task_id", taskID, "error", err)
 		if errors.Is(err, service.ErrCardSessionLeaseUnavailable) {
 			writeError(w, http.StatusConflict, "card session lease is held by another provider host")
+			return
+		}
+		if errors.Is(err, service.ErrCardSessionLeaseOwner) {
+			writeError(w, http.StatusForbidden, "daemon lease owner required")
 			return
 		}
 		if errors.Is(err, pgx.ErrNoRows) {
