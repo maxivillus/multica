@@ -176,6 +176,7 @@ type CardSessionLeaseResponse struct {
 	Generation       int64  `json:"generation"`
 	LeaseEpoch       int64  `json:"lease_epoch"`
 	LeaseHeartbeatAt string `json:"lease_heartbeat_at,omitempty"`
+	IdleTimeoutHours int    `json:"card_session_idle_timeout_hours,omitempty"`
 }
 
 func cardSessionLeaseResponse(session db.CardSession) CardSessionLeaseResponse {

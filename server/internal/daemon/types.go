@@ -189,6 +189,11 @@ type CardSessionLease struct {
 	Generation       int64  `json:"generation"`
 	LeaseEpoch       int64  `json:"lease_epoch"`
 	LeaseHeartbeatAt string `json:"lease_heartbeat_at,omitempty"`
+	// IdleTimeoutHours is the workspace setting that the server uses to expire
+	// this card-session generation. It lets the daemon stop its local provider
+	// process on the same idle boundary instead of retaining it until a fixed
+	// host default.
+	IdleTimeoutHours int `json:"card_session_idle_timeout_hours,omitempty"`
 }
 
 // ChatAttachmentMeta is the structured attachment metadata the daemon

@@ -422,11 +422,12 @@ type AgentTaskResponse struct {
 	// CardSessionID identifies the server-owned generation this task is bound
 	// to. Lease owner identity and provider credentials never travel in this
 	// response; only the fencing epoch is returned on the start response.
-	CardSessionID         string `json:"card_session_id,omitempty"`
-	CardSessionGeneration int64  `json:"card_session_generation,omitempty"`
-	CardSessionLeaseEpoch int64  `json:"card_session_lease_epoch,omitempty"`
-	PriorSessionID        string `json:"prior_session_id,omitempty"` // session ID from a previous task on same issue
-	PriorWorkDir          string `json:"prior_work_dir,omitempty"`   // work_dir from a previous task on same issue
+	CardSessionID               string `json:"card_session_id,omitempty"`
+	CardSessionGeneration       int64  `json:"card_session_generation,omitempty"`
+	CardSessionLeaseEpoch       int64  `json:"card_session_lease_epoch,omitempty"`
+	CardSessionIdleTimeoutHours int    `json:"card_session_idle_timeout_hours,omitempty"`
+	PriorSessionID              string `json:"prior_session_id,omitempty"` // session ID from a previous task on same issue
+	PriorWorkDir                string `json:"prior_work_dir,omitempty"`   // work_dir from a previous task on same issue
 	// PriorSessionResumeUnavailable is set when a more recent Codex session was
 	// withheld because its rollout was missing (MUL-5305); PriorSessionID (if
 	// any) is then an older fallback, and the daemon surfaces the continuity gap

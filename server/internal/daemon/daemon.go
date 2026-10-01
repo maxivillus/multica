@@ -662,8 +662,10 @@ type Daemon struct {
 	// deleted bare clone and an unrelated `not empty` cleanup failure.
 	bgSyncs sync.WaitGroup
 
-	runner             taskRunner    // executes agent tasks; set to d.runTask by New(), overridable in tests
-	cancelPollInterval time.Duration // how often handleTask polls for server-side cancellation; overridable in tests
+	runner                     taskRunner               // executes agent tasks; set to d.runTask by New(), overridable in tests
+	cardSessionHosts           *cardSessionHostRegistry // one persistent provider process per open card-session generation
+	cardSessionHostIdleTimeout time.Duration            // fallback; each host receives the server's setting in its lease response
+	cancelPollInterval         time.Duration            // how often handleTask polls for server-side cancellation; overridable in tests
 	// taskSlotWait is the brief semaphore wait before the capacity backoff.
 	// New sets the production default; tests shorten it to reach that branch.
 	taskSlotWait time.Duration
@@ -751,6 +753,8 @@ func New(cfg Config, logger *slog.Logger) *Daemon {
 	}
 	d.activeEnvRootsCond = sync.NewCond(&d.activeEnvRootsMu)
 	d.activeStoresCond = sync.NewCond(&d.activeStoresMu)
+	d.cardSessionHosts = newCardSessionHostRegistry(logger)
+	d.cardSessionHostIdleTimeout = 24 * time.Hour
 	// Seed the copy-on-write availability set from the startup probe. Callers
 	// must go through d.agents() from here on; cfg.Agents is the initial value
 	// only and does not track later refreshes.
@@ -2152,6 +2156,11 @@ func (d *Daemon) Run(ctx context.Context) error {
 
 	// Deregister runtimes on shutdown (uses a fresh context since ctx will be cancelled).
 	defer d.deregisterRuntimes()
+	defer func() {
+		if d.cardSessionHosts != nil {
+			d.cardSessionHosts.closeAll()
+		}
+	}()
 
 	// Start workspace sync loop to discover newly created workspaces.
 	go d.workspaceSyncLoop(ctx)
@@ -2168,6 +2177,7 @@ func (d *Daemon) Run(ctx context.Context) error {
 	go d.gcLoop(ctx)
 	go d.autoUpdateLoop(ctx)
 	go d.tokenRenewalLoop(ctx)
+	go d.cardSessionHostReaper(ctx)
 
 	// Preflight succeeded and the background loops are up: the daemon has
 	// registered its runtimes and can now claim and run tasks. Flip /health
@@ -8434,21 +8444,44 @@ func (d *Daemon) runTask(ctx context.Context, task Task, provider string, slot i
 		stopPrepareLease()
 		return TaskResult{}, fmt.Errorf("start task failed: %w", err)
 	}
-	// A card-session start response carries a server-issued fencing epoch. Keep
-	// that lease alive for the whole provider turn and fail closed if ownership
-	// can no longer be proven. The legacy zero lease remains compatible with
-	// older servers that do not expose card-session fencing yet.
+	// A card-session start response carries a server-issued fencing epoch. The
+	// lease belongs to the live host, so its heartbeat must outlive this task's
+	// terminal callback and continue through the idle window. The legacy zero
+	// lease remains compatible with older servers that do not expose fencing.
 	executionCtx := ctx
-	stopCardSessionLease := func() {}
+	var cancelExecution context.CancelFunc
+	var cardLeaseHandle *cardSessionLeaseHandle
+	var cardHost *cardSessionHost
+	var cardHostMu sync.Mutex
 	if cardSessionLease.CardSessionID != "" && cardSessionLease.LeaseEpoch > 0 {
-		var cancelExecution context.CancelFunc
 		executionCtx, cancelExecution = context.WithCancel(ctx)
-		stopCardSessionLease = d.maintainCardSessionLease(
-			executionCtx, task.ID, cardSessionLease.LeaseEpoch, cancelExecution, taskLog,
-		)
-		defer func() {
-			stopCardSessionLease()
+		leaseLost := func() {
 			cancelExecution()
+			cardHostMu.Lock()
+			host := cardHost
+			cardHostMu.Unlock()
+			if host != nil {
+				_ = host.closeAfterLeaseLoss()
+			}
+		}
+		// Start heartbeating before provider setup so a slow initialize cannot
+		// leave the freshly acquired server lease without an owner.
+		cardLeaseHandle = d.newCardSessionLeaseHandle(
+			d.daemonLifecycleCtx(), task.ID, cardSessionLease.LeaseEpoch, leaseLost, taskLog,
+		)
+		if cardLeaseHandle == nil {
+			releaseCtx, cancelRelease := context.WithTimeout(context.Background(), cardSessionLeaseReleaseTimeout)
+			_, _ = d.client.ReleaseCardSessionLease(releaseCtx, task.ID, cardSessionLease.LeaseEpoch)
+			cancelRelease()
+			return TaskResult{}, errors.New("card session lease heartbeat could not start")
+		}
+		defer func() {
+			if cardLeaseHandle != nil {
+				cardLeaseHandle.stop(true)
+			}
+			if cancelExecution != nil {
+				cancelExecution()
+			}
 		}()
 	}
 	if taskSupplementNegotiated {
@@ -8746,6 +8779,7 @@ func (d *Daemon) runTask(ctx context.Context, task Task, provider string, slot i
 		McpConfig:              mcpConfig,
 		ThinkingLevel:          thinkingLevel,
 		ServiceTier:            serviceTier,
+		TaskAuthToken:          agentToken,
 		OpenclawMode:           openclawMode,
 		ClaudeSettingsPath:     env.ClaudeSettingsPath,
 		QwenpawWorkspace:       env.QwenpawWorkspace,
@@ -8821,7 +8855,67 @@ func (d *Daemon) runTask(ctx context.Context, task Task, provider string, slot i
 	// Shared across the resume-retry below so the retry's transcript rows
 	// keep ascending seq values for the same task.
 	var msgSeq atomic.Int32
-	result, tools, err := d.executeAndDrain(executionCtx, backend, prompt, execOpts, taskLog, task.ID, env.CodexHome, &msgSeq)
+	var executeTurn func(context.Context, string, agent.ExecOptions) (*agent.Session, error)
+	executeTurn = backend.Execute
+	if task.CardSessionID != "" {
+		if d.cardSessionHosts == nil {
+			d.cardSessionHosts = newCardSessionHostRegistry(d.logger)
+		}
+		// The provider process belongs to the daemon/card-session lifetime, not
+		// to this one task's execution context. A task context is cancelled as
+		// soon as its comment is reported; passing it to OpenPersistent would
+		// therefore kill the supposedly continuous host between comments.
+		idleTimeout := d.cardSessionHostIdleTimeout
+		if cardSessionLease.IdleTimeoutHours > 0 {
+			idleTimeout = time.Duration(cardSessionLease.IdleTimeoutHours) * time.Hour
+		}
+		openedHost, hostErr := d.cardSessionHosts.acquire(d.daemonLifecycleCtx(), task.CardSessionID, backend, execOpts, idleTimeout)
+		if hostErr != nil {
+			return TaskResult{}, hostErr
+		}
+		cardHostMu.Lock()
+		cardHost = openedHost
+		cardHostMu.Unlock()
+		if cardLeaseHandle != nil {
+			if openedHost.hasLease() {
+				// The host already owns this generation (a later comment). Move
+				// the authenticated lookup to the current task while retaining
+				// the one daemon-lifetime heartbeat.
+				openedHost.updateLease(task.ID, cardSessionLease.LeaseEpoch, func() {
+					cancelExecution()
+					_ = openedHost.closeAfterLeaseLoss()
+				})
+				cardLeaseHandle.stop(false)
+				cardLeaseHandle = nil
+			} else if openedHost.attachLease(cardLeaseHandle) {
+				cardLeaseHandle = nil
+			} else {
+				_ = openedHost.close()
+				return TaskResult{}, errors.New("card session host could not attach lease")
+			}
+		} else if !openedHost.hasLease() {
+			// A host that exited between lookup and acquire can be replaced by
+			// the registry. Attach a fresh daemon-lifetime keeper after setup.
+			leaseLost := func() {
+				cancelExecution()
+				_ = openedHost.closeAfterLeaseLoss()
+			}
+			freshLease := d.newCardSessionLeaseHandle(
+				d.daemonLifecycleCtx(), task.ID, cardSessionLease.LeaseEpoch, leaseLost, taskLog,
+			)
+			if !openedHost.attachLease(freshLease) {
+				freshLease.stop(true)
+				_ = openedHost.close()
+				return TaskResult{}, errors.New("card session host could not attach lease")
+			}
+		}
+		executeTurn = openedHost.execute
+		taskLog.Info("using persistent card-session host",
+			"card_session_id", task.CardSessionID,
+			"pid", cardHost.session.ProcessID(),
+		)
+	}
+	result, tools, err := d.executeAndDrainWith(executionCtx, executeTurn, prompt, execOpts, taskLog, task.ID, env.CodexHome, &msgSeq)
 	if err != nil {
 		return TaskResult{}, err
 	}
@@ -8877,7 +8971,7 @@ func (d *Daemon) runTask(ctx context.Context, task Task, provider string, slot i
 		}
 		freshPrompt := BuildPrompt(task, provider, promptOptions...)
 
-		retryResult, retryTools, retryErr := d.executeAndDrain(executionCtx, backend, freshPrompt, execOpts, taskLog, task.ID, env.CodexHome, &msgSeq)
+		retryResult, retryTools, retryErr := d.executeAndDrainWith(executionCtx, executeTurn, freshPrompt, execOpts, taskLog, task.ID, env.CodexHome, &msgSeq)
 		if retryErr != nil {
 			logFreshSessionStartFailure(taskLog, retryErr)
 		} else if retryResult.Status != "completed" && retryResult.SessionID == "" {
@@ -9324,6 +9418,15 @@ func freshSessionMayHelp(errText string) bool {
 // sequence instead of restarting at 1 — the server orders the transcript by
 // seq alone, and duplicate seqs would interleave the two attempts' rows.
 func (d *Daemon) executeAndDrain(ctx context.Context, backend agent.Backend, prompt string, opts agent.ExecOptions, taskLog *slog.Logger, taskID, codexHome string, msgSeq *atomic.Int32) (agent.Result, int32, error) {
+	return d.executeAndDrainWith(ctx, backend.Execute, prompt, opts, taskLog, taskID, codexHome, msgSeq)
+}
+
+// executeAndDrainWith is the common transcript/watchdog boundary for both
+// one-shot backends and a persistent card-session host. The executor function
+// is intentionally injected instead of branching inside the drain loop: a
+// persistent host keeps its process after the returned Result, while all
+// server reporting and liveness accounting remains identical to a normal run.
+func (d *Daemon) executeAndDrainWith(ctx context.Context, execute func(context.Context, string, agent.ExecOptions) (*agent.Session, error), prompt string, opts agent.ExecOptions, taskLog *slog.Logger, taskID, codexHome string, msgSeq *atomic.Int32) (agent.Result, int32, error) {
 	phaseRecorder := taskPhaseRecorderFromContext(ctx)
 	// Wrap the caller's ctx so the idle watchdog (below) can interrupt both
 	// the agent subprocess (via the ctx passed to backend.Execute) AND the
@@ -9333,7 +9436,7 @@ func (d *Daemon) executeAndDrain(ctx context.Context, backend agent.Backend, pro
 	agentCtx, agentCancel := context.WithCancel(ctx)
 	defer agentCancel()
 
-	session, err := backend.Execute(agentCtx, prompt, opts)
+	session, err := execute(agentCtx, prompt, opts)
 	if err != nil {
 		// One provider-agnostic boundary for launches: every backend's
 		// cmd.Start() failure arrives here, so diagnosing ENOEXEC at this point
