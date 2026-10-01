@@ -11,7 +11,6 @@ import (
 	"github.com/go-chi/chi/v5"
 	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgtype"
-	"github.com/multica-ai/multica/server/internal/middleware"
 	"github.com/multica-ai/multica/server/internal/service"
 	db "github.com/multica-ai/multica/server/pkg/db/generated"
 )
@@ -165,8 +164,8 @@ func (h *Handler) PinTaskSession(w http.ResponseWriter, r *http.Request) {
 }
 
 // CardSessionLeaseRequest carries the fencing epoch returned by the start
-// transition. The owner is taken from daemon authentication, never from the
-// request body.
+// transition. The owner is taken from daemon authentication or the task's
+// server-side runtime identity, never from the request body.
 type CardSessionLeaseRequest struct {
 	LeaseEpoch int64 `json:"lease_epoch"`
 }
@@ -193,10 +192,16 @@ func cardSessionLeaseResponse(session db.CardSession) CardSessionLeaseResponse {
 // cannot prevent the configured idle timeout from closing its generation.
 func (h *Handler) HeartbeatCardSessionLease(w http.ResponseWriter, r *http.Request) {
 	taskID := chi.URLParam(r, "taskId")
-	if _, ok := h.requireDaemonTaskAccess(w, r, taskID); !ok {
+	task, ok := h.requireDaemonTaskAccess(w, r, taskID)
+	if !ok {
 		return
 	}
-	owner := middleware.DaemonIDFromContext(r.Context())
+	owner, ownerErr := h.daemonLeaseOwnerForTask(r.Context(), task)
+	if ownerErr != nil {
+		slog.Warn("resolve card-session heartbeat owner failed", "task_id", taskID, "error", ownerErr)
+		writeError(w, http.StatusInternalServerError, "failed to load task runtime")
+		return
+	}
 	if owner == "" {
 		writeError(w, http.StatusForbidden, "daemon lease owner required")
 		return
@@ -224,10 +229,16 @@ func (h *Handler) HeartbeatCardSessionLease(w http.ResponseWriter, r *http.Reque
 // host's lease.
 func (h *Handler) ReleaseCardSessionLease(w http.ResponseWriter, r *http.Request) {
 	taskID := chi.URLParam(r, "taskId")
-	if _, ok := h.requireDaemonTaskAccess(w, r, taskID); !ok {
+	task, ok := h.requireDaemonTaskAccess(w, r, taskID)
+	if !ok {
 		return
 	}
-	owner := middleware.DaemonIDFromContext(r.Context())
+	owner, ownerErr := h.daemonLeaseOwnerForTask(r.Context(), task)
+	if ownerErr != nil {
+		slog.Warn("resolve card-session release owner failed", "task_id", taskID, "error", ownerErr)
+		writeError(w, http.StatusInternalServerError, "failed to load task runtime")
+		return
+	}
 	if owner == "" {
 		writeError(w, http.StatusForbidden, "daemon lease owner required")
 		return

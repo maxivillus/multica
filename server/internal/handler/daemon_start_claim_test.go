@@ -210,3 +210,80 @@ func TestStartClaimWirePrecision(t *testing.T) {
 		})
 	}
 }
+
+func TestStartTaskPATFallbackUsesRuntimeDaemonLeaseOwner(t *testing.T) {
+	if testHandler == nil || testPool == nil {
+		t.Skip("database not available")
+	}
+
+	ctx := context.Background()
+	workspaceID, runtimeID, agentID, _, issueID := createCardSessionCapacityFixture(t, ctx)
+	generation := time.Now().UTC().Truncate(time.Microsecond)
+	var taskID string
+	if err := testPool.QueryRow(ctx, `
+		INSERT INTO agent_task_queue (agent_id, runtime_id, issue_id, status, priority, dispatched_at)
+		VALUES ($1, $2, $3, 'dispatched', 0, $4)
+		RETURNING id`, agentID, runtimeID, issueID, generation).Scan(&taskID); err != nil {
+		t.Fatalf("insert dispatched task: %v", err)
+	}
+	t.Cleanup(func() {
+		_, _ = testPool.Exec(context.Background(), `DELETE FROM agent_task_queue WHERE id = $1`, taskID)
+	})
+
+	var daemonID string
+	if err := testPool.QueryRow(ctx, `SELECT daemon_id FROM agent_runtime WHERE id = $1`, runtimeID).Scan(&daemonID); err != nil {
+		t.Fatalf("load runtime daemon id: %v", err)
+	}
+
+	startReq := newRequestAsUser(testUserID, http.MethodPost, "/api/daemon/tasks/"+taskID+"/start", map[string]any{
+		"runtime_id":    runtimeID,
+		"dispatched_at": generation.Format(time.RFC3339Nano),
+	})
+	startReq.Header.Set("X-Workspace-ID", workspaceID)
+	startReq = withURLParam(startReq, "taskId", taskID)
+	startResp := httptest.NewRecorder()
+	testHandler.StartTask(startResp, startReq)
+	if startResp.Code != http.StatusOK {
+		t.Fatalf("PAT start status = %d: %s", startResp.Code, startResp.Body.String())
+	}
+	var started AgentTaskResponse
+	if err := json.Unmarshal(startResp.Body.Bytes(), &started); err != nil {
+		t.Fatalf("decode PAT start response: %v", err)
+	}
+	if started.CardSessionID == "" || started.CardSessionLeaseEpoch <= 0 {
+		t.Fatalf("PAT start card lease = id %q epoch %d, want a fenced generation", started.CardSessionID, started.CardSessionLeaseEpoch)
+	}
+
+	var owner string
+	var epoch int64
+	if err := testPool.QueryRow(ctx, `SELECT COALESCE(lease_owner, ''), lease_epoch FROM card_session WHERE id = $1`, started.CardSessionID).Scan(&owner, &epoch); err != nil {
+		t.Fatalf("read PAT start lease: %v", err)
+	}
+	if owner != daemonID || epoch != started.CardSessionLeaseEpoch {
+		t.Fatalf("PAT start lease = owner %q epoch %d, want owner %q epoch %d", owner, epoch, daemonID, started.CardSessionLeaseEpoch)
+	}
+
+	for _, endpoint := range []string{"heartbeat", "release"} {
+		req := newRequestAsUser(testUserID, http.MethodPost, "/api/daemon/tasks/"+taskID+"/card-session/"+endpoint, map[string]any{
+			"lease_epoch": started.CardSessionLeaseEpoch,
+		})
+		req.Header.Set("X-Workspace-ID", workspaceID)
+		req = withURLParam(req, "taskId", taskID)
+		response := httptest.NewRecorder()
+		if endpoint == "heartbeat" {
+			testHandler.HeartbeatCardSessionLease(response, req)
+		} else {
+			testHandler.ReleaseCardSessionLease(response, req)
+		}
+		if response.Code != http.StatusOK {
+			t.Fatalf("PAT %s status = %d: %s", endpoint, response.Code, response.Body.String())
+		}
+	}
+
+	if err := testPool.QueryRow(ctx, `SELECT COALESCE(lease_owner, '') FROM card_session WHERE id = $1`, started.CardSessionID).Scan(&owner); err != nil {
+		t.Fatalf("read released PAT lease: %v", err)
+	}
+	if owner != "" {
+		t.Fatalf("released PAT lease owner = %q, want empty", owner)
+	}
+}
