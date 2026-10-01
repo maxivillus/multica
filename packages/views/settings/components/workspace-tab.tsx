@@ -322,7 +322,7 @@ export function WorkspaceTab() {
     savedValue: savedCardSessionSettings,
     onSave: saveCardSessionSettings,
     onSuccess: () =>
-      toast.success(t(($) => $.workspace.toast_saved), {
+      toast.success(t(($) => $.auto_save.toast_saved), {
         id: "settings-auto-save",
       }),
     onError: (error) =>
