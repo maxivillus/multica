@@ -22,6 +22,32 @@ type Backend interface {
 	Execute(ctx context.Context, prompt string, opts ExecOptions) (*Session, error)
 }
 
+// PersistentBackend is the optional process-lifetime contract used by card
+// sessions. OpenPersistent starts one provider process and returns a handle
+// whose Execute calls are serialized by the caller while the process remains
+// alive between turns. Backends that cannot provide this contract must not be
+// silently wrapped in the one-shot Execute path for a live card session.
+type PersistentBackend interface {
+	Backend
+	OpenPersistent(ctx context.Context, opts ExecOptions) (PersistentSession, error)
+}
+
+// PersistentSession represents one provider process and conversation. Execute
+// runs one turn and returns its usual streaming Session; the process remains
+// owned by the PersistentSession after that Session reaches a terminal result.
+// Close is idempotent and is the only operation that ends the provider
+// process. ProcessID is diagnostic and lets lifecycle tests prove that two
+// turns used the same OS process.
+type PersistentSession interface {
+	Execute(ctx context.Context, prompt string, opts ExecOptions) (*Session, error)
+	Close() error
+	ProcessID() int
+	// IsClosed reports whether the provider process can accept another turn.
+	// A process may exit outside Close (for example after a provider crash), so
+	// the daemon can evict that dead handle instead of retrying it forever.
+	IsClosed() bool
+}
+
 // ExecOptions configures a single execution.
 type ExecOptions struct {
 	// EnableTaskSupplement installs provider hooks only for runs whose daemon/server
@@ -118,6 +144,11 @@ type ExecOptions struct {
 	// routing; empty means inherit local Codex config.
 	// Other providers ignore this field.
 	ServiceTier string
+	// TaskAuthToken is an ephemeral credential supplied only to a persistent
+	// backend's per-turn broker. It must never be copied into a provider
+	// process environment; one-shot backends ignore it. The daemon clears the
+	// broker credential when the turn reaches its terminal boundary.
+	TaskAuthToken string
 	// OpenclawMode chooses between local (embedded) and gateway routing for
 	// the openclaw backend. "" or "local" keeps the historical behaviour —
 	// the daemon spawns `openclaw agent --local …` and the agent loop runs

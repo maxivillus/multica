@@ -163,6 +163,104 @@ func (h *Handler) PinTaskSession(w http.ResponseWriter, r *http.Request) {
 	w.WriteHeader(http.StatusNoContent)
 }
 
+// CardSessionLeaseRequest carries the fencing epoch returned by the start
+// transition. The owner is taken from daemon authentication or the task's
+// server-side runtime identity, never from the request body.
+type CardSessionLeaseRequest struct {
+	LeaseEpoch int64 `json:"lease_epoch"`
+}
+
+type CardSessionLeaseResponse struct {
+	CardSessionID    string `json:"card_session_id"`
+	Generation       int64  `json:"generation"`
+	LeaseEpoch       int64  `json:"lease_epoch"`
+	LeaseHeartbeatAt string `json:"lease_heartbeat_at,omitempty"`
+	IdleTimeoutHours int    `json:"card_session_idle_timeout_hours,omitempty"`
+}
+
+func cardSessionLeaseResponse(session db.CardSession) CardSessionLeaseResponse {
+	return CardSessionLeaseResponse{
+		CardSessionID:    uuidToString(session.ID),
+		Generation:       session.Generation,
+		LeaseEpoch:       session.LeaseEpoch,
+		LeaseHeartbeatAt: timestampToString(session.LeaseHeartbeatAt),
+	}
+}
+
+// HeartbeatCardSessionLease keeps the live-provider ownership fence alive.
+// It intentionally does not touch card-session activity, so an idle process
+// cannot prevent the configured idle timeout from closing its generation.
+func (h *Handler) HeartbeatCardSessionLease(w http.ResponseWriter, r *http.Request) {
+	taskID := chi.URLParam(r, "taskId")
+	task, ok := h.requireDaemonTaskAccess(w, r, taskID)
+	if !ok {
+		return
+	}
+	owner, ownerErr := h.daemonLeaseOwnerForTask(r.Context(), task)
+	if ownerErr != nil {
+		slog.Warn("resolve card-session heartbeat owner failed", "task_id", taskID, "error", ownerErr)
+		writeError(w, http.StatusInternalServerError, "failed to load task runtime")
+		return
+	}
+	if owner == "" {
+		writeError(w, http.StatusForbidden, "daemon lease owner required")
+		return
+	}
+	var req CardSessionLeaseRequest
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil || req.LeaseEpoch <= 0 {
+		writeError(w, http.StatusBadRequest, "lease_epoch must be a positive integer")
+		return
+	}
+	session, err := h.TaskService.HeartbeatCardSessionLeaseByTask(r.Context(), parseUUID(taskID), owner, req.LeaseEpoch)
+	if err != nil {
+		if errors.Is(err, service.ErrCardSessionLeaseUnavailable) {
+			writeError(w, http.StatusConflict, "card session lease is no longer owned")
+			return
+		}
+		slog.Warn("heartbeat card session lease failed", "task_id", taskID, "error", err)
+		writeError(w, http.StatusInternalServerError, "heartbeat card session lease failed")
+		return
+	}
+	writeJSON(w, http.StatusOK, cardSessionLeaseResponse(session))
+}
+
+// ReleaseCardSessionLease is used when a live provider host closes normally.
+// Owner and epoch are both required so a stale process cannot release a newer
+// host's lease.
+func (h *Handler) ReleaseCardSessionLease(w http.ResponseWriter, r *http.Request) {
+	taskID := chi.URLParam(r, "taskId")
+	task, ok := h.requireDaemonTaskAccess(w, r, taskID)
+	if !ok {
+		return
+	}
+	owner, ownerErr := h.daemonLeaseOwnerForTask(r.Context(), task)
+	if ownerErr != nil {
+		slog.Warn("resolve card-session release owner failed", "task_id", taskID, "error", ownerErr)
+		writeError(w, http.StatusInternalServerError, "failed to load task runtime")
+		return
+	}
+	if owner == "" {
+		writeError(w, http.StatusForbidden, "daemon lease owner required")
+		return
+	}
+	var req CardSessionLeaseRequest
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil || req.LeaseEpoch <= 0 {
+		writeError(w, http.StatusBadRequest, "lease_epoch must be a positive integer")
+		return
+	}
+	session, err := h.TaskService.ReleaseCardSessionLeaseByTask(r.Context(), parseUUID(taskID), owner, req.LeaseEpoch)
+	if err != nil {
+		if errors.Is(err, service.ErrCardSessionLeaseUnavailable) {
+			writeError(w, http.StatusConflict, "card session lease is no longer owned")
+			return
+		}
+		slog.Warn("release card session lease failed", "task_id", taskID, "error", err)
+		writeError(w, http.StatusInternalServerError, "release card session lease failed")
+		return
+	}
+	writeJSON(w, http.StatusOK, cardSessionLeaseResponse(session))
+}
+
 // RerunIssueRequest is the optional body of POST /api/issues/{id}/rerun.
 // All fields are optional; an empty body keeps the legacy "rerun the issue's
 // current assignee" behaviour used by the CLI.

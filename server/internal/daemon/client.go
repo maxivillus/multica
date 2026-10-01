@@ -477,7 +477,20 @@ const (
 var errStartClaimRejected = errors.New("task start claim rejected")
 
 func (c *Client) StartTask(ctx context.Context, task Task, capabilities ...string) (bool, error) {
+	negotiated, _, err := c.startTask(ctx, task, capabilities...)
+	return negotiated, err
+}
+
+// StartTaskWithLease is the lease-aware start variant. It preserves the
+// existing StartTask signature for older daemon call sites while exposing the
+// server-issued card-session fencing epoch to a live-session coordinator.
+func (c *Client) StartTaskWithLease(ctx context.Context, task Task, capabilities ...string) (bool, CardSessionLease, error) {
+	return c.startTask(ctx, task, capabilities...)
+}
+
+func (c *Client) startTask(ctx context.Context, task Task, capabilities ...string) (bool, CardSessionLease, error) {
 	var negotiated bool
+	var lease CardSessionLease
 	var decodeResponse responseDecoder = func(r io.Reader) error {
 		data, err := io.ReadAll(io.LimitReader(r, maxStartTaskResponseBytes+1))
 		if err != nil {
@@ -488,6 +501,11 @@ func (c *Client) StartTask(ctx context.Context, task Task, capabilities ...strin
 		}
 		var response struct {
 			SupplementCapability string `json:"supplement_capability"`
+			CardSessionID        string `json:"card_session_id"`
+			Generation           int64  `json:"generation"`
+			LeaseEpoch           int64  `json:"lease_epoch"`
+			LeaseHeartbeatAt     string `json:"lease_heartbeat_at"`
+			IdleTimeoutHours     int    `json:"card_session_idle_timeout_hours"`
 		}
 		// Empty acknowledgements start the task without negotiating supplements.
 		// Invalid JSON fails without retrying; transport read failures can retry.
@@ -497,16 +515,23 @@ func (c *Client) StartTask(ctx context.Context, task Task, capabilities ...strin
 			}
 		}
 		negotiated = response.SupplementCapability == protocol.DaemonCapabilityTaskSupplementV1
+		lease = CardSessionLease{
+			CardSessionID:    response.CardSessionID,
+			Generation:       response.Generation,
+			LeaseEpoch:       response.LeaseEpoch,
+			LeaseHeartbeatAt: response.LeaseHeartbeatAt,
+			IdleTimeoutHours: response.IdleTimeoutHours,
+		}
 		return nil
 	}
 	path := fmt.Sprintf("/api/daemon/tasks/%s/start", task.ID)
 	if !task.StartClaimSupported {
 		// Old servers have no safe replay contract. Preserve one attempt.
 		err := c.postJSON(ctx, path, map[string]any{"capabilities": capabilities}, decodeResponse)
-		return err == nil && negotiated, err
+		return err == nil && negotiated, lease, err
 	}
 	if task.RuntimeID == "" || task.DispatchedAt == "" {
-		return false, fmt.Errorf("start task: claim is missing runtime_id or dispatched_at")
+		return false, lease, fmt.Errorf("start task: claim is missing runtime_id or dispatched_at")
 	}
 	ctx, cancel := context.WithTimeout(ctx, startTaskTimeout)
 	defer cancel()
@@ -517,9 +542,9 @@ func (c *Client) StartTask(ctx context.Context, task Task, capabilities ...strin
 	}, decodeResponse, startTaskRetrySchedule)
 	var reqErr *requestError
 	if errors.As(err, &reqErr) && reqErr.StatusCode == http.StatusConflict {
-		return false, fmt.Errorf("%w: %w", errStartClaimRejected, err)
+		return false, lease, fmt.Errorf("%w: %w", errStartClaimRejected, err)
 	}
-	return err == nil && negotiated, err
+	return err == nil && negotiated, lease, err
 }
 
 // MarkTaskWaitingLocalDirectory parks a freshly-dispatched task in the
@@ -700,6 +725,28 @@ func (c *Client) PinTaskSession(ctx context.Context, taskID, sessionID, workDir 
 		body["work_dir"] = workDir
 	}
 	return c.postJSON(ctx, fmt.Sprintf("/api/daemon/tasks/%s/session", taskID), body, nil)
+}
+
+// HeartbeatCardSessionLease refreshes the server-side fencing timestamp for a
+// live provider host. The epoch is mandatory: a process from before takeover
+// must not be able to keep the replacement lease alive.
+func (c *Client) HeartbeatCardSessionLease(ctx context.Context, taskID string, leaseEpoch int64) (CardSessionLease, error) {
+	var lease CardSessionLease
+	err := c.postJSON(ctx, fmt.Sprintf("/api/daemon/tasks/%s/card-session/heartbeat", taskID), map[string]any{
+		"lease_epoch": leaseEpoch,
+	}, &lease)
+	return lease, err
+}
+
+// ReleaseCardSessionLease clears a live-provider lease on a normal host
+// shutdown. The server checks the owner from daemon authentication and the
+// epoch from this request.
+func (c *Client) ReleaseCardSessionLease(ctx context.Context, taskID string, leaseEpoch int64) (CardSessionLease, error) {
+	var lease CardSessionLease
+	err := c.postJSON(ctx, fmt.Sprintf("/api/daemon/tasks/%s/card-session/release", taskID), map[string]any{
+		"lease_epoch": leaseEpoch,
+	}, &lease)
+	return lease, err
 }
 
 // RecoverOrphans tells the server to fail any dispatched/running tasks the
