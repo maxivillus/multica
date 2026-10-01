@@ -152,7 +152,7 @@ func TestStartTaskWithLeaseAndCardSessionLeaseEndpoints(t *testing.T) {
 			if body["runtime_id"] != "runtime-1" {
 				t.Fatalf("start runtime_id = %#v", body["runtime_id"])
 			}
-			response = `{"supplement_capability":"task-supplement-v1","card_session_id":"session-1","generation":4,"lease_epoch":7,"lease_heartbeat_at":"2026-09-30T09:00:00Z","card_session_idle_timeout_hours":48}`
+			response = `{"supplement_capability":"task-supplement-v1","card_session_id":"session-1","card_session_generation":4,"card_session_lease_epoch":7,"lease_heartbeat_at":"2026-09-30T09:00:00Z","card_session_idle_timeout_hours":48}`
 		case "/api/daemon/tasks/task-1/card-session/heartbeat":
 			if body["lease_epoch"] != float64(7) {
 				t.Fatalf("heartbeat lease_epoch = %#v", body["lease_epoch"])
