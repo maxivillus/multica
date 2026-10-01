@@ -1601,6 +1601,8 @@ func NewRouterWithOptions(pool *pgxpool.Pool, hub *realtime.Hub, bus *events.Bus
 
 		r.Post("/runtimes/{runtimeId}/recover-orphans", h.RecoverOrphanedTasks)
 		r.Post("/tasks/{taskId}/session", h.PinTaskSession)
+		r.Post("/tasks/{taskId}/card-session/heartbeat", h.HeartbeatCardSessionLease)
+		r.Post("/tasks/{taskId}/card-session/release", h.ReleaseCardSessionLease)
 	})
 
 	// Public Plugin Action API. This is the stable, globally versioned contract

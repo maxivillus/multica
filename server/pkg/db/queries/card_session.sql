@@ -97,6 +97,8 @@ RETURNING *;
 UPDATE card_session
 SET state = 'open',
     pause_reason = NULL,
+    lease_owner = CASE WHEN state = 'paused' THEN NULL ELSE lease_owner END,
+    lease_heartbeat_at = CASE WHEN state = 'paused' THEN NULL ELSE lease_heartbeat_at END,
     last_activity_at = now(),
     updated_at = now()
 WHERE id = $1
@@ -113,6 +115,8 @@ SET state = 'paused',
         WHEN issue_status_allows_agent_task(issue.workspace_id, issue.status) THEN 'unassigned'
         ELSE issue_effective_status(issue.workspace_id, issue.status)
     END,
+    lease_owner = NULL,
+    lease_heartbeat_at = NULL,
     last_activity_at = now(),
     updated_at = now()
 FROM issue
@@ -134,6 +138,8 @@ UPDATE card_session AS cs
 SET state = 'closed',
     pause_reason = NULL,
     closed_at = now(),
+    lease_owner = NULL,
+    lease_heartbeat_at = NULL,
     updated_at = now()
 FROM workspace AS w
 WHERE cs.workspace_id = $1
@@ -172,6 +178,8 @@ UPDATE card_session AS cs
 SET state = 'closed',
     pause_reason = NULL,
     closed_at = now(),
+    lease_owner = NULL,
+    lease_heartbeat_at = NULL,
     updated_at = now()
 FROM workspace AS w
 WHERE w.id = cs.workspace_id
@@ -227,6 +235,85 @@ WHERE t.id = $1
           END)
       )
   );
+
+-- name: GetCardSession :one
+SELECT *
+FROM card_session
+WHERE id = $1;
+
+-- name: AcquireCardSessionLeaseForTask :one
+-- A live provider host acquires the current generation only when no other
+-- owner has a fresh heartbeat. A same-owner replay with a fresh heartbeat is
+-- idempotent; a takeover or stale same-owner recovery advances the fencing
+-- epoch. The task binding keeps a stale task from acquiring a newer generation.
+UPDATE card_session AS cs
+SET lease_owner = NULLIF(sqlc.arg(lease_owner)::text, ''),
+    lease_epoch = cs.lease_epoch + CASE
+        WHEN cs.lease_owner = sqlc.arg(lease_owner)::text
+             AND cs.lease_heartbeat_at > now() - make_interval(secs => sqlc.arg(stale_after_seconds)::double precision)
+            THEN 0
+        ELSE 1
+    END,
+    lease_heartbeat_at = now(),
+    updated_at = now()
+FROM agent_task_queue AS task
+WHERE task.id = sqlc.arg(task_id)
+  AND task.card_session_id = cs.id
+  AND task.status = 'running'
+  AND cs.state = 'open'
+  AND NULLIF(sqlc.arg(lease_owner)::text, '') IS NOT NULL
+  AND (
+      cs.lease_owner IS NULL
+      OR cs.lease_heartbeat_at IS NULL
+      OR cs.lease_heartbeat_at <= now() - make_interval(secs => sqlc.arg(stale_after_seconds)::double precision)
+      OR cs.lease_owner = sqlc.arg(lease_owner)::text
+  )
+RETURNING cs.*;
+
+-- name: HeartbeatCardSessionLeaseByTask :one
+-- Heartbeats fence ownership only; they must never extend card idle activity.
+UPDATE card_session AS cs
+SET lease_heartbeat_at = now(),
+    updated_at = now()
+FROM agent_task_queue AS task
+WHERE task.id = sqlc.arg(task_id)
+  AND task.card_session_id = cs.id
+  AND cs.state = 'open'
+  AND cs.lease_owner = sqlc.arg(lease_owner)::text
+  AND cs.lease_epoch = sqlc.arg(lease_epoch)
+RETURNING cs.*;
+
+-- name: ReleaseCardSessionLeaseByTask :one
+-- Release is fenced by both owner and epoch so a previous process cannot
+-- clear a lease acquired by its replacement.
+UPDATE card_session AS cs
+SET lease_owner = NULL,
+    lease_heartbeat_at = NULL,
+    updated_at = now()
+FROM agent_task_queue AS task
+WHERE task.id = sqlc.arg(task_id)
+  AND task.card_session_id = cs.id
+  AND cs.state <> 'closed'
+  AND cs.lease_owner = sqlc.arg(lease_owner)::text
+  AND cs.lease_epoch = sqlc.arg(lease_epoch)
+RETURNING cs.*;
+
+-- name: FinalizeCardSessionProviderStateByTask :exec
+-- The provider can reveal its session only in the terminal result. Persist
+-- that pointer in the same transaction as the task transition so the next
+-- comment cannot claim the card between completion and the asynchronous pin.
+-- Empty values intentionally preserve the last known pointer: a provider
+-- turn may finish without repeating its stable session id.
+UPDATE card_session AS cs
+SET provider_session_id = COALESCE(NULLIF(sqlc.arg(provider_session_id), ''), cs.provider_session_id),
+    work_dir = COALESCE(NULLIF(sqlc.arg(work_dir), ''), cs.work_dir),
+    last_activity_at = now(),
+    updated_at = now()
+FROM agent_task_queue AS t
+WHERE t.id = sqlc.arg(task_id)
+  AND t.card_session_id = cs.id
+  AND cs.state <> 'closed'
+  AND t.status IN ('completed', 'failed', 'cancelled');
 
 -- name: TouchCardSessionsForTasks :exec
 -- Provider usage and committed task transitions advance activity after their

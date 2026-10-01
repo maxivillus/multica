@@ -5,6 +5,7 @@ import (
 	"errors"
 	"fmt"
 	"log/slog"
+	"strings"
 	"time"
 
 	"github.com/jackc/pgx/v5"
@@ -21,8 +22,13 @@ var (
 	ErrCardSessionCapacity = errors.New("card session capacity exhausted")
 	ErrCardSessionStatus   = errors.New("issue status does not allow an active card session")
 	ErrCardSessionInactive = ErrCardSessionStatus
-	ErrIssueTaskCancelled  = errors.New("issue is cancelled; agent task was not created")
-	ErrIssueTaskUnavailable = errors.New("issue is unavailable; agent task was not created")
+	// ErrCardSessionLeaseUnavailable is returned when another provider host
+	// still owns the open generation with a fresh heartbeat. Callers must not
+	// fall back to a second live process in that case.
+	ErrCardSessionLeaseUnavailable = errors.New("card session lease unavailable")
+	ErrCardSessionLeaseOwner       = errors.New("card session lease owner is required")
+	ErrIssueTaskCancelled          = errors.New("issue is cancelled; agent task was not created")
+	ErrIssueTaskUnavailable        = errors.New("issue is unavailable; agent task was not created")
 )
 
 const (
@@ -33,6 +39,10 @@ const (
 	cardSessionEventCapacity           = "capacity"
 	cardSessionCapacityRetryDelay      = 30 * time.Second
 	cardSessionCapacityWaiterBatchSize = 20
+	// A host that stops heartbeating is fenced after this bounded window. The
+	// value is deliberately independent from idle_timeout_hours: a lease
+	// heartbeat proves ownership, not user activity.
+	cardSessionLeaseStaleAfter = 90 * time.Second
 )
 
 func (s *TaskService) observeCardSession(ctx context.Context, event, result string, session db.CardSession, attrs ...any) {
@@ -403,6 +413,91 @@ func (s *TaskService) UpdateCardSessionProviderState(ctx context.Context, taskID
 	}
 	s.ObserveCardSessionProviderPinDuration(ctx, taskID, result, time.Since(started))
 	return err
+}
+
+// acquireCardSessionLeaseWithQueries fences a provider host to the generation
+// already bound to taskID. It is called inside the task-start transaction so a
+// successful running transition and lease acquisition commit together.
+func (s *TaskService) acquireCardSessionLeaseWithQueries(ctx context.Context, q *db.Queries, taskID pgtype.UUID, owner string) (db.CardSession, error) {
+	owner = strings.TrimSpace(owner)
+	if owner == "" {
+		return db.CardSession{}, ErrCardSessionLeaseOwner
+	}
+	if q == nil {
+		return db.CardSession{}, nil
+	}
+	session, err := q.AcquireCardSessionLeaseForTask(ctx, db.AcquireCardSessionLeaseForTaskParams{
+		LeaseOwner:        owner,
+		TaskID:            taskID,
+		StaleAfterSeconds: cardSessionLeaseStaleAfter.Seconds(),
+	})
+	if errors.Is(err, pgx.ErrNoRows) {
+		return db.CardSession{}, fmt.Errorf("%w: task=%s", ErrCardSessionLeaseUnavailable, util.UUIDToString(taskID))
+	}
+	if err != nil {
+		return db.CardSession{}, fmt.Errorf("acquire card session lease: %w", err)
+	}
+	return session, nil
+}
+
+// AcquireCardSessionLeaseForTask is the explicit lease boundary for a daemon
+// that owns a live provider host. A fresh same-owner replay is idempotent;
+// takeover and stale-owner recovery advance the fencing epoch.
+func (s *TaskService) AcquireCardSessionLeaseForTask(ctx context.Context, taskID pgtype.UUID, owner string) (db.CardSession, error) {
+	if s == nil || s.Queries == nil {
+		return db.CardSession{}, nil
+	}
+	return s.acquireCardSessionLeaseWithQueries(ctx, s.Queries, taskID, owner)
+}
+
+// HeartbeatCardSessionLeaseByTask refreshes only the lease timestamp. It does
+// not touch last_activity_at, so a live but idle provider can still expire by
+// the configured card-session timeout.
+func (s *TaskService) HeartbeatCardSessionLeaseByTask(ctx context.Context, taskID pgtype.UUID, owner string, epoch int64) (db.CardSession, error) {
+	owner = strings.TrimSpace(owner)
+	if owner == "" {
+		return db.CardSession{}, ErrCardSessionLeaseOwner
+	}
+	if s == nil || s.Queries == nil {
+		return db.CardSession{}, nil
+	}
+	session, err := s.Queries.HeartbeatCardSessionLeaseByTask(ctx, db.HeartbeatCardSessionLeaseByTaskParams{
+		TaskID:     taskID,
+		LeaseOwner: owner,
+		LeaseEpoch: epoch,
+	})
+	if errors.Is(err, pgx.ErrNoRows) {
+		return db.CardSession{}, fmt.Errorf("%w: heartbeat rejected for task=%s epoch=%d", ErrCardSessionLeaseUnavailable, util.UUIDToString(taskID), epoch)
+	}
+	if err != nil {
+		return db.CardSession{}, fmt.Errorf("heartbeat card session lease: %w", err)
+	}
+	return session, nil
+}
+
+// ReleaseCardSessionLeaseByTask clears a lease only when both owner and epoch
+// still match. A stale process therefore cannot release its replacement's
+// lease.
+func (s *TaskService) ReleaseCardSessionLeaseByTask(ctx context.Context, taskID pgtype.UUID, owner string, epoch int64) (db.CardSession, error) {
+	owner = strings.TrimSpace(owner)
+	if owner == "" {
+		return db.CardSession{}, ErrCardSessionLeaseOwner
+	}
+	if s == nil || s.Queries == nil {
+		return db.CardSession{}, nil
+	}
+	session, err := s.Queries.ReleaseCardSessionLeaseByTask(ctx, db.ReleaseCardSessionLeaseByTaskParams{
+		TaskID:     taskID,
+		LeaseOwner: owner,
+		LeaseEpoch: epoch,
+	})
+	if errors.Is(err, pgx.ErrNoRows) {
+		return db.CardSession{}, fmt.Errorf("%w: release rejected for task=%s epoch=%d", ErrCardSessionLeaseUnavailable, util.UUIDToString(taskID), epoch)
+	}
+	if err != nil {
+		return db.CardSession{}, fmt.Errorf("release card session lease: %w", err)
+	}
+	return session, nil
 }
 
 // bindStartedIssueTaskToCardSession fixes the issue task's generation before
