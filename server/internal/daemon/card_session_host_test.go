@@ -90,11 +90,19 @@ func (s *fakePersistentSession) IsClosed() bool {
 func TestCardSessionIDForTurnPrefersStartAcknowledgement(t *testing.T) {
 	claimed := Task{CardSessionID: "claimed-session"}
 
-	if got := cardSessionIDForTurn(claimed, CardSessionLease{CardSessionID: "started-session"}); got != "started-session" {
+	if got := cardSessionIDForTurn(claimed, CardSessionLease{CardSessionID: "started-session", LeaseEpoch: 7}); got != "started-session" {
 		t.Fatalf("card session id = %q, want start acknowledgement id", got)
 	}
-	if got := cardSessionIDForTurn(claimed, CardSessionLease{}); got != "claimed-session" {
-		t.Fatalf("card session id = %q, want claimed id when acknowledgement is empty", got)
+	if got := cardSessionIDForTurn(claimed, CardSessionLease{}); got != "" {
+		t.Fatalf("unfenced card session id = %q, want empty", got)
+	}
+}
+
+func TestCardSessionIDForTurnSkipsUnfencedSession(t *testing.T) {
+	claimed := Task{CardSessionID: "claimed-session"}
+
+	if got := cardSessionIDForTurn(claimed, CardSessionLease{CardSessionID: "started-session"}); got != "" {
+		t.Fatalf("unfenced card session id = %q, want empty", got)
 	}
 }
 

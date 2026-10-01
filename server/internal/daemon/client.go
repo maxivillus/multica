@@ -501,12 +501,12 @@ func (c *Client) startTask(ctx context.Context, task Task, capabilities ...strin
 			return fmt.Errorf("%w: task start exceeds %d bytes", errInvalidResponseBody, maxStartTaskResponseBytes)
 		}
 		var response struct {
-			SupplementCapability string `json:"supplement_capability"`
-			CardSessionID        string `json:"card_session_id"`
-			Generation           int64  `json:"generation"`
-			LeaseEpoch           int64  `json:"lease_epoch"`
-			LeaseHeartbeatAt     string `json:"lease_heartbeat_at"`
-			IdleTimeoutHours     int    `json:"card_session_idle_timeout_hours"`
+			SupplementCapability  string `json:"supplement_capability"`
+			CardSessionID         string `json:"card_session_id"`
+			CardSessionGeneration int64  `json:"card_session_generation"`
+			CardSessionLeaseEpoch int64  `json:"card_session_lease_epoch"`
+			LeaseHeartbeatAt      string `json:"lease_heartbeat_at"`
+			IdleTimeoutHours      int    `json:"card_session_idle_timeout_hours"`
 		}
 		// Empty acknowledgements start the task without negotiating supplements.
 		// Invalid JSON fails without retrying; transport read failures can retry.
@@ -518,8 +518,8 @@ func (c *Client) startTask(ctx context.Context, task Task, capabilities ...strin
 		negotiated = response.SupplementCapability == protocol.DaemonCapabilityTaskSupplementV1
 		lease = CardSessionLease{
 			CardSessionID:    response.CardSessionID,
-			Generation:       response.Generation,
-			LeaseEpoch:       response.LeaseEpoch,
+			Generation:       response.CardSessionGeneration,
+			LeaseEpoch:       response.CardSessionLeaseEpoch,
 			LeaseHeartbeatAt: response.LeaseHeartbeatAt,
 			IdleTimeoutHours: response.IdleTimeoutHours,
 		}

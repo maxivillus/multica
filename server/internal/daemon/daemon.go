@@ -7710,10 +7710,13 @@ func logFreshSessionStartFailure(taskLog *slog.Logger, err error) {
 	taskLog.Error("fresh session also failed to start; keeping the original poisoned result", "error_present", err != nil)
 }
 
-// cardSessionIDForTurn uses the start acknowledgement as the authoritative
-// card binding. Claims are assembled before StartTask lazily binds an issue to
-// its generation, so the claimed Task often has no card session id yet.
+// cardSessionIDForTurn returns a persistent binding only when the start
+// acknowledgement includes a fencing epoch. Older servers may return a card
+// session id without fencing; those turns must use the one-shot path.
 func cardSessionIDForTurn(task Task, lease CardSessionLease) string {
+	if lease.LeaseEpoch <= 0 {
+		return ""
+	}
 	if lease.CardSessionID != "" {
 		return lease.CardSessionID
 	}
