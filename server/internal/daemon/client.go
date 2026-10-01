@@ -506,6 +506,7 @@ func (c *Client) startTask(ctx context.Context, task Task, capabilities ...strin
 			Generation           int64  `json:"generation"`
 			LeaseEpoch           int64  `json:"lease_epoch"`
 			LeaseHeartbeatAt     string `json:"lease_heartbeat_at"`
+			IdleTimeoutHours     int    `json:"card_session_idle_timeout_hours"`
 		}
 		// Empty acknowledgements start the task without negotiating supplements.
 		// Invalid JSON fails without retrying; transport read failures can retry.
@@ -520,6 +521,7 @@ func (c *Client) startTask(ctx context.Context, task Task, capabilities ...strin
 			Generation:       response.Generation,
 			LeaseEpoch:       response.LeaseEpoch,
 			LeaseHeartbeatAt: response.LeaseHeartbeatAt,
+			IdleTimeoutHours: response.IdleTimeoutHours,
 		}
 		return nil
 	}

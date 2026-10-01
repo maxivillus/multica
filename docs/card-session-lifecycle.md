@@ -42,11 +42,13 @@ idempotent; a different owner can take over only after the 90-second lease
 heartbeat window is stale, and every takeover advances `lease_epoch`.
 
 The daemon API exposes heartbeat and release operations fenced by
-`lease_owner + lease_epoch`. Heartbeat updates only the lease timestamp; it
-never updates `last_activity_at`, so an idle provider host cannot keep a card
-generation alive indefinitely. State transitions to `paused` or `closed`
-clear the lease in both the service and database-trigger paths, and a stale
-owner cannot release a replacement lease.
+`lease_owner + lease_epoch`. The daemon keeps the lease heartbeat running for
+the whole live host, including the idle window; closing the host sends the
+fenced release. Heartbeat updates only the lease timestamp; it never updates
+`last_activity_at`, so an idle provider host cannot keep a card generation
+alive indefinitely. State transitions to `paused` or `closed` clear the lease
+in both the service and database-trigger paths, and a stale owner cannot
+release a replacement lease.
 
 ### Token statistics
 
@@ -86,7 +88,18 @@ The daemon pins the same state as soon as it is observed and repeats the pin in
 the transaction that completes or fails a task. This closes the hand-off window
 where a follow-up comment could be claimed after the task ended but before an
 asynchronous pin reached the database. The durable generation remains
-available across daemon or process restarts. The lease is the fencing contract
-for a future live provider host; the current one-shot backend execution path
-still uses provider resume/rejoin after the task boundary and does not keep a
-provider process alive for the entire idle window.
+available across daemon or process restarts.
+
+For Codex, the daemon now opens one app-server process and one provider thread
+per card-session generation. Every subsequent task on that generation sends a
+new `turn/start` to the same thread; the host registry serializes turns and
+keeps the process alive until local idle expiry, daemon shutdown, or provider
+failure. The provider process receives an opaque loopback broker credential;
+the current task credential is installed only for that turn and is cleared
+while the host is idle.
+
+Backends that do not implement the persistent multi-turn contract return an
+explicit unsupported error for a live card session. They do not silently fall
+back to the old one-shot path, because that would report continuity while
+starting a new process for every comment. Provider adapters must implement the
+same contract before they can serve card-session generations.

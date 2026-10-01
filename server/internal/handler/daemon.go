@@ -22,6 +22,7 @@ import (
 	"github.com/jackc/pgx/v5/pgtype"
 	"github.com/multica-ai/multica/server/internal/analytics"
 	"github.com/multica-ai/multica/server/internal/auth"
+	"github.com/multica-ai/multica/server/internal/cardsession"
 	"github.com/multica-ai/multica/server/internal/daemonws"
 	"github.com/multica-ai/multica/server/internal/integrations/slack"
 	"github.com/multica-ai/multica/server/internal/issuestatus"
@@ -4217,6 +4218,15 @@ func (h *Handler) StartTask(w http.ResponseWriter, r *http.Request) {
 		if cardSession, sessionErr := h.Queries.GetCardSession(r.Context(), task.CardSessionID); sessionErr == nil {
 			resp.CardSessionGeneration = cardSession.Generation
 			resp.CardSessionLeaseEpoch = cardSession.LeaseEpoch
+			if workspace, workspaceErr := h.Queries.GetWorkspace(r.Context(), parseUUID(workspaceID)); workspaceErr == nil {
+				if settings, settingsErr := cardsession.Parse(workspace.Settings); settingsErr == nil {
+					resp.CardSessionIdleTimeoutHours = settings.IdleTimeoutHours
+				} else {
+					slog.Warn("start task: invalid card-session workspace settings; using server default", "task_id", taskID, "error", settingsErr)
+				}
+			} else if !errors.Is(workspaceErr, pgx.ErrNoRows) {
+				slog.Warn("start task: failed to load workspace card-session settings", "task_id", taskID, "error", workspaceErr)
+			}
 		} else if !errors.Is(sessionErr, pgx.ErrNoRows) {
 			slog.Warn("start task: failed to load card session lease epoch", "task_id", taskID, "card_session_id", uuidToString(task.CardSessionID), "error", sessionErr)
 		}

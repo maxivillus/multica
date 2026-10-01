@@ -152,7 +152,7 @@ func TestStartTaskWithLeaseAndCardSessionLeaseEndpoints(t *testing.T) {
 			if body["runtime_id"] != "runtime-1" {
 				t.Fatalf("start runtime_id = %#v", body["runtime_id"])
 			}
-			response = `{"supplement_capability":"task-supplement-v1","card_session_id":"session-1","generation":4,"lease_epoch":7,"lease_heartbeat_at":"2026-09-30T09:00:00Z"}`
+			response = `{"supplement_capability":"task-supplement-v1","card_session_id":"session-1","generation":4,"lease_epoch":7,"lease_heartbeat_at":"2026-09-30T09:00:00Z","card_session_idle_timeout_hours":48}`
 		case "/api/daemon/tasks/task-1/card-session/heartbeat":
 			if body["lease_epoch"] != float64(7) {
 				t.Fatalf("heartbeat lease_epoch = %#v", body["lease_epoch"])
@@ -177,7 +177,7 @@ func TestStartTaskWithLeaseAndCardSessionLeaseEndpoints(t *testing.T) {
 	if err != nil {
 		t.Fatalf("StartTaskWithLease: %v", err)
 	}
-	if !negotiated || lease.CardSessionID != "session-1" || lease.Generation != 4 || lease.LeaseEpoch != 7 || lease.LeaseHeartbeatAt != "2026-09-30T09:00:00Z" {
+	if !negotiated || lease.CardSessionID != "session-1" || lease.Generation != 4 || lease.LeaseEpoch != 7 || lease.LeaseHeartbeatAt != "2026-09-30T09:00:00Z" || lease.IdleTimeoutHours != 48 {
 		t.Fatalf("start lease = %#v, negotiated=%t", lease, negotiated)
 	}
 

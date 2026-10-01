@@ -1,6 +1,6 @@
 ## ADR-0001: Durable card session generations
 
-- Status: Accepted for the first implementation slice
+- Status: Superseded by [ADR-0002](ADR-0002-continuous-card-session-host.md)
 - Date: 2026-08-25
 
 ### Context
