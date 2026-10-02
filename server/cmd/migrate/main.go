@@ -459,11 +459,23 @@ func refuseChannelChatRouteHistoryRollbackWith(ctx context.Context, query rowQue
 
 var upMigrationConditions = map[string]migrationCondition{
 	// The fork previously used numeric prefixes 420 and 422 for card-session
-	// migrations. The schema ledger stores full migration names, so apply the
-	// renumbered migrations on fresh databases but preserve their existing DDL
-	// when an older fork ledger already records the corresponding version.
-	"564_card_sessions":                 skipIfMigrationRecorded("420_card_sessions"),
-	"566_card_session_cancel_retention": skipIfMigrationRecorded("422_card_session_cancel_retention"),
+	// migrations. A deployed fork then inserted the card-session series before
+	// the current upstream sequence, using 548–561. The schema ledger stores
+	// full migration names, so apply the renumbered migrations on fresh
+	// databases but preserve existing DDL when either legacy ledger is present.
+	"564_card_sessions":                              skipIfMigrationRecordedAny("420_card_sessions", "548_card_sessions"),
+	"566_card_session_cancel_retention":              skipIfMigrationRecordedAny("422_card_session_cancel_retention", "550_card_session_cancel_retention"),
+	"567_card_session_idle_lifecycle":                skipIfMigrationRecorded("551_card_session_idle_lifecycle"),
+	"568_card_session_workspace_activity_index":      skipIfMigrationRecorded("552_card_session_workspace_activity_index"),
+	"569_agent_task_card_session":                    skipIfMigrationRecorded("553_agent_task_card_session"),
+	"570_agent_task_card_session_index":              skipIfMigrationRecorded("554_agent_task_card_session_index"),
+	"571_card_session_one_resumable_per_issue_agent": skipIfMigrationRecorded("555_card_session_one_resumable_per_issue_agent"),
+	"572_card_session_workspace_state_index":         skipIfMigrationRecorded("556_card_session_workspace_state_index"),
+	"573_card_session_issue_index":                   skipIfMigrationRecorded("557_card_session_issue_index"),
+	"574_issue_task_cancel_outbox":                   skipIfMigrationRecorded("558_issue_task_cancel_outbox"),
+	"575_issue_task_lifecycle_lock":                  skipIfMigrationRecorded("559_issue_task_lifecycle_lock"),
+	"576_issue_task_cancel_outbox_created_index":     skipIfMigrationRecorded("560_issue_task_cancel_outbox_created_index"),
+	"577_card_session_lease_fencing":                 skipIfMigrationRecorded("561_card_session_lease_fencing"),
 	// Preserve applied history; pending 469 is superseded by the bounded expand
 	// migration. SaaS backfills separately; self-host converges in 491.
 	"469_issue_status_lifecycle_categories": skipMigration("superseded by 478 expansion and 491 convergence (MUL-7365)"),
@@ -493,11 +505,22 @@ var downMigrationConditions = map[string]migrationCondition{
 	// A skipped legacy migration must also remain intact during rollback: the
 	// new ledger rows are removed, while the old fork's schema and ledger rows
 	// stay at their original versions.
-	"564_card_sessions":                     skipIfMigrationRecorded("420_card_sessions"),
-	"566_card_session_cancel_retention":     skipIfMigrationRecorded("422_card_session_cancel_retention"),
-	"454_drop_comment_content_bigm_index":   whenOperatorClassAvailable(pgBigmOperatorClass),
-	"455_drop_comment_content_trgm_index":   whenOperatorClassUnavailable(pgBigmOperatorClass),
-	"463_drop_issue_description_bigm_index": whenOperatorClassAvailable(pgBigmOperatorClass),
+	"564_card_sessions":                              skipIfMigrationRecordedAny("420_card_sessions", "548_card_sessions"),
+	"566_card_session_cancel_retention":              skipIfMigrationRecordedAny("422_card_session_cancel_retention", "550_card_session_cancel_retention"),
+	"567_card_session_idle_lifecycle":                skipIfMigrationRecorded("551_card_session_idle_lifecycle"),
+	"568_card_session_workspace_activity_index":      skipIfMigrationRecorded("552_card_session_workspace_activity_index"),
+	"569_agent_task_card_session":                    skipIfMigrationRecorded("553_agent_task_card_session"),
+	"570_agent_task_card_session_index":              skipIfMigrationRecorded("554_agent_task_card_session_index"),
+	"571_card_session_one_resumable_per_issue_agent": skipIfMigrationRecorded("555_card_session_one_resumable_per_issue_agent"),
+	"572_card_session_workspace_state_index":         skipIfMigrationRecorded("556_card_session_workspace_state_index"),
+	"573_card_session_issue_index":                   skipIfMigrationRecorded("557_card_session_issue_index"),
+	"574_issue_task_cancel_outbox":                   skipIfMigrationRecorded("558_issue_task_cancel_outbox"),
+	"575_issue_task_lifecycle_lock":                  skipIfMigrationRecorded("559_issue_task_lifecycle_lock"),
+	"576_issue_task_cancel_outbox_created_index":     skipIfMigrationRecorded("560_issue_task_cancel_outbox_created_index"),
+	"577_card_session_lease_fencing":                 skipIfMigrationRecorded("561_card_session_lease_fencing"),
+	"454_drop_comment_content_bigm_index":            whenOperatorClassAvailable(pgBigmOperatorClass),
+	"455_drop_comment_content_trgm_index":            whenOperatorClassUnavailable(pgBigmOperatorClass),
+	"463_drop_issue_description_bigm_index":          whenOperatorClassAvailable(pgBigmOperatorClass),
 }
 
 func hooksForDirection(direction string) map[string]preMigrationHook {
@@ -544,17 +567,23 @@ func skipMigration(reason string) migrationCondition {
 }
 
 func skipIfMigrationRecorded(legacyVersion string) migrationCondition {
+	return skipIfMigrationRecordedAny(legacyVersion)
+}
+
+func skipIfMigrationRecordedAny(legacyVersions ...string) migrationCondition {
 	return func(ctx context.Context, conn *pgxpool.Conn) (bool, string, error) {
-		var legacyApplied bool
-		if err := conn.QueryRow(ctx, `
-			SELECT EXISTS (
-				SELECT 1 FROM schema_migrations WHERE version = $1
-			)
-		`, legacyVersion).Scan(&legacyApplied); err != nil {
-			return false, "", fmt.Errorf("check legacy migration %q: %w", legacyVersion, err)
-		}
-		if legacyApplied {
-			return false, "legacy migration " + legacyVersion + " is already recorded", nil
+		for _, legacyVersion := range legacyVersions {
+			var legacyApplied bool
+			if err := conn.QueryRow(ctx, `
+				SELECT EXISTS (
+					SELECT 1 FROM schema_migrations WHERE version = $1
+				)
+			`, legacyVersion).Scan(&legacyApplied); err != nil {
+				return false, "", fmt.Errorf("check legacy migration %q: %w", legacyVersion, err)
+			}
+			if legacyApplied {
+				return false, "legacy migration " + legacyVersion + " is already recorded", nil
+			}
 		}
 		return true, "", nil
 	}
