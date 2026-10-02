@@ -190,7 +190,7 @@ func TestTaskSupplementNegotiationFailsClosed(t *testing.T) {
 			if tc.daemonAdvertises {
 				capabilities = []string{protocol.DaemonCapabilityTaskSupplementV1}
 			}
-			req := withURLParam(newRequest(http.MethodPost, "/start", map[string]any{"capabilities": capabilities}), "taskId", fixture.taskID)
+			req := withURLParam(newDaemonTokenRequest(http.MethodPost, "/start", map[string]any{"capabilities": capabilities}, testWorkspaceID, "test-daemon"), "taskId", fixture.taskID)
 			var started AgentTaskResponse
 			testutil.Call(t, testHandler.StartTask, req).Want(http.StatusOK).JSON(&started)
 			if started.Status != "running" || started.StartedAt == nil {
@@ -217,7 +217,7 @@ func TestTaskSupplementCapabilityDoesNotBreakNonIssueStarts(t *testing.T) {
 			runtimeID := dbfx.Runtime(t, "supplement-no-issue", testutil.Cols{"provider": provider})
 			agentID := dbfx.Agent(t, "Supplement no issue", runtimeID)
 			taskID := dbfx.Task(t, agentID, testutil.Cols{"runtime_id": runtimeID, "issue_id": nil, "status": "dispatched"})
-			started, err := testHandler.TaskService.StartTask(t.Context(), parseUUID(taskID), true)
+			started, err := testHandler.TaskService.StartTaskWithCardSessionLease(t.Context(), parseUUID(taskID), "test-daemon", true)
 			if err != nil || started.Status != "running" {
 				t.Fatalf("non-issue start = %#v: %v", started, err)
 			}

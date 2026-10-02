@@ -284,6 +284,7 @@ func (h *Handler) maybeAutoCompleteIssue(ctx context.Context, workspaceID, issue
 		return
 	}
 	h.broadcastCancelledWakeups(ctx, updated.WorkspaceID, cancelledWakeups)
+	h.reconcileCardSessionStatus(ctx, issue, updated)
 	// A merged PR is the most common way a sub-issue reaches done; the parent
 	// hears about it on the same path as a manual status change.
 	if updated.ParentIssueID.Valid {

@@ -6,8 +6,8 @@
 -- cost_usd_ticks is the provider's own price for this usage (1e-10 USD), NULL
 -- when it reports none. It is overwritten like the token counters so a
 -- corrected report replaces the previous figure rather than accumulating.
-INSERT INTO task_usage (task_id, provider, model, input_tokens, output_tokens, cache_read_tokens, cache_write_tokens, cost_usd_ticks, updated_at)
-VALUES ($1, $2, $3, $4, $5, $6, $7, sqlc.narg('cost_usd_ticks'), now())
+INSERT INTO task_usage (task_id, provider, model, input_tokens, output_tokens, cache_read_tokens, cache_write_tokens, cost_usd_ticks, card_session_mode, updated_at)
+VALUES ($1, $2, $3, $4, $5, $6, $7, sqlc.narg('cost_usd_ticks'), sqlc.narg('card_session_mode'), now())
 ON CONFLICT (task_id, provider, model)
 DO UPDATE SET
     input_tokens = EXCLUDED.input_tokens,
@@ -15,6 +15,7 @@ DO UPDATE SET
     cache_read_tokens = EXCLUDED.cache_read_tokens,
     cache_write_tokens = EXCLUDED.cache_write_tokens,
     cost_usd_ticks = EXCLUDED.cost_usd_ticks,
+    card_session_mode = EXCLUDED.card_session_mode,
     updated_at = now();
 
 -- name: GetTaskUsage :many
@@ -43,7 +44,8 @@ SELECT
     tu.output_tokens,
     tu.cache_read_tokens,
     tu.cache_write_tokens,
-    tu.cost_usd_ticks
+    tu.cost_usd_ticks,
+    tu.card_session_mode
 FROM task_usage tu
 JOIN agent_task_queue atq ON atq.id = tu.task_id
 WHERE atq.issue_id = $1
@@ -62,7 +64,8 @@ SELECT
     tu.output_tokens,
     tu.cache_read_tokens,
     tu.cache_write_tokens,
-    tu.cost_usd_ticks
+    tu.cost_usd_ticks,
+    tu.card_session_mode
 FROM task_usage tu
 JOIN agent_task_queue atq ON atq.id = tu.task_id
 WHERE atq.agent_id = sqlc.arg('agent_id')
@@ -108,6 +111,22 @@ SELECT
     (terminal_runs.terminal_task_count - terminal_runs.metered_task_count)::int AS unreported_task_count
 FROM usage
 CROSS JOIN terminal_runs;
+
+-- The opened_at boundary and card_session_id scope the cumulative snapshot to
+-- one server-owned generation. This is an on-demand derived value; the
+-- card_session row does not store a second copy of task usage.
+-- name: GetCardSessionTokenUsage :one
+SELECT
+    COALESCE(SUM(tu.input_tokens), 0)::bigint AS total_input_tokens,
+    COALESCE(SUM(tu.output_tokens), 0)::bigint AS total_output_tokens,
+    COALESCE(SUM(tu.cache_read_tokens), 0)::bigint AS total_cache_read_tokens,
+    COALESCE(SUM(tu.cache_write_tokens), 0)::bigint AS total_cache_write_tokens,
+    COUNT(DISTINCT tu.task_id)::int AS task_count
+FROM task_usage AS tu
+JOIN agent_task_queue AS atq ON atq.id = tu.task_id
+JOIN card_session AS cs ON cs.id = atq.card_session_id
+WHERE cs.id = sqlc.arg(card_session_id)
+  AND tu.created_at >= cs.opened_at;
 
 -- name: ListDashboardUsageDaily :many
 -- Daily per-(date, provider, model) token aggregates for the workspace, served

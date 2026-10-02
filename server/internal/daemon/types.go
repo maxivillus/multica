@@ -110,6 +110,9 @@ type Task struct {
 	LeaderRoleResolved            bool                   `json:"leader_role_resolved,omitempty"`             // server capability: IsLeaderTask/SquadID authoritatively answer "is this a leader run". Absent on servers predating it — those before #4951 never sent is_leader_task at all, later ones send it without this guarantee — so taskIsSquadLeader falls back to the briefing marker for both (MUL-5811)
 	PriorSessionID                string                 `json:"prior_session_id,omitempty"`                 // Claude session ID from a previous task on this issue
 	PriorWorkDir                  string                 `json:"prior_work_dir,omitempty"`                   // work_dir from a previous task on this issue
+	CardSessionID                 string                 `json:"card_session_id,omitempty"`                  // server-owned card generation bound to this task
+	CardSessionGeneration         int64                  `json:"card_session_generation,omitempty"`          // generation number within the issue/agent pair
+	CardSessionLeaseEpoch         int64                  `json:"card_session_lease_epoch,omitempty"`         // fencing epoch returned after lease acquisition
 	PriorSessionResumeUnavailable bool                   `json:"prior_session_resume_unavailable,omitempty"` // MUL-5305: server signals a more recent Codex session was withheld (rollout missing) and PriorSessionID (if any) is an older fallback; the run must disclose the continuity gap even if that older session resumes cleanly. Absent/false on old servers.
 	TriggerCommentID              string                 `json:"trigger_comment_id,omitempty"`               // comment that triggered this task
 	CoalescedCommentIDs           []string               `json:"coalesced_comment_ids,omitempty"`            // MUL-4195: earlier comments folded into this run while it was still queued; the agent must address these in addition to the (newest) triggering comment. Empty for old servers / non-merged runs
@@ -178,6 +181,21 @@ type Task struct {
 	// Empty or non-task-scoped values are fatal for writable agent tasks; the
 	// daemon must not fall back to its own token. See MUL-3292.
 	AuthToken string `json:"auth_token,omitempty"`
+}
+
+// CardSessionLease is the non-secret fencing state returned by the daemon API.
+// Provider credentials and lease-owner identity stay on their respective
+// trust boundaries and are never serialized here.
+type CardSessionLease struct {
+	CardSessionID    string `json:"card_session_id"`
+	Generation       int64  `json:"generation"`
+	LeaseEpoch       int64  `json:"lease_epoch"`
+	LeaseHeartbeatAt string `json:"lease_heartbeat_at,omitempty"`
+	// IdleTimeoutHours is the workspace setting that the server uses to expire
+	// this card-session generation. It lets the daemon stop its local provider
+	// process on the same idle boundary instead of retaining it until a fixed
+	// host default.
+	IdleTimeoutHours int `json:"card_session_idle_timeout_hours,omitempty"`
 }
 
 // ChatAttachmentMeta is the structured attachment metadata the daemon
@@ -277,6 +295,7 @@ type SkillFileRefData struct {
 type TaskUsageEntry struct {
 	Provider         string `json:"provider"`
 	Model            string `json:"model"`
+	CardSessionMode  string `json:"card_session_mode,omitempty"`
 	InputTokens      int64  `json:"input_tokens"`
 	OutputTokens     int64  `json:"output_tokens"`
 	CacheReadTokens  int64  `json:"cache_read_tokens"`

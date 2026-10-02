@@ -139,6 +139,22 @@ func TestEffectiveIsIdentityOnBuiltInsWithoutQuerying(t *testing.T) {
 	}
 }
 
+func TestIsTerminalCoversDoneAndCancelledOnly(t *testing.T) {
+	for _, tc := range []struct {
+		category string
+		want     bool
+	}{
+		{Done, true},
+		{Cancelled, true},
+		{InReview, false},
+		{Blocked, false},
+	} {
+		if got := IsTerminal(tc.category); got != tc.want {
+			t.Errorf("IsTerminal(%q) = %t, want %t", tc.category, got, tc.want)
+		}
+	}
+}
+
 func TestEffectiveMapsCustomStatusToItsCategory(t *testing.T) {
 	q := newFakeQuerier(
 		custom("human_review", InReview),
@@ -156,6 +172,34 @@ func TestEffectiveMapsCustomStatusToItsCategory(t *testing.T) {
 	for key, want := range cases {
 		if got := Effective(context.Background(), q, testWorkspace, key); got != want {
 			t.Errorf("Effective(%q) = %q, want %q", key, got, want)
+		}
+	}
+}
+
+func TestAllowsAgentTaskPreservesBuiltInParkingAndCustomLifecycle(t *testing.T) {
+	q := newFakeQuerier(
+		custom("custom_unstarted", CategoryUnstarted),
+		custom("custom_started", CategoryStarted),
+		custom("custom_done", CategoryDone),
+		custom("custom_closed", CategoryClosed),
+	)
+	cases := map[string]bool{
+		Backlog:            false,
+		Todo:               true,
+		InProgress:         true,
+		InReview:           true,
+		Blocked:            false,
+		Done:               true,
+		Cancelled:          false,
+		"custom_unstarted": true,
+		"custom_started":   true,
+		"custom_done":      true,
+		"custom_closed":    false,
+		"unknown":          false,
+	}
+	for status, want := range cases {
+		if got := AllowsAgentTask(context.Background(), q, testWorkspace, status); got != want {
+			t.Errorf("AllowsAgentTask(%q) = %t, want %t", status, got, want)
 		}
 	}
 }

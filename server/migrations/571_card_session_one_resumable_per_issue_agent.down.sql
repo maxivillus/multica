@@ -1,0 +1,1 @@
+DROP INDEX CONCURRENTLY IF EXISTS card_session_one_resumable_per_issue_agent;

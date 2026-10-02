@@ -209,6 +209,10 @@ type streamProtocolObservation struct {
 // and environment values so diagnosing a missing terminal event cannot leak the
 // task transcript or provider credentials into daemon logs.
 func logStreamProtocolObservation(logger *slog.Logger, obs streamProtocolObservation) {
+	lastEventType := observedCursorEventType(obs.lastEventType)
+	if obs.provider == "qwen" {
+		lastEventType = safeQwenEventType(obs.lastEventType)
+	}
 	logger.Info("agent stream protocol summary",
 		"provider", obs.provider,
 		"cli_version", obs.cliVersion,
@@ -223,7 +227,7 @@ func logStreamProtocolObservation(logger *slog.Logger, obs streamProtocolObserva
 		"result_bytes", obs.resultBytes,
 		"last_assistant_bytes", obs.lastAssistantBytes,
 		"scanner_error", obs.scannerError,
-		"last_event_type", obs.lastEventType,
+		"last_event_type", lastEventType,
 		"unhandled_event_type_count", obs.unhandledEventTypeCount,
 		"unhandled_event_types", obs.unhandledEventTypes,
 		"unhandled_subtype_count", obs.unhandledSubtypeCount,

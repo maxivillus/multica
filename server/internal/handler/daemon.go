@@ -22,6 +22,7 @@ import (
 	"github.com/jackc/pgx/v5/pgtype"
 	"github.com/multica-ai/multica/server/internal/analytics"
 	"github.com/multica-ai/multica/server/internal/auth"
+	"github.com/multica-ai/multica/server/internal/cardsession"
 	"github.com/multica-ai/multica/server/internal/daemonws"
 	"github.com/multica-ai/multica/server/internal/integrations/slack"
 	"github.com/multica-ai/multica/server/internal/issuestatus"
@@ -163,6 +164,27 @@ func (h *Handler) requireDaemonTaskAccessWithWorkspace(w http.ResponseWriter, r 
 		return db.AgentTaskQueue{}, "", false
 	}
 	return task, wsID, true
+}
+
+// daemonLeaseOwnerForTask resolves the owner used by card-session fencing.
+// Daemon-token requests already carry the authenticated daemon id. PAT/JWT
+// fallback requests do not, so derive the same stable machine identity from
+// the task's server-side runtime instead of leaving a card session unfenced.
+func (h *Handler) daemonLeaseOwnerForTask(ctx context.Context, task db.AgentTaskQueue) (string, error) {
+	if owner := strings.TrimSpace(middleware.DaemonIDFromContext(ctx)); owner != "" {
+		return owner, nil
+	}
+	if !task.RuntimeID.Valid {
+		return "", nil
+	}
+	runtime, err := h.getAgentRuntime(ctx, obsmetrics.RuntimeLookupSourceDaemonAPI, task.RuntimeID)
+	if err != nil {
+		return "", fmt.Errorf("load task runtime for card-session lease: %w", err)
+	}
+	if !runtime.DaemonID.Valid {
+		return "", nil
+	}
+	return strings.TrimSpace(runtime.DaemonID.String), nil
 }
 
 // verifyDaemonWorkspaceAccess checks workspace access without writing an HTTP error.
@@ -2306,24 +2328,46 @@ func rerunSourceMatchesTaskScope(task, source db.AgentTaskQueue) bool {
 	return false
 }
 
-// applyFreshSessionRetryWorkdir resolves the prior pointers for an automatic
-// retry that must start a fresh session. CreateRetryTask forces one only when
-// the parent's failure poisoned the conversation (currently
-// codex_semantic_inactivity), and still copies the parent's work_dir onto the
-// child: a poisoned conversation says nothing about the files it left behind,
-// the same contract the manual-retry branch applies (MUL-4869, MUL-7034).
-//
-// The workdir is offered only to a daemon whose `multica repo checkout` keeps
-// an existing checkout's work (DaemonCapabilityCheckoutKeepsWorkV1). The fresh
-// session has no memory of that work and will fetch its repositories again;
-// an older daemon's checkout resets the checkout and deletes the work being
-// kept, so it gets a fresh directory as before. The daemon validates the
-// directory before reusing it and falls back to a fresh Prepare when it is
-// gone. Either way the failed attempt's working memory does not come back, so
-// the continuity gap is disclosed.
-func applyFreshSessionRetryWorkdir(task db.AgentTaskQueue, resp *AgentTaskResponse, daemonKeepsCheckoutWork bool) {
-	if daemonKeepsCheckoutWork && task.WorkDir.Valid {
-		resp.PriorWorkDir = task.WorkDir.String
+// validatedRetryWorkDir returns the source workdir only while its runtime and
+// execution scope still match the retry. Issue retries must remain bound to the
+// same open card-session generation; chat retries must remain in the same chat
+// and channel-context revision.
+func (h *Handler) validatedRetryWorkDir(ctx context.Context, task db.AgentTaskQueue, workspaceID string) pgtype.Text {
+	if !task.RetryOfTaskID.Valid {
+		return pgtype.Text{}
+	}
+	source, err := h.Queries.GetAgentTask(ctx, task.RetryOfTaskID)
+	if err != nil || source.AgentID != task.AgentID || source.RuntimeID != task.RuntimeID {
+		return pgtype.Text{}
+	}
+	if task.IssueID.Valid {
+		if !source.IssueID.Valid || source.IssueID != task.IssueID || !source.CardSessionID.Valid {
+			return pgtype.Text{}
+		}
+		cardSession, err := h.Queries.GetResumableCardSession(ctx, db.GetResumableCardSessionParams{
+			IssueID:     task.IssueID,
+			AgentID:     task.AgentID,
+			WorkspaceID: parseUUID(workspaceID),
+		})
+		if err != nil || cardSession.State != "open" || cardSession.ID != source.CardSessionID {
+			return pgtype.Text{}
+		}
+		return source.WorkDir
+	}
+	if task.ChatSessionID.Valid && source.ChatSessionID.Valid && source.ChatSessionID == task.ChatSessionID &&
+		source.ChannelContextRevision == task.ChannelContextRevision {
+		return source.WorkDir
+	}
+	return pgtype.Text{}
+}
+
+// applyFreshSessionRetryWorkdir offers the already-validated workdir only to a
+// daemon whose checkout preserves existing work. Older daemons get a fresh
+// directory; all such retries disclose that provider session state was not
+// carried forward.
+func applyFreshSessionRetryWorkdir(workDir pgtype.Text, resp *AgentTaskResponse, daemonKeepsCheckoutWork bool) {
+	if daemonKeepsCheckoutWork && workDir.Valid {
+		resp.PriorWorkDir = workDir.String
 	}
 	resp.PriorSessionResumeUnavailable = true
 }
@@ -2897,14 +2941,19 @@ func (h *Handler) buildClaimedTaskResponse(r *http.Request, task *db.AgentTaskQu
 			resp.TriggerCommentContent = "The newest triggering comment is no longer available. Address every earlier comment included below."
 		}
 
-		// Resolve the prior agent session / workdir to resume.
-		if task.RerunOfTaskID.Valid {
+		// Backlog comment/mention work is an ordinary explicit task, without a
+		// persistent card-session generation. Do not leak legacy task history or
+		// resume hints into that task either.
+		if issue.Status == issuestatus.Backlog {
+			resp.PriorSessionID = ""
+			resp.PriorWorkDir = ""
+			resp.PriorSessionResumeUnavailable = false
+		} else if task.RerunOfTaskID.Valid {
 			// Manual retry: resume precisely from the source task the user
 			// clicked, NOT the most-recent (agent, issue) row — a parallel task
-			// on the same issue must never hijack the resume (MUL-4869). The
-			// workdir is ALWAYS reused when it still exists; the session is
-			// resumed only when the source failure did not poison the
-			// conversation AND the source ran on this runtime.
+			// on the same issue must never hijack the resume (MUL-4869). Provider
+			// pointers are reusable only when the source task is bound to the
+			// current open card-session generation.
 			//
 			// Resume-safety is computed HERE from the source task, not read off
 			// task.ForceFreshSession: RerunIssue pins that flag to true so an OLD
@@ -2914,31 +2963,37 @@ func (h *Handler) buildClaimedTaskResponse(r *http.Request, task *db.AgentTaskQu
 			// its 400/invalid_request_error text defense for legacy /
 			// mis-classified rows that the exact-source path would otherwise miss.
 			//
-			// When the source workdir is gone (GC'd), absent on this runtime, or
-			// was never recorded (failed too early), execenv.Reuse falls back to a
-			// fresh Prepare and gateResumeToReusedWorkdir drops the now-unusable
-			// session — reuse is best-effort, never a silent swap onto a stale
-			// directory. PriorWorkDir is offered regardless of runtime (a shared
-			// mount may still resolve it); only the per-cwd session is
-			// runtime-gated.
 			if src, err := h.Queries.GetAgentTask(r.Context(), task.RerunOfTaskID); err == nil && rerunSourceMatchesTaskScope(*task, src) {
-				if src.WorkDir.Valid {
-					resp.PriorWorkDir = src.WorkDir.String
-				}
-				if !service.ResumeUnsafeFailure(src.FailureReason.String, src.Error.String) &&
-					src.SessionID.Valid && src.RuntimeID == task.RuntimeID {
-					resp.PriorSessionID = src.SessionID.String
-					// The deltas date from the run we actually resume, which on
-					// this path is the operator-chosen source — routinely NOT
-					// the newest run on the issue. nil unless that run proved it
-					// delivered its prompt to the provider (MUL-7344).
-					resumeAnchor = newResumedRunAnchor(src.Status, src.StartedAt, src.IssueSnapshot)
-				}
-				// MUL-5305: if the source task withheld its Codex session because
-				// the rollout was missing, this rerun has nothing resumable from it
-				// — disclose the gap rather than silently starting fresh.
-				if src.SessionRolloutMissing {
+				cardSession, sessionErr := h.Queries.GetResumableCardSession(r.Context(), db.GetResumableCardSessionParams{
+					IssueID:     task.IssueID,
+					AgentID:     task.AgentID,
+					WorkspaceID: parseUUID(runtimeWorkspaceID),
+				})
+				generationMatches := sessionErr == nil && cardSession.State == "open" &&
+					src.CardSessionID.Valid && src.CardSessionID == cardSession.ID
+				if generationMatches {
+					if src.RuntimeID == task.RuntimeID && src.WorkDir.Valid {
+						resp.PriorWorkDir = src.WorkDir.String
+					}
+					if !service.ResumeUnsafeFailure(src.FailureReason.String, src.Error.String) &&
+						src.SessionID.Valid && src.RuntimeID == task.RuntimeID {
+						resp.PriorSessionID = src.SessionID.String
+						// Anchor follow-up deltas to the explicitly selected source
+						// run, but only when its provider session is resumed.
+						resumeAnchor = newResumedRunAnchor(src.Status, src.StartedAt, src.IssueSnapshot)
+					}
+					// MUL-5305: disclose when rollout withheld the source session.
+					if src.SessionRolloutMissing {
+						resp.PriorSessionResumeUnavailable = true
+					}
+				} else if src.SessionID.Valid || src.WorkDir.Valid {
 					resp.PriorSessionResumeUnavailable = true
+					slog.Warn("daemon claim: rerun source has no matching open card-session generation; starting fresh",
+						"task_id", uuidToString(task.ID),
+						"source_task_id", uuidToString(src.ID),
+						"source_card_session_bound", src.CardSessionID.Valid,
+						"open_card_session_found", sessionErr == nil && cardSession.State == "open",
+					)
 				}
 			} else if err == nil {
 				slog.Warn("daemon claim: rerun source belongs to another agent or scope; starting fresh",
@@ -2952,27 +3007,63 @@ func (h *Handler) buildClaimedTaskResponse(r *http.Request, task *db.AgentTaskQu
 				resp.PriorSessionResumeUnavailable = true
 			}
 		} else if !task.ForceFreshSession {
-			// Non-rerun follow-up on the same issue: resume the most recent
-			// (agent, issue) session so the agent keeps the issue's conversation
-			// context across turns. The "Focus on THIS comment" guard in
-			// prompt.go defends against inheriting the prior turn's "Done."
-			// marker, and GetLastTaskSession already excludes poisoned sessions.
-			if prior, err := h.Queries.GetLastTaskSession(r.Context(), db.GetLastTaskSessionParams{
-				AgentID: task.AgentID,
-				IssueID: task.IssueID,
-			}); err == nil && prior.SessionID.Valid {
-				if prior.RuntimeID == task.RuntimeID {
-					resp.PriorSessionID = prior.SessionID.String
-					// Same rule as the rerun path: date the deltas from the run
-					// this session belongs to. GetLastTaskSession skips poisoned
-					// and retired sessions, so `prior` can be an older run than
-					// the newest one on the issue; it also accepts failed and
-					// cancelled rows, which keep the session resumable but prove
-					// nothing about delivery (MUL-7344).
-					resumeAnchor = newResumedRunAnchor(prior.Status, prior.StartedAt, prior.IssueSnapshot)
+			// The card session is the continuity boundary. Task history supplies
+			// resume safety and the snapshot anchor, but it must name the provider
+			// session pinned to this generation before the daemon can resume it.
+			cardSessionParams := db.GetResumableCardSessionParams{
+				IssueID:     task.IssueID,
+				AgentID:     task.AgentID,
+				WorkspaceID: parseUUID(runtimeWorkspaceID),
+			}
+			cardSession, cardSessionErr := h.Queries.GetResumableCardSession(r.Context(), cardSessionParams)
+			useLegacyTaskHistory := false
+			if cardSessionErr == nil {
+				if cardSession.State == "open" {
+					if cardSession.ProviderSessionID.Valid {
+						if prior, err := h.Queries.GetLastTaskSession(r.Context(), db.GetLastTaskSessionParams{
+							AgentID: task.AgentID,
+							IssueID: task.IssueID,
+						}); err == nil && prior.SessionID.Valid && prior.SessionID.String == cardSession.ProviderSessionID.String {
+							if prior.RuntimeID == task.RuntimeID {
+								if cardSession.WorkDir.Valid {
+									resp.PriorWorkDir = cardSession.WorkDir.String
+								}
+								resp.PriorSessionID = prior.SessionID.String
+								// Date deltas from the terminal run whose session the
+								// current card generation actually continues.
+								resumeAnchor = newResumedRunAnchor(prior.Status, prior.StartedAt, prior.IssueSnapshot)
+							}
+						}
+					}
 				}
-				if prior.WorkDir.Valid {
-					resp.PriorWorkDir = prior.WorkDir.String
+			} else if errors.Is(cardSessionErr, pgx.ErrNoRows) {
+				// Preserve existing task-history continuity only for issues that
+				// have never had a card-session generation. A closed generation
+				// must not leak its provider state into a later generation.
+				if _, err := h.Queries.GetLatestCardSession(r.Context(), db.GetLatestCardSessionParams{
+					IssueID:     task.IssueID,
+					AgentID:     task.AgentID,
+					WorkspaceID: parseUUID(runtimeWorkspaceID),
+				}); errors.Is(err, pgx.ErrNoRows) {
+					useLegacyTaskHistory = true
+				} else if err != nil {
+					slog.Warn("daemon claim: failed to check latest card session", "task_id", uuidToString(task.ID), "error", err)
+				}
+			} else {
+				slog.Warn("daemon claim: failed to load resumable card session", "task_id", uuidToString(task.ID), "error", cardSessionErr)
+			}
+			if useLegacyTaskHistory {
+				if prior, err := h.Queries.GetLastTaskSession(r.Context(), db.GetLastTaskSessionParams{
+					AgentID: task.AgentID,
+					IssueID: task.IssueID,
+				}); err == nil && prior.SessionID.Valid {
+					if prior.RuntimeID == task.RuntimeID {
+						resp.PriorSessionID = prior.SessionID.String
+						resumeAnchor = newResumedRunAnchor(prior.Status, prior.StartedAt, prior.IssueSnapshot)
+						if prior.WorkDir.Valid {
+							resp.PriorWorkDir = prior.WorkDir.String
+						}
+					}
 				}
 			}
 			// MUL-5305: if the most recent terminal task withheld its Codex
@@ -2991,7 +3082,8 @@ func (h *Handler) buildClaimedTaskResponse(r *http.Request, task *db.AgentTaskQu
 			// Automatic retry that must start a fresh session: continue in the
 			// parent's workdir, never its session. A force_fresh task with no
 			// retry lineage still resumes nothing.
-			applyFreshSessionRetryWorkdir(*task, &resp, requestHasClientCapability(r, protocol.DaemonCapabilityCheckoutKeepsWorkV1))
+			workDir := h.validatedRetryWorkDir(r.Context(), *task, runtimeWorkspaceID)
+			applyFreshSessionRetryWorkdir(workDir, &resp, requestHasClientCapability(r, protocol.DaemonCapabilityCheckoutKeepsWorkV1))
 		}
 
 		// Both deltas, now that the resume source is known (MUL-7344).
@@ -3119,11 +3211,13 @@ func (h *Handler) buildClaimedTaskResponse(r *http.Request, task *db.AgentTaskQu
 			// otherwise a single failed turn would silently drop the entire
 			// conversation memory on the next message. The fallback also
 			// requires runtime to match.
-			if cs.SessionID.Valid && cs.RuntimeID.Valid && cs.RuntimeID == task.RuntimeID {
-				resp.PriorSessionID = cs.SessionID.String
-			}
-			if cs.WorkDir.Valid {
-				resp.PriorWorkDir = cs.WorkDir.String
+			if cs.RuntimeID.Valid && cs.RuntimeID == task.RuntimeID {
+				if cs.SessionID.Valid {
+					resp.PriorSessionID = cs.SessionID.String
+				}
+				if cs.WorkDir.Valid {
+					resp.PriorWorkDir = cs.WorkDir.String
+				}
 			}
 		}
 		// Resolve the user-message input batch for this run. A task-owned
@@ -3188,9 +3282,11 @@ func (h *Handler) buildClaimedTaskResponse(r *http.Request, task *db.AgentTaskQu
 				})
 				h.Metrics.ObserveChatClaimLastSessionQuery(time.Since(started).Seconds())
 				switch {
+				case err == nil && prior.SessionID.Valid && prior.RuntimeID != task.RuntimeID:
+					h.Metrics.RecordChatClaimSessionFallbackMiss()
 				case err == nil && prior.SessionID.Valid:
 					h.Metrics.RecordChatClaimSessionFallbackHit()
-					if resp.PriorSessionID == "" && prior.RuntimeID == task.RuntimeID {
+					if resp.PriorSessionID == "" {
 						resp.PriorSessionID = prior.SessionID.String
 					}
 					if prior.WorkDir.Valid && resp.PriorWorkDir == "" {
@@ -3223,7 +3319,8 @@ func (h *Handler) buildClaimedTaskResponse(r *http.Request, task *db.AgentTaskQu
 			// Same as the issue branch. The retry lineage is what separates this
 			// from a user-requested fresh start (the Lark fresh-session command),
 			// which still inherits nothing.
-			applyFreshSessionRetryWorkdir(*task, &resp, requestHasClientCapability(r, protocol.DaemonCapabilityCheckoutKeepsWorkV1))
+			workDir := h.validatedRetryWorkDir(r.Context(), *task, resp.WorkspaceID)
+			applyFreshSessionRetryWorkdir(workDir, &resp, requestHasClientCapability(r, protocol.DaemonCapabilityCheckoutKeepsWorkV1))
 		}
 
 		parts := make([]string, 0, len(unanswered))
@@ -3881,7 +3978,7 @@ func (h *Handler) ClaimTaskByRuntime(w http.ResponseWriter, r *http.Request) {
 	task.DeliveredCommentIds = receipt
 	resp.DeliveredCommentIDs = uuidStringsOrEmpty(receipt)
 
-	slog.Info("task claimed by runtime", "task_id", uuidToString(task.ID), "runtime_id", runtimeID, "agent_id", uuidToString(task.AgentID), "prior_session", resp.PriorSessionID)
+	slog.Info("task claimed by runtime", "task_id", uuidToString(task.ID), "runtime_id", runtimeID, "agent_id", uuidToString(task.AgentID), "prior_session_present", resp.PriorSessionID != "")
 	if resp.Agent != nil && len(resp.Agent.Skills) > 0 {
 		if skillPayload, err := json.Marshal(resp.Agent.Skills); err == nil {
 			skillPayloadBytes = len(skillPayload)
@@ -4078,8 +4175,14 @@ func (h *Handler) StartTask(w http.ResponseWriter, r *http.Request) {
 	taskID := chi.URLParam(r, "taskId")
 
 	// Verify the caller owns this task's workspace.
-	_, workspaceID, ok := h.requireDaemonTaskAccessWithWorkspace(w, r, taskID)
+	accessTask, workspaceID, ok := h.requireDaemonTaskAccessWithWorkspace(w, r, taskID)
 	if !ok {
+		return
+	}
+	leaseOwner, leaseOwnerErr := h.daemonLeaseOwnerForTask(r.Context(), accessTask)
+	if leaseOwnerErr != nil {
+		slog.Warn("resolve card-session lease owner failed", "task_id", taskID, "error", leaseOwnerErr)
+		writeError(w, http.StatusInternalServerError, "failed to load task runtime")
 		return
 	}
 
@@ -4101,7 +4204,7 @@ func (h *Handler) StartTask(w http.ResponseWriter, r *http.Request) {
 	if legacy {
 		// Older daemons send {}. Keep their single-winner behavior; in
 		// particular, they cannot acknowledge an already-running task.
-		task, err = h.TaskService.StartTask(r.Context(), parseUUID(taskID), enableTaskSupplement)
+		task, err = h.TaskService.StartTaskWithCardSessionLease(r.Context(), parseUUID(taskID), leaseOwner, enableTaskSupplement)
 	} else {
 		runtimeID, ok := parseUUIDOrBadRequest(w, req.RuntimeID, "runtime_id")
 		if !ok {
@@ -4112,13 +4215,21 @@ func (h *Handler) StartTask(w http.ResponseWriter, r *http.Request) {
 			writeError(w, http.StatusBadRequest, "dispatched_at must be a PostgreSQL claim timestamp")
 			return
 		}
-		task, err = h.TaskService.StartTaskForClaim(r.Context(), db.LockAgentTaskStartClaimParams{
+		task, err = h.TaskService.StartTaskForClaimWithCardSessionLease(r.Context(), db.LockAgentTaskStartClaimParams{
 			ID: parseUUID(taskID), RuntimeID: runtimeID,
 			DispatchedAt: pgtype.Timestamptz{Time: generation, Valid: true},
-		}, enableTaskSupplement)
+		}, leaseOwner, enableTaskSupplement)
 	}
 	if err != nil {
 		slog.Warn("start task failed", "task_id", taskID, "error", err)
+		if errors.Is(err, service.ErrCardSessionLeaseUnavailable) {
+			writeError(w, http.StatusConflict, "card session lease is held by another provider host")
+			return
+		}
+		if errors.Is(err, service.ErrCardSessionLeaseOwner) {
+			writeError(w, http.StatusForbidden, "daemon lease owner required")
+			return
+		}
 		if errors.Is(err, pgx.ErrNoRows) {
 			status := http.StatusConflict
 			if legacy {
@@ -4133,6 +4244,23 @@ func (h *Handler) StartTask(w http.ResponseWriter, r *http.Request) {
 
 	slog.Info("task started", "task_id", taskID, "agent_id", uuidToString(task.AgentID))
 	resp := taskToResponse(*task, workspaceID)
+	if task.CardSessionID.Valid {
+		if cardSession, sessionErr := h.Queries.GetCardSession(r.Context(), task.CardSessionID); sessionErr == nil {
+			resp.CardSessionGeneration = cardSession.Generation
+			resp.CardSessionLeaseEpoch = cardSession.LeaseEpoch
+			if workspace, workspaceErr := h.Queries.GetWorkspace(r.Context(), parseUUID(workspaceID)); workspaceErr == nil {
+				if settings, settingsErr := cardsession.Parse(workspace.Settings); settingsErr == nil {
+					resp.CardSessionIdleTimeoutHours = settings.IdleTimeoutHours
+				} else {
+					slog.Warn("start task: invalid card-session workspace settings; using server default", "task_id", taskID, "error", settingsErr)
+				}
+			} else if !errors.Is(workspaceErr, pgx.ErrNoRows) {
+				slog.Warn("start task: failed to load workspace card-session settings", "task_id", taskID, "error", workspaceErr)
+			}
+		} else if !errors.Is(sessionErr, pgx.ErrNoRows) {
+			slog.Warn("start task: failed to load card session lease epoch", "task_id", taskID, "card_session_id", uuidToString(task.CardSessionID), "error", sessionErr)
+		}
+	}
 	// Echo the capability the server actually committed for this exact run.
 	// A daemon must use this response rather than its own offer: an old server
 	// ignores the offer and omits the field, which keeps daemon-first rollouts
@@ -4852,6 +4980,7 @@ func formatLegacyCommentEntry(comment CoalescedCommentData) string {
 type TaskUsagePayload struct {
 	Provider         string `json:"provider"`
 	Model            string `json:"model"`
+	CardSessionMode  string `json:"card_session_mode,omitempty"`
 	InputTokens      int64  `json:"input_tokens"`
 	OutputTokens     int64  `json:"output_tokens"`
 	CacheReadTokens  int64  `json:"cache_read_tokens"`
@@ -4897,6 +5026,7 @@ func (h *Handler) ReportTaskUsage(w http.ResponseWriter, r *http.Request) {
 	// resolve to a provider instead of landing as '' and pricing $0.
 	var runtimeProvider string
 	runtimeProviderLoaded := false
+	usageRecorded := false
 	for _, u := range req.Usage {
 		provider := normalizeProvider(u.Provider)
 		if provider == "" {
@@ -4915,6 +5045,7 @@ func (h *Handler) ReportTaskUsage(w http.ResponseWriter, r *http.Request) {
 			TaskID:           parseUUID(taskID),
 			Provider:         provider,
 			Model:            u.Model,
+			CardSessionMode:  normalizeCardSessionMode(u.CardSessionMode),
 			InputTokens:      u.InputTokens,
 			OutputTokens:     u.OutputTokens,
 			CacheReadTokens:  u.CacheReadTokens,
@@ -4924,6 +5055,7 @@ func (h *Handler) ReportTaskUsage(w http.ResponseWriter, r *http.Request) {
 			slog.Warn("upsert task usage failed", "task_id", taskID, "model", u.Model, "error", err)
 			continue
 		}
+		usageRecorded = true
 		h.TaskService.CaptureTaskUsage(r.Context(), task, provider, u.Model, u.InputTokens, u.OutputTokens, u.CacheReadTokens, u.CacheWriteTokens, u.CostUSDTicks)
 
 		// Surface prompt-cache effectiveness per run so cache hit rates are
@@ -4942,6 +5074,12 @@ func (h *Handler) ReportTaskUsage(w http.ResponseWriter, r *http.Request) {
 				"cache_write_tokens", u.CacheWriteTokens,
 				"cache_read_ratio", float64(u.CacheReadTokens)/float64(totalInput),
 			)
+		}
+	}
+	if usageRecorded {
+		parsedTaskID := parseUUID(taskID)
+		if err := h.TaskService.TouchCardSessionActivityForTask(r.Context(), parsedTaskID); err != nil {
+			slog.Warn("touch card session after provider usage update failed", "task_id", taskID, "error", err)
 		}
 	}
 
@@ -5709,7 +5847,7 @@ func (h *Handler) hydrateTaskUsage(ctx context.Context, issueID pgtype.UUID, res
 	for _, row := range rows {
 		appendTaskUsage(byTask, row.TaskID, row.Provider, row.Model,
 			row.InputTokens, row.OutputTokens, row.CacheReadTokens,
-			row.CacheWriteTokens, row.CostUsdTicks)
+			row.CacheWriteTokens, row.CostUsdTicks, row.CardSessionMode)
 	}
 	attachTaskUsage(resp, byTask)
 }
@@ -5738,7 +5876,7 @@ func (h *Handler) hydrateAgentTaskUsage(ctx context.Context, agentID pgtype.UUID
 	for _, row := range rows {
 		appendTaskUsage(byTask, row.TaskID, row.Provider, row.Model,
 			row.InputTokens, row.OutputTokens, row.CacheReadTokens,
-			row.CacheWriteTokens, row.CostUsdTicks)
+			row.CacheWriteTokens, row.CostUsdTicks, row.CardSessionMode)
 	}
 	attachTaskUsage(resp, byTask)
 	return nil
@@ -5754,6 +5892,7 @@ func appendTaskUsage(
 	cacheReadTokens int64,
 	cacheWriteTokens int64,
 	costUsdTicks pgtype.Int8,
+	cardSessionMode pgtype.Text,
 ) {
 	var cost *int64
 	if costUsdTicks.Valid {
@@ -5768,8 +5907,26 @@ func appendTaskUsage(
 		OutputTokens:     outputTokens,
 		CacheReadTokens:  cacheReadTokens,
 		CacheWriteTokens: cacheWriteTokens,
+		CardSessionMode:  optionalTaskUsageMode(cardSessionMode),
 		CostUsdTicks:     cost,
 	})
+}
+
+func normalizeCardSessionMode(mode string) pgtype.Text {
+	mode = strings.TrimSpace(mode)
+	switch mode {
+	case "persistent", "resume":
+		return pgtype.Text{String: mode, Valid: true}
+	default:
+		return pgtype.Text{}
+	}
+}
+
+func optionalTaskUsageMode(mode pgtype.Text) string {
+	if mode.Valid {
+		return mode.String
+	}
+	return ""
 }
 
 func attachTaskUsage(resp []AgentTaskResponse, byTask map[string][]TaskUsageData) {

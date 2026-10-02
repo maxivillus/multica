@@ -472,6 +472,7 @@ export interface AgentTask {
 export interface TaskUsage {
   provider?: string;
   model: string;
+  card_session_mode?: "persistent" | "resume";
   input_tokens: number;
   output_tokens: number;
   cache_read_tokens: number;

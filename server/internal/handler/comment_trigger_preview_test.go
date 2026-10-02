@@ -625,7 +625,7 @@ func TestCreateComment_ThreadReplyDoesNotEscalateToAssignee(t *testing.T) {
 			if primary == nil {
 				t.Fatal("thread owner task was not claimable")
 			}
-			if _, err := testHandler.TaskService.StartTask(ctx, primary.ID); err != nil {
+			if _, err := testHandler.TaskService.StartTaskWithCardSessionLease(ctx, primary.ID, "test-daemon"); err != nil {
 				t.Fatal(err)
 			}
 			if got, want := taskIDs(runsRequest(t, issueID, "")), sortedCopy(uuidToString(primary.ID)); !sameIDs(got, want) {

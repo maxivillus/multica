@@ -370,7 +370,7 @@ func (b *copilotBackend) Execute(ctx context.Context, prompt string, opts ExecOp
 		return nil, fmt.Errorf("start copilot: %w", err)
 	}
 
-	b.cfg.Logger.Info("copilot started", "pid", cmd.Process.Pid, "cwd", opts.Cwd, "model", opts.Model)
+	b.cfg.Logger.Info("copilot started", "pid", cmd.Process.Pid, "cwd_present", opts.Cwd != "", "model", opts.Model)
 
 	msgCh := make(chan Message, 256)
 	resCh := make(chan Result, 1)
@@ -402,7 +402,7 @@ func (b *copilotBackend) Execute(ctx context.Context, prompt string, opts ExecOp
 
 			var evt copilotEvent
 			if err := json.Unmarshal([]byte(line), &evt); err != nil {
-				slog.Warn("copilot event parse failed", "err", err, "line", line)
+				slog.Warn("copilot event parse failed", "error_present", err != nil, "line_bytes", len(line))
 				continue
 			}
 
@@ -411,7 +411,7 @@ func (b *copilotBackend) Execute(ctx context.Context, prompt string, opts ExecOp
 			}
 		}
 		if err := scanner.Err(); err != nil {
-			slog.Warn("copilot stdout scanner error", "err", err)
+			slog.Warn("copilot stdout scanner error", "error_present", err != nil)
 		}
 
 		exitErr := cmd.Wait()
@@ -442,7 +442,7 @@ func (b *copilotBackend) Execute(ctx context.Context, prompt string, opts ExecOp
 		// log it so the next regression is visible from the daemon log alone.
 		if len(usage) == 0 && st.finalStatus == "completed" {
 			b.cfg.Logger.Warn("copilot reported no token usage",
-				"session", st.sessionID,
+				"session_id_present", st.sessionID != "",
 				"model", st.activeModel,
 				"hint", "Copilot CLI filters assistant.usage and session.shutdown out of --output-format json; only assistant.message.outputTokens remains, and newer CLIs no longer populate it")
 		}

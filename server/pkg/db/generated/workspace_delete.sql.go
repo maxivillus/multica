@@ -19,6 +19,9 @@ batch AS MATERIALIZED (
 deleted_task_usage AS (
     DELETE FROM task_usage WHERE task_id IN (SELECT id FROM batch)
 ),
+deleted_issue_task_cancellations AS (
+    DELETE FROM issue_task_cancel_outbox WHERE task_id IN (SELECT id FROM batch)
+),
 deleted_task_messages AS (
     DELETE FROM task_message WHERE task_id IN (SELECT id FROM batch)
 ),
@@ -48,8 +51,7 @@ DELETE FROM agent_task_queue WHERE id IN (SELECT id FROM batch)
 
 // Deletes one bounded batch of tasks together with everything that hangs off
 // them, every arm keyed by task_id against an existing index, then the task rows
-// by primary key. The legacy FK cascades stay a safety net only: this statement
-// is what actually removes the rows, so teardown keeps working when they go.
+// by primary key. Cancellation outbox rows are explicitly cleared here.
 func (q *Queries) DeleteTaskBatch(ctx context.Context, taskIds []pgtype.UUID) error {
 	_, err := q.db.Exec(ctx, deleteTaskBatch, taskIds)
 	return err
@@ -237,6 +239,9 @@ WITH deleted_wakeup_receipts AS (
  DELETE FROM issue_wakeup_receipt WHERE wakeup_id IN (SELECT id FROM issue_wakeup WHERE workspace_id=$1)
 ), deleted_wakeups AS (
  DELETE FROM issue_wakeup WHERE workspace_id=$1
+), deleted_issue_task_cancellations AS (
+ DELETE FROM issue_task_cancel_outbox
+ WHERE issue_id IN (SELECT id FROM issue WHERE workspace_id = $1)
 ),
 deleted_child_events AS (
  DELETE FROM issue_child_event WHERE workspace_id=$1
@@ -302,6 +307,15 @@ ws_channel_installations AS MATERIALIZED (
 ),
 ws_lark_installations AS MATERIALIZED (
     SELECT id FROM lark_installation WHERE workspace_id = $1
+),
+deleted_card_sessions AS (
+    DELETE FROM card_session WHERE workspace_id = $1
+    RETURNING id
+),
+cleared_card_session_task_bindings AS (
+    UPDATE agent_task_queue
+    SET card_session_id = NULL
+    WHERE card_session_id IN (SELECT id FROM deleted_card_sessions)
 ),
 deleted_task_tokens AS (
     DELETE FROM task_token

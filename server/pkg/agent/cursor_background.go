@@ -117,7 +117,7 @@ func (b *cursorBackgroundTools) Add(call cursorToolCall) {
 		// No work was claimed. Preserve Cursor's launch completion so the idle
 		// watchdog remains available even when the tool watchdog is disabled.
 		// This grants no cleanup recovery window and never signals the PID.
-		b.logger.Warn("cannot own Cursor background shell; returning launch result for idle watchdog fallback", "error", err)
+		b.logger.Warn("cannot own Cursor background shell; returning launch result for idle watchdog fallback", "error_present", err != nil)
 		b.SendResult(call)
 		return
 	}
@@ -192,7 +192,7 @@ func (b *cursorBackgroundTools) finish(interrupt bool, deadline time.Time) bool 
 		}
 		if err != nil || alive {
 			if err != nil && interrupt {
-				b.logger.Warn("could not stop Cursor background shell", "error", err)
+				b.logger.Warn("could not stop Cursor background shell", "error_present", err != nil)
 			}
 			remaining = append(remaining, tool)
 			continue

@@ -1,6 +1,7 @@
 package daemon
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
 	"errors"
@@ -18,6 +19,7 @@ import (
 	"strings"
 	"sync"
 	"sync/atomic"
+	"syscall"
 	"testing"
 	"time"
 
@@ -56,6 +58,55 @@ func TestNormalizeServerBaseURL(t *testing.T) {
 	}
 	if got != "http://localhost:8080" {
 		t.Fatalf("expected http://localhost:8080, got %s", got)
+	}
+}
+
+func TestEnsureWorkspacesRootMarkerDoesNotLogPath(t *testing.T) {
+	root := filepath.Join(t.TempDir(), "private-workspaces-root-marker")
+	markerPath := filepath.Join(root, execenv.TaskContextMarkerRelPath)
+	if err := os.MkdirAll(filepath.Dir(markerPath), 0o755); err != nil {
+		t.Fatalf("mkdir marker directory: %v", err)
+	}
+	if err := os.WriteFile(markerPath, []byte(`{"managed_by":"foreign-marker-owner"}`), 0o644); err != nil {
+		t.Fatalf("write foreign marker: %v", err)
+	}
+
+	var logs bytes.Buffer
+	d := &Daemon{
+		cfg:    Config{WorkspacesRoot: root},
+		logger: slog.New(slog.NewTextHandler(&logs, nil)),
+	}
+	d.ensureWorkspacesRootMarker()
+
+	if strings.Contains(logs.String(), markerPath) {
+		t.Fatalf("marker path leaked into daemon log: %s", logs.String())
+	}
+	if !strings.Contains(logs.String(), "error_present=true") {
+		t.Fatalf("marker failure log should retain a safe error indicator: %s", logs.String())
+	}
+}
+
+func TestExecuteAndDrainDoesNotLogExecutablePath(t *testing.T) {
+	markerPath := filepath.Join(t.TempDir(), "private-executable-path-marker")
+	var logs bytes.Buffer
+	logger := slog.New(slog.NewTextHandler(&logs, &slog.HandlerOptions{Level: slog.LevelDebug}))
+	d := newTestDaemon(t)
+	backend := &fakeBackend{errors: []error{
+		&os.PathError{Op: "fork/exec", Path: markerPath, Err: syscall.ENOEXEC},
+	}}
+
+	_, _, err := d.executeAndDrain(context.Background(), backend, "prompt", agent.ExecOptions{}, logger, "task-exec-error", "", new(atomic.Int32))
+	if err == nil {
+		t.Fatal("executeAndDrain() error = nil, want exec format error")
+	}
+	if !strings.Contains(err.Error(), markerPath) {
+		t.Fatalf("returned error lost its actionable path: %v", err)
+	}
+	if strings.Contains(logs.String(), markerPath) {
+		t.Fatalf("executable path leaked into daemon logs: %s", logs.String())
+	}
+	if !strings.Contains(logs.String(), "exec_format_error=true") {
+		t.Fatalf("backend launch log omitted the safe exec-format flag: %s", logs.String())
 	}
 }
 
@@ -2892,6 +2943,42 @@ func (orderedTranscriptBackend) Execute(_ context.Context, _ string, _ agent.Exe
 		close(resCh)
 	}()
 	return &agent.Session{Messages: msgCh, Result: resCh}, nil
+}
+
+type privatePathErrorTranscriptBackend struct{ content string }
+
+func (b privatePathErrorTranscriptBackend) Execute(_ context.Context, _ string, _ agent.ExecOptions) (*agent.Session, error) {
+	msgs := make(chan agent.Message, 1)
+	msgs <- agent.Message{Type: agent.MessageError, Content: b.content}
+	close(msgs)
+	results := make(chan agent.Result, 1)
+	results <- agent.Result{Status: "completed", Output: "done"}
+	close(results)
+	return &agent.Session{Messages: msgs, Result: results}, nil
+}
+
+func TestExecuteAndDrainRedactsProviderErrorContentFromLogs(t *testing.T) {
+	t.Parallel()
+	marker := "/private/APPSEC_SESSION_PATH_MARKER"
+	d, rec := newTranscriptRecorder(t)
+	var logs bytes.Buffer
+	logger := slog.New(slog.NewTextHandler(&logs, &slog.HandlerOptions{Level: slog.LevelDebug}))
+	if _, _, err := d.executeAndDrain(context.Background(), privatePathErrorTranscriptBackend{content: marker}, "p", agent.ExecOptions{}, logger, "task-private-error", "", new(atomic.Int32)); err != nil {
+		t.Fatalf("executeAndDrain: %v", err)
+	}
+	output := logs.String()
+	if strings.Contains(output, marker) {
+		t.Fatalf("provider error content leaked into daemon logs: %s", output)
+	}
+	for _, field := range []string{"error_present=true", "content_bytes="} {
+		if !strings.Contains(output, field) {
+			t.Errorf("safe provider error diagnostic missing %q: %s", field, output)
+		}
+	}
+	messages := rec.snapshot()
+	if len(messages) != 1 || messages[0].Type != "error" || messages[0].Content != marker {
+		t.Fatalf("redaction changed the user-visible task error: %+v", messages)
+	}
 }
 
 func TestExecuteAndDrain_PreservesTranscriptArrivalOrderAcrossMessageTypes(t *testing.T) {

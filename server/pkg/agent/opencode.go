@@ -79,7 +79,7 @@ func (b *opencodeBackend) Execute(ctx context.Context, prompt string, opts ExecO
 	}
 	if runtime.GOOS == "windows" {
 		if native := resolveOpenCodeNativeFromShim(resolved, os.Stat); native != "" {
-			b.cfg.Logger.Info("opencode resolved to native binary to avoid .cmd shim argv truncation", "shim", resolved, "native", native)
+			logNativeBinaryResolution(b.cfg.Logger, "opencode", resolved, native)
 			resolved = native
 		}
 	}
@@ -257,7 +257,7 @@ func (b *opencodeBackend) Execute(ctx context.Context, prompt string, opts ExecO
 		return nil, fmt.Errorf("start opencode: %w", err)
 	}
 
-	b.cfg.Logger.Info("opencode started", "pid", cmd.Process.Pid, "cwd", opts.Cwd, "model", opts.Model)
+	b.cfg.Logger.Info("opencode started", "pid", cmd.Process.Pid, "cwd_present", opts.Cwd != "", "model", opts.Model)
 
 	msgCh := make(chan Message, 256)
 	resCh := make(chan Result, 1)
@@ -537,7 +537,7 @@ func (b *opencodeBackend) processEvents(r io.Reader, ch chan<- Message) eventRes
 
 	// Check for scanner errors (e.g. broken pipe, read errors).
 	if scanErr := scanner.Err(); scanErr != nil {
-		b.cfg.Logger.Warn("opencode stdout scanner error", "error", scanErr)
+		b.cfg.Logger.Warn("opencode stdout scanner error", "error_present", scanErr != nil)
 		if finalStatus == "completed" {
 			finalStatus = "failed"
 			finalError = fmt.Sprintf("stdout read error: %v", scanErr)
@@ -663,7 +663,7 @@ func (b *opencodeBackend) handleErrorEvent(event opencodeEvent, ch chan<- Messag
 		errMsg = "unknown opencode error"
 	}
 
-	b.cfg.Logger.Warn("opencode error event", "error", errMsg)
+	b.cfg.Logger.Warn("opencode error event", "error_present", errMsg != "")
 	trySend(ch, Message{Type: MessageError, Content: errMsg})
 
 	*finalStatus = "failed"

@@ -6,6 +6,7 @@ import (
 	"io"
 	"log/slog"
 	"net/http"
+	"time"
 
 	"github.com/go-chi/chi/v5"
 	"github.com/jackc/pgx/v5"
@@ -82,6 +83,12 @@ func (h *Handler) PinTaskSession(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusBadRequest, "session_id or work_dir required")
 		return
 	}
+	started := time.Now()
+	recordCardSessionPin := func(result string) {
+		if h.TaskService != nil {
+			h.TaskService.ObserveCardSessionProviderPinDuration(r.Context(), parseUUID(taskID), result, time.Since(started))
+		}
+	}
 
 	params := db.UpdateAgentTaskSessionParams{ID: parseUUID(taskID)}
 	if req.SessionID != "" {
@@ -107,6 +114,7 @@ func (h *Handler) PinTaskSession(w http.ResponseWriter, r *http.Request) {
 	// means there is no session to lock or advance.
 	tx, err := h.TxStarter.Begin(r.Context())
 	if err != nil {
+		recordCardSessionPin("error")
 		slog.Warn("pin-session failed to start tx", "task_id", taskID, "error", err)
 		writeError(w, http.StatusInternalServerError, "pin session failed")
 		return
@@ -115,12 +123,24 @@ func (h *Handler) PinTaskSession(w http.ResponseWriter, r *http.Request) {
 	qtx := h.Queries.WithTx(tx)
 
 	if _, err := qtx.LockChatSessionForTask(r.Context(), params.ID); err != nil && !errors.Is(err, pgx.ErrNoRows) {
+		recordCardSessionPin("error")
 		slog.Warn("pin-session failed to lock chat session", "task_id", taskID, "error", err)
 		writeError(w, http.StatusInternalServerError, "pin session failed")
 		return
 	}
 	if err := qtx.UpdateAgentTaskSession(r.Context(), params); err != nil {
+		recordCardSessionPin("error")
 		slog.Warn("pin-session failed", "task_id", taskID, "error", err)
+		writeError(w, http.StatusInternalServerError, "pin session failed")
+		return
+	}
+	if err := qtx.UpdateCardSessionProviderStateByTask(r.Context(), db.UpdateCardSessionProviderStateByTaskParams{
+		ID:                params.ID,
+		ProviderSessionID: req.SessionID,
+		WorkDir:           req.WorkDir,
+	}); err != nil {
+		recordCardSessionPin("error")
+		slog.Warn("pin-session failed to update card session", "task_id", taskID, "error", err)
 		writeError(w, http.StatusInternalServerError, "pin session failed")
 		return
 	}
@@ -128,16 +148,117 @@ func (h *Handler) PinTaskSession(w http.ResponseWriter, r *http.Request) {
 	// chat task, and refuses to move the pointer when a newer turn already owns
 	// a session — so a straggler pin cannot drag the conversation backwards.
 	if err := qtx.AdvanceCancelledChatSessionPointer(r.Context(), params.ID); err != nil {
+		recordCardSessionPin("error")
 		slog.Warn("advance cancelled chat session pointer failed", "task_id", taskID, "error", err)
 		writeError(w, http.StatusInternalServerError, "pin session failed")
 		return
 	}
 	if err := tx.Commit(r.Context()); err != nil {
+		recordCardSessionPin("error")
 		slog.Warn("pin-session commit failed", "task_id", taskID, "error", err)
 		writeError(w, http.StatusInternalServerError, "pin session failed")
 		return
 	}
+	recordCardSessionPin("updated")
 	w.WriteHeader(http.StatusNoContent)
+}
+
+// CardSessionLeaseRequest carries the fencing epoch returned by the start
+// transition. The owner is taken from daemon authentication or the task's
+// server-side runtime identity, never from the request body.
+type CardSessionLeaseRequest struct {
+	LeaseEpoch int64 `json:"lease_epoch"`
+}
+
+type CardSessionLeaseResponse struct {
+	CardSessionID    string `json:"card_session_id"`
+	Generation       int64  `json:"generation"`
+	LeaseEpoch       int64  `json:"lease_epoch"`
+	LeaseHeartbeatAt string `json:"lease_heartbeat_at,omitempty"`
+	IdleTimeoutHours int    `json:"card_session_idle_timeout_hours,omitempty"`
+}
+
+func cardSessionLeaseResponse(session db.CardSession) CardSessionLeaseResponse {
+	return CardSessionLeaseResponse{
+		CardSessionID:    uuidToString(session.ID),
+		Generation:       session.Generation,
+		LeaseEpoch:       session.LeaseEpoch,
+		LeaseHeartbeatAt: timestampToString(session.LeaseHeartbeatAt),
+	}
+}
+
+// HeartbeatCardSessionLease keeps the live-provider ownership fence alive.
+// It intentionally does not touch card-session activity, so an idle process
+// cannot prevent the configured idle timeout from closing its generation.
+func (h *Handler) HeartbeatCardSessionLease(w http.ResponseWriter, r *http.Request) {
+	taskID := chi.URLParam(r, "taskId")
+	task, ok := h.requireDaemonTaskAccess(w, r, taskID)
+	if !ok {
+		return
+	}
+	owner, ownerErr := h.daemonLeaseOwnerForTask(r.Context(), task)
+	if ownerErr != nil {
+		slog.Warn("resolve card-session heartbeat owner failed", "task_id", taskID, "error", ownerErr)
+		writeError(w, http.StatusInternalServerError, "failed to load task runtime")
+		return
+	}
+	if owner == "" {
+		writeError(w, http.StatusForbidden, "daemon lease owner required")
+		return
+	}
+	var req CardSessionLeaseRequest
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil || req.LeaseEpoch <= 0 {
+		writeError(w, http.StatusBadRequest, "lease_epoch must be a positive integer")
+		return
+	}
+	session, err := h.TaskService.HeartbeatCardSessionLeaseByTask(r.Context(), parseUUID(taskID), owner, req.LeaseEpoch)
+	if err != nil {
+		if errors.Is(err, service.ErrCardSessionLeaseUnavailable) {
+			writeError(w, http.StatusConflict, "card session lease is no longer owned")
+			return
+		}
+		slog.Warn("heartbeat card session lease failed", "task_id", taskID, "error", err)
+		writeError(w, http.StatusInternalServerError, "heartbeat card session lease failed")
+		return
+	}
+	writeJSON(w, http.StatusOK, cardSessionLeaseResponse(session))
+}
+
+// ReleaseCardSessionLease is used when a live provider host closes normally.
+// Owner and epoch are both required so a stale process cannot release a newer
+// host's lease.
+func (h *Handler) ReleaseCardSessionLease(w http.ResponseWriter, r *http.Request) {
+	taskID := chi.URLParam(r, "taskId")
+	task, ok := h.requireDaemonTaskAccess(w, r, taskID)
+	if !ok {
+		return
+	}
+	owner, ownerErr := h.daemonLeaseOwnerForTask(r.Context(), task)
+	if ownerErr != nil {
+		slog.Warn("resolve card-session release owner failed", "task_id", taskID, "error", ownerErr)
+		writeError(w, http.StatusInternalServerError, "failed to load task runtime")
+		return
+	}
+	if owner == "" {
+		writeError(w, http.StatusForbidden, "daemon lease owner required")
+		return
+	}
+	var req CardSessionLeaseRequest
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil || req.LeaseEpoch <= 0 {
+		writeError(w, http.StatusBadRequest, "lease_epoch must be a positive integer")
+		return
+	}
+	session, err := h.TaskService.ReleaseCardSessionLeaseByTask(r.Context(), parseUUID(taskID), owner, req.LeaseEpoch)
+	if err != nil {
+		if errors.Is(err, service.ErrCardSessionLeaseUnavailable) {
+			writeError(w, http.StatusConflict, "card session lease is no longer owned")
+			return
+		}
+		slog.Warn("release card session lease failed", "task_id", taskID, "error", err)
+		writeError(w, http.StatusInternalServerError, "release card session lease failed")
+		return
+	}
+	writeJSON(w, http.StatusOK, cardSessionLeaseResponse(session))
 }
 
 // RerunIssueRequest is the optional body of POST /api/issues/{id}/rerun.

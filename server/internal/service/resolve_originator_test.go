@@ -443,9 +443,9 @@ func TestEnqueueTaskForIssueStoresRuntimeMCPOverlayInQueuedRow(t *testing.T) {
 	}
 	if err := pool.QueryRow(ctx, `
 		INSERT INTO issue (
-			workspace_id, title, creator_type, creator_id, assignee_type, assignee_id, priority
+			workspace_id, title, creator_type, creator_id, assignee_type, assignee_id, priority, status
 		)
-		VALUES ($1, 'runtime overlay issue', 'member', $2, 'agent', $3, 'medium')
+		VALUES ($1, 'runtime overlay issue', 'member', $2, 'agent', $3, 'medium', 'todo')
 		RETURNING id
 	`, workspaceIDStr, userIDStr, agentIDStr).Scan(&issueIDStr); err != nil {
 		t.Fatalf("seed issue: %v", err)

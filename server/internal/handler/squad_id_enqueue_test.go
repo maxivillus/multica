@@ -40,11 +40,12 @@ func TestCreateComment_SquadMentionStampsSquadIDOnLeaderTask(t *testing.T) {
 	t.Cleanup(func() { testPool.Exec(context.Background(), `DELETE FROM squad WHERE id = $1`, squadID) })
 
 	// Issue assigned to nobody (definitely not the squad) — the leader task is
-	// produced purely by the @squad comment mention.
+	// produced purely by the @squad comment mention. Backlog mentions remain
+	// explicit ordinary tasks and must not open a persistent card session.
 	var issueID string
 	if err := testPool.QueryRow(ctx, `
-		INSERT INTO issue (workspace_id, creator_type, creator_id, title)
-		VALUES ($1, 'member', $2, 'squad_id stamp test')
+		INSERT INTO issue (workspace_id, creator_type, creator_id, title, status)
+		VALUES ($1, 'member', $2, 'squad_id stamp test', 'backlog')
 		RETURNING id
 	`, testWorkspaceID, testUserID).Scan(&issueID); err != nil {
 		t.Fatalf("create issue: %v", err)
@@ -67,13 +68,13 @@ func TestCreateComment_SquadMentionStampsSquadIDOnLeaderTask(t *testing.T) {
 
 	// The leader task must be queued AND carry squad_id = squadID, with
 	// is_leader_task = true.
-	var gotSquadID string
+	var taskID, gotSquadID string
 	var isLeader bool
 	if err := testPool.QueryRow(ctx, `
-		SELECT squad_id::text, is_leader_task
+		SELECT id, squad_id::text, is_leader_task
 		FROM agent_task_queue
 		WHERE issue_id = $1 AND agent_id = $2 AND status = 'queued'
-	`, issueID, leaderID).Scan(&gotSquadID, &isLeader); err != nil {
+	`, issueID, leaderID).Scan(&taskID, &gotSquadID, &isLeader); err != nil {
 		t.Fatalf("load leader task: %v", err)
 	}
 	if gotSquadID != squadID {
@@ -81,6 +82,29 @@ func TestCreateComment_SquadMentionStampsSquadIDOnLeaderTask(t *testing.T) {
 	}
 	if !isLeader {
 		t.Fatalf("leader task is_leader_task = false, want true")
+	}
+	var cardSessionCount int
+	if err := testPool.QueryRow(ctx, `SELECT COUNT(*) FROM card_session WHERE issue_id = $1`, issueID).Scan(&cardSessionCount); err != nil {
+		t.Fatalf("count backlog card sessions: %v", err)
+	}
+	if cardSessionCount != 0 {
+		t.Fatalf("backlog mention created %d card sessions, want none", cardSessionCount)
+	}
+	if _, err := testPool.Exec(ctx, `UPDATE agent_task_queue SET status = 'dispatched', dispatched_at = now() WHERE id = $1`, taskID); err != nil {
+		t.Fatalf("dispatch ordinary backlog mention task: %v", err)
+	}
+	started, err := testHandler.TaskService.StartTaskWithCardSessionLease(ctx, util.MustParseUUID(taskID), "test-daemon")
+	if err != nil {
+		t.Fatalf("start ordinary backlog mention task: %v", err)
+	}
+	if started.CardSessionID.Valid {
+		t.Fatalf("backlog mention task card_session_id = %s, want NULL", util.UUIDToString(started.CardSessionID))
+	}
+	if err := testHandler.TaskService.UpdateCardSessionProviderState(ctx, started.ID, "backlog-provider-sentinel", "/private/backlog-workdir"); err != nil {
+		t.Fatalf("pin ordinary backlog task provider state: %v", err)
+	}
+	if err := testHandler.TaskService.TouchCardSessionActivityForTask(ctx, started.ID); err != nil {
+		t.Fatalf("touch ordinary backlog task activity: %v", err)
 	}
 }
 

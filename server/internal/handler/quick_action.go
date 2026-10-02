@@ -919,16 +919,20 @@ func (h *Handler) RunQuickAction(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	comment := created.Comment()
+	issue = h.reopenTerminalIssueOnComment(r.Context(), issue, created.IssueStatus, actorType, actorID)
 
 	resp := commentToResponse(comment, nil, nil)
 	resp.IssueRevision = created.IssueRevision
+	if issue.Revision > resp.IssueRevision {
+		resp.IssueRevision = issue.Revision
+	}
 	h.publish(protocol.EventCommentCreated, workspaceID, actorType, actorID, map[string]any{
 		"comment":             resp,
 		"issue_title":         issue.Title,
 		"issue_assignee_type": textToPtr(issue.AssigneeType),
 		"issue_assignee_id":   uuidToPtr(issue.AssigneeID),
 		"issue_status":        issue.Status,
-		"issue_revision":      created.IssueRevision,
+		"issue_revision":      resp.IssueRevision,
 	})
 
 	resp.TriggerOutcomes = h.triggerTasksForComment(r.Context(), issue, comment, nil, actorType, actorID, originatorUserID, nil, nil)
