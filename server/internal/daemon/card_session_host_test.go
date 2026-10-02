@@ -106,6 +106,36 @@ func TestCardSessionIDForTurnSkipsUnfencedSession(t *testing.T) {
 	}
 }
 
+func TestCardSessionExecutionModeUsesResumeForOneShotBackend(t *testing.T) {
+	mode, usePersistentHost := cardSessionExecutionModeFor(&oneShotOnlyBackend{}, "card-1")
+	if mode != cardSessionExecutionModeResume {
+		t.Fatalf("card session mode = %q, want %q", mode, cardSessionExecutionModeResume)
+	}
+	if usePersistentHost {
+		t.Fatal("one-shot backend was routed to persistent card-session host")
+	}
+}
+
+func TestCardSessionExecutionModeUsesPersistentHostForPersistentBackend(t *testing.T) {
+	mode, usePersistentHost := cardSessionExecutionModeFor(&fakePersistentBackend{}, "card-1")
+	if mode != cardSessionExecutionModePersistent {
+		t.Fatalf("card session mode = %q, want %q", mode, cardSessionExecutionModePersistent)
+	}
+	if !usePersistentHost {
+		t.Fatal("persistent backend was not routed to persistent card-session host")
+	}
+}
+
+func TestCardSessionExecutionModeIsEmptyWithoutCardSession(t *testing.T) {
+	mode, usePersistentHost := cardSessionExecutionModeFor(&fakePersistentBackend{}, "")
+	if mode != "" {
+		t.Fatalf("card session mode = %q, want empty", mode)
+	}
+	if usePersistentHost {
+		t.Fatal("backend without a card session was routed to persistent host")
+	}
+}
+
 func TestCardSessionHostRegistryReusesOnePersistentProcess(t *testing.T) {
 	backend := &fakePersistentBackend{}
 	registry := newCardSessionHostRegistry(nil)
@@ -187,7 +217,7 @@ func TestCardSessionHostRegistryClosesIdleHosts(t *testing.T) {
 	}
 }
 
-func TestCardSessionHostRegistryDoesNotFallbackToOneShot(t *testing.T) {
+func TestCardSessionHostRegistryRejectsUnsupportedBackend(t *testing.T) {
 	registry := newCardSessionHostRegistry(nil)
 	_, err := registry.acquire(context.Background(), "card-1", &oneShotOnlyBackend{}, agent.ExecOptions{})
 	if !errors.Is(err, ErrCardSessionPersistentUnsupported) {

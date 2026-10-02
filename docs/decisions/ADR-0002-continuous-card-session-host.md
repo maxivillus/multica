@@ -41,9 +41,11 @@ because it preserves the process while leaving task scheduling available.
   expiry. Its default remains 24 hours and its range remains 1–999. Existing
   activity updates continue to define the deadline. On expiry, close the live
   provider process, release the lease, and close the generation.
-- Require every supported provider backend to implement a persistent
-  multi-turn host. Do not silently fall back to one-shot execution while a
-  healthy host should remain alive.
+- Use the persistent multi-turn host only for provider backends that expose
+  that capability. Route other providers through their normal one-shot/resume
+  execution path and mark the mode as `resume`; never report that path as a
+  persistent host or fail a card task only because the optional capability is
+  absent.
 - If the runtime process itself crashes or is forcibly stopped, the operating
   system necessarily ends its provider process. After fencing the old lease,
   recover from the persisted provider session ID when the provider supports it

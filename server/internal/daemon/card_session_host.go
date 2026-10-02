@@ -11,11 +11,11 @@ import (
 	"github.com/multica-ai/multica/server/pkg/agent"
 )
 
-// ErrCardSessionPersistentUnsupported is returned when a card task is routed
-// to a backend that cannot keep one provider process alive between turns. A
-// card session must fail explicitly in this case; falling back to Backend.Execute
-// would recreate the old one-shot behavior while appearing to preserve the
-// session.
+// ErrCardSessionPersistentUnsupported is returned when the persistent host
+// registry is asked to open a backend that cannot keep one provider process
+// alive between turns. The daemon routes such backends through Backend.Execute
+// instead; this error keeps direct persistent-host callers from misreporting
+// a one-shot backend as a live host.
 var ErrCardSessionPersistentUnsupported = errors.New("provider backend does not support persistent card sessions")
 
 // cardSessionHostRegistry owns the process handles for live card-session

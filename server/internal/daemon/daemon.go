@@ -7710,9 +7710,9 @@ func logFreshSessionStartFailure(taskLog *slog.Logger, err error) {
 	taskLog.Error("fresh session also failed to start; keeping the original poisoned result", "error_present", err != nil)
 }
 
-// cardSessionIDForTurn returns a persistent binding only when the start
+// cardSessionIDForTurn returns a fenced binding only when the start
 // acknowledgement includes a fencing epoch. Older servers may return a card
-// session id without fencing; those turns must use the one-shot path.
+// session id without fencing; those turns must use the ordinary provider path.
 func cardSessionIDForTurn(task Task, lease CardSessionLease) string {
 	if lease.LeaseEpoch <= 0 {
 		return ""
@@ -7721,6 +7721,27 @@ func cardSessionIDForTurn(task Task, lease CardSessionLease) string {
 		return lease.CardSessionID
 	}
 	return task.CardSessionID
+}
+
+type cardSessionExecutionMode string
+
+const (
+	cardSessionExecutionModeResume     cardSessionExecutionMode = "resume"
+	cardSessionExecutionModePersistent cardSessionExecutionMode = "persistent"
+)
+
+// cardSessionExecutionModeFor selects the execution contract for a fenced card
+// session. Persistent hosts are opt-in: a backend without PersistentBackend
+// must keep using its normal Execute implementation so provider-specific
+// one-shot/resume behavior remains available.
+func cardSessionExecutionModeFor(backend agent.Backend, cardSessionID string) (cardSessionExecutionMode, bool) {
+	if cardSessionID == "" {
+		return "", false
+	}
+	if _, ok := backend.(agent.PersistentBackend); ok {
+		return cardSessionExecutionModePersistent, true
+	}
+	return cardSessionExecutionModeResume, false
 }
 
 func (d *Daemon) runTask(ctx context.Context, task Task, provider string, slot int, taskLog *slog.Logger) (taskResult TaskResult, returnErr error) {
@@ -8882,7 +8903,8 @@ func (d *Daemon) runTask(ctx context.Context, task Task, provider string, slot i
 	var msgSeq atomic.Int32
 	var executeTurn func(context.Context, string, agent.ExecOptions) (*agent.Session, error)
 	executeTurn = backend.Execute
-	if cardSessionID != "" {
+	cardSessionMode, usePersistentCardSession := cardSessionExecutionModeFor(backend, cardSessionID)
+	if usePersistentCardSession {
 		if d.cardSessionHosts == nil {
 			d.cardSessionHosts = newCardSessionHostRegistry(d.logger)
 		}
@@ -8938,6 +8960,16 @@ func (d *Daemon) runTask(ctx context.Context, task Task, provider string, slot i
 		taskLog.Info("using persistent card-session host",
 			"card_session_id", cardSessionID,
 			"pid", cardHost.session.ProcessID(),
+			"card_session_mode", string(cardSessionMode),
+		)
+	} else if cardSessionMode == cardSessionExecutionModeResume {
+		// Keep the task-scoped lease heartbeat until the ordinary provider
+		// execution finishes. Its deferred stop releases this generation's
+		// lease; it must not be attached to a process that does not exist.
+		taskLog.Info("using card-session provider resume path",
+			"card_session_id", cardSessionID,
+			"card_session_mode", string(cardSessionMode),
+			"persistent", false,
 		)
 	}
 	result, tools, err := d.executeAndDrainWith(executionCtx, executeTurn, prompt, execOpts, taskLog, task.ID, env.CodexHome, &msgSeq)

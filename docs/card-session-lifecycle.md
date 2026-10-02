@@ -98,8 +98,9 @@ failure. The provider process receives an opaque loopback broker credential;
 the current task credential is installed only for that turn and is cleared
 while the host is idle.
 
-Backends that do not implement the persistent multi-turn contract return an
-explicit unsupported error for a live card session. They do not silently fall
-back to the old one-shot path, because that would report continuity while
-starting a new process for every comment. Provider adapters must implement the
-same contract before they can serve card-session generations.
+Backends that implement the persistent multi-turn contract use the live host
+path. Other backends use their ordinary provider `one-shot/resume` path for
+each task; the daemon records this as `card_session_mode=resume` and keeps the
+server-side lease scoped to the current task. They are not reported as
+persistent hosts, and the absence of the optional capability does not by
+itself fail a card task.

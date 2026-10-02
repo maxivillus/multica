@@ -25,8 +25,8 @@ type Backend interface {
 // PersistentBackend is the optional process-lifetime contract used by card
 // sessions. OpenPersistent starts one provider process and returns a handle
 // whose Execute calls are serialized by the caller while the process remains
-// alive between turns. Backends that cannot provide this contract must not be
-// silently wrapped in the one-shot Execute path for a live card session.
+// alive between turns. Backends that cannot provide this contract use their
+// normal Execute path for card turns and are not reported as persistent.
 type PersistentBackend interface {
 	Backend
 	OpenPersistent(ctx context.Context, opts ExecOptions) (PersistentSession, error)
