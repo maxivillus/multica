@@ -91,7 +91,7 @@ func TestWorkerReplyDelivery(t *testing.T) {
 					}
 				}
 				if state == "running" {
-					if _, err := testHandler.TaskService.StartTask(ctx, parseUUID(leaderTaskID)); err != nil {
+					if _, err := testHandler.TaskService.StartTaskWithCardSessionLease(ctx, parseUUID(leaderTaskID), "test-daemon"); err != nil {
 						t.Fatal(err)
 					}
 				}
@@ -124,7 +124,7 @@ func TestWorkerReplyDelivery(t *testing.T) {
 					t.Fatal("an earlier claim cannot have delivered a later comment")
 				}
 				if state != "running" {
-					if _, err := testHandler.TaskService.StartTask(ctx, parseUUID(leaderTaskID)); err != nil {
+					if _, err := testHandler.TaskService.StartTaskWithCardSessionLease(ctx, parseUUID(leaderTaskID), "test-daemon"); err != nil {
 						t.Fatal(err)
 					}
 				}
@@ -152,7 +152,7 @@ func TestWorkerReplyDelivery(t *testing.T) {
 				if successor.SquadID != parseUUID(squadID) || successor.OriginatorUserID != parseUUID(testUserID) || successor.AccountableUserID != parseUUID(testUserID) || successor.DelegatedFromTaskID != parseUUID(workerTaskID) {
 					t.Fatal("worker follow-up lost squad or human delegation provenance")
 				}
-				if _, err := testHandler.TaskService.StartTask(ctx, parseUUID(next.ID)); err != nil {
+				if _, err := testHandler.TaskService.StartTaskWithCardSessionLease(ctx, parseUUID(next.ID), "test-daemon"); err != nil {
 					t.Fatal(err)
 				}
 				completeWorkerReplyRun(t, next.ID)
@@ -226,7 +226,7 @@ func TestWorkerReplyReconcileBoundaries(t *testing.T) {
 				}
 				if mode == "completed_before_registration" {
 					registration.before = func() {
-						if _, err := testHandler.TaskService.StartTask(ctx, parseUUID(taskID)); err != nil {
+						if _, err := testHandler.TaskService.StartTaskWithCardSessionLease(ctx, parseUUID(taskID), "test-daemon"); err != nil {
 							t.Fatal(err)
 						}
 						completeWorkerReplyRun(t, taskID)
@@ -266,7 +266,7 @@ func TestWorkerReplyReconcileBoundaries(t *testing.T) {
 				dbfx.Exec(t, `UPDATE issue SET assignee_type = 'agent', assignee_id = $2 WHERE id = $1`, issueID, workerID)
 			}
 			if mode != "completed_before_registration" {
-				if _, err := testHandler.TaskService.StartTask(ctx, parseUUID(taskID)); err != nil {
+				if _, err := testHandler.TaskService.StartTaskWithCardSessionLease(ctx, parseUUID(taskID), "test-daemon"); err != nil {
 					t.Fatal(err)
 				}
 				completeWorkerReplyRun(t, taskID)
@@ -285,7 +285,7 @@ func TestWorkerReplyReconcileBoundaries(t *testing.T) {
 			if next == nil || !slices.Contains(next.DeliveredCommentIDs, replyID) {
 				t.Fatal("accepted reply was not delivered")
 			}
-			if _, err := testHandler.TaskService.StartTask(ctx, parseUUID(next.ID)); err != nil {
+			if _, err := testHandler.TaskService.StartTaskWithCardSessionLease(ctx, parseUUID(next.ID), "test-daemon"); err != nil {
 				t.Fatal(err)
 			}
 			completeWorkerReplyRun(t, next.ID)

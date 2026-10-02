@@ -644,7 +644,7 @@ func TestClaimTaskByRuntime_StartedRetryWithoutProviderMustNotWaiveReads(t *test
 	}
 
 	// started_at lands here. The provider never launches.
-	if started, err := testHandler.TaskService.StartTask(ctx, child.ID); err != nil || !started.StartedAt.Valid {
+	if started, err := testHandler.TaskService.StartTaskWithCardSessionLease(ctx, child.ID, "test-daemon"); err != nil || !started.StartedAt.Valid {
 		t.Fatalf("StartTask did not record started_at: %v", err)
 	}
 	recovered, err := testHandler.Queries.RecoverOrphanedTasksForRuntime(ctx, parseUUID(runtimeID))

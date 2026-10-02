@@ -315,7 +315,7 @@ func TestCancelledTaskLateProviderPinIsRetainedForFollowUp(t *testing.T) {
 		t.Fatalf("insert dispatched task: %v", err)
 	}
 	t.Cleanup(func() { testPool.Exec(context.Background(), `DELETE FROM agent_task_queue WHERE id = $1`, taskID) })
-	started, err := testHandler.TaskService.StartTask(ctx, taskID)
+	started, err := testHandler.TaskService.StartTaskWithCardSessionLease(ctx, taskID, "test-daemon")
 	if err != nil {
 		t.Fatalf("start task: %v", err)
 	}
@@ -445,7 +445,7 @@ func TestExistingAssignedTodoAllocatesGenerationLazilyAtTaskStart(t *testing.T) 
 		t.Fatalf("insert task: %v", err)
 	}
 	t.Cleanup(func() { testPool.Exec(context.Background(), `DELETE FROM agent_task_queue WHERE id = $1`, taskID) })
-	started, err := testHandler.TaskService.StartTask(ctx, taskID)
+	started, err := testHandler.TaskService.StartTaskWithCardSessionLease(ctx, taskID, "test-daemon")
 	if err != nil {
 		t.Fatalf("start task: %v", err)
 	}
@@ -852,7 +852,7 @@ func TestClosedCardSessionRejectsLateTaskCallbacksFromPriorGeneration(t *testing
 				t.Fatalf("insert dispatched task: %v", err)
 			}
 			t.Cleanup(func() { testPool.Exec(context.Background(), `DELETE FROM agent_task_queue WHERE id = $1`, taskID) })
-			started, err := testHandler.TaskService.StartTask(ctx, taskID)
+			started, err := testHandler.TaskService.StartTaskWithCardSessionLease(ctx, taskID, "test-daemon")
 			if err != nil {
 				t.Fatalf("start task: %v", err)
 			}

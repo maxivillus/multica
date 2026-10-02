@@ -45,7 +45,7 @@ func TestRefreshCardSessionTokenStatsAggregatesCurrentUsage(t *testing.T) {
 	if _, err := pool.Exec(ctx, `UPDATE agent_task_queue SET status = 'dispatched', dispatched_at = now() WHERE id = $1`, task.ID); err != nil {
 		t.Fatalf("dispatch fixture task: %v", err)
 	}
-	started, err := svc.StartTask(ctx, task.ID)
+	started, err := svc.StartTaskWithCardSessionLease(ctx, task.ID, "test-daemon")
 	if err != nil {
 		t.Fatalf("start fixture task and bind its card-session generation: %v", err)
 	}

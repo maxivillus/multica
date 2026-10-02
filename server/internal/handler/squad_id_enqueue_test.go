@@ -93,7 +93,7 @@ func TestCreateComment_SquadMentionStampsSquadIDOnLeaderTask(t *testing.T) {
 	if _, err := testPool.Exec(ctx, `UPDATE agent_task_queue SET status = 'dispatched', dispatched_at = now() WHERE id = $1`, taskID); err != nil {
 		t.Fatalf("dispatch ordinary backlog mention task: %v", err)
 	}
-	started, err := testHandler.TaskService.StartTask(ctx, util.MustParseUUID(taskID))
+	started, err := testHandler.TaskService.StartTaskWithCardSessionLease(ctx, util.MustParseUUID(taskID), "test-daemon")
 	if err != nil {
 		t.Fatalf("start ordinary backlog mention task: %v", err)
 	}
