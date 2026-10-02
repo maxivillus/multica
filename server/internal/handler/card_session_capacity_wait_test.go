@@ -92,11 +92,11 @@ func TestIssueTasksWaitForCardSessionCapacity(t *testing.T) {
 			if claimed == nil || claimed.ID != task.ID {
 				t.Fatalf("claim after freeing capacity = %v, want task %s", claimed, util.UUIDToString(task.ID))
 			}
-			started, err := testHandler.TaskService.StartTaskForClaim(ctx, db.LockAgentTaskStartClaimParams{
+			started, err := testHandler.TaskService.StartTaskForClaimWithCardSessionLease(ctx, db.LockAgentTaskStartClaimParams{
 				ID:           claimed.ID,
 				RuntimeID:    claimed.RuntimeID,
 				DispatchedAt: claimed.DispatchedAt,
-			})
+			}, "test-daemon")
 			if err != nil {
 				t.Fatalf("start admitted task: %v", err)
 			}
