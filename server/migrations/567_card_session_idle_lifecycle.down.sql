@@ -16,10 +16,6 @@ SET settings = (
                 w.settings->'_migration_567_card_session_settings'->'post_done_retention_hours',
                 w.settings->'card_sessions'->'idle_timeout_hours',
                 '24'::jsonb
-            ),
-            'token_stats_interval_minutes', COALESCE(
-                w.settings->'_migration_567_card_session_settings'->'token_stats_interval_minutes',
-                '15'::jsonb
             )
         )) - 'idle_timeout_hours',
         true
@@ -71,12 +67,7 @@ ALTER TABLE card_session
     );
 
 ALTER TABLE card_session
-    DROP COLUMN IF EXISTS pause_reason,
-    DROP COLUMN IF EXISTS token_input_tokens,
-    DROP COLUMN IF EXISTS token_output_tokens,
-    DROP COLUMN IF EXISTS token_cache_read_tokens,
-    DROP COLUMN IF EXISTS token_cache_write_tokens,
-    DROP COLUMN IF EXISTS token_task_count;
+    DROP COLUMN IF EXISTS pause_reason;
 CREATE OR REPLACE FUNCTION guard_card_session_close()
 RETURNS trigger
 LANGUAGE plpgsql

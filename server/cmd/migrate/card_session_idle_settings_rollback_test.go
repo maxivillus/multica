@@ -41,8 +41,8 @@ func TestCardSessionIdleSettingsRollbackRestoresLegacyValues(t *testing.T) {
 		id       string
 		settings string
 	}{
-		{"00000000-0000-0000-0000-000000000551", `{"card_sessions":{"post_done_retention_hours":72,"token_stats_interval_minutes":31,"max_open_sessions":7}}`},
-		{"00000000-0000-0000-0000-000000000552", `{"card_sessions":{"idle_timeout_hours":36,"post_done_retention_hours":48,"token_stats_interval_minutes":27,"max_open_sessions":8}}`},
+		{"00000000-0000-0000-0000-000000000551", `{"card_sessions":{"post_done_retention_hours":72,"max_open_sessions":7}}`},
+		{"00000000-0000-0000-0000-000000000552", `{"card_sessions":{"idle_timeout_hours":36,"post_done_retention_hours":48,"max_open_sessions":8}}`},
 	}
 	for _, workspace := range workspaces {
 		if _, err := pool.Exec(ctx, `INSERT INTO workspace (id, settings) VALUES ($1, $2::jsonb)`, workspace.id, workspace.settings); err != nil {
@@ -68,56 +68,52 @@ func TestCardSessionIdleSettingsRollbackRestoresLegacyValues(t *testing.T) {
 		t.Fatalf("apply settings upgrade: %v", err)
 	}
 
-	assertSettings := func(id, idle, retention, interval, maxOpen, rollbackMetadata string) {
+	assertSettings := func(id, idle, retention, maxOpen string, rollbackMetadata bool) {
 		t.Helper()
-		var gotIdle, gotRetention, gotInterval, gotMax, gotRollback string
+		var gotIdle, gotRetention, gotMax string
+		var gotRollback bool
 		if err := pool.QueryRow(ctx, `
 			SELECT
 				COALESCE(settings->'card_sessions'->>'idle_timeout_hours', ''),
 				COALESCE(settings->'card_sessions'->>'post_done_retention_hours', ''),
-				COALESCE(settings->'card_sessions'->>'token_stats_interval_minutes', ''),
 				COALESCE(settings->'card_sessions'->>'max_open_sessions', ''),
-				COALESCE(settings->'_migration_567_card_session_settings'->>'token_stats_interval_minutes', '')
-			FROM workspace WHERE id = $1`, id).Scan(&gotIdle, &gotRetention, &gotInterval, &gotMax, &gotRollback); err != nil {
+				settings ? '_migration_567_card_session_settings'
+			FROM workspace WHERE id = $1`, id).Scan(&gotIdle, &gotRetention, &gotMax, &gotRollback); err != nil {
 			t.Fatalf("read workspace settings %s: %v", id, err)
 		}
-		if gotIdle != idle || gotRetention != retention || gotInterval != interval || gotMax != maxOpen || gotRollback != rollbackMetadata {
-			t.Fatalf("settings %s = idle %q retention %q interval %q max %q rollback %q; want %q %q %q %q %q",
-				id, gotIdle, gotRetention, gotInterval, gotMax, gotRollback,
-				idle, retention, interval, maxOpen, rollbackMetadata)
+		if gotIdle != idle || gotRetention != retention || gotMax != maxOpen || gotRollback != rollbackMetadata {
+			t.Fatalf("settings %s = idle %q retention %q max %q rollback %t; want %q %q %q %t",
+				id, gotIdle, gotRetention, gotMax, gotRollback,
+				idle, retention, maxOpen, rollbackMetadata)
 		}
 	}
-	assertSettings(workspaces[0].id, "72", "", "", "7", "31")
-	assertSettings(workspaces[1].id, "36", "", "", "8", "27")
+	assertSettings(workspaces[0].id, "72", "", "7", true)
+	assertSettings(workspaces[1].id, "36", "", "8", true)
 
 	if _, err := pool.Exec(ctx, downSettings); err != nil {
 		t.Fatalf("apply settings rollback: %v", err)
 	}
 	for _, workspace := range workspaces {
-		var idle, retention, interval, maxOpen string
+		var idle, retention, maxOpen string
 		var rollbackMetadata bool
 		if err := pool.QueryRow(ctx, `
 			SELECT
 				COALESCE(settings->'card_sessions'->>'idle_timeout_hours', ''),
 				COALESCE(settings->'card_sessions'->>'post_done_retention_hours', ''),
-				COALESCE(settings->'card_sessions'->>'token_stats_interval_minutes', ''),
 				COALESCE(settings->'card_sessions'->>'max_open_sessions', ''),
 				settings ? '_migration_567_card_session_settings'
-			FROM workspace WHERE id = $1`, workspace.id).Scan(&idle, &retention, &interval, &maxOpen, &rollbackMetadata); err != nil {
+			FROM workspace WHERE id = $1`, workspace.id).Scan(&idle, &retention, &maxOpen, &rollbackMetadata); err != nil {
 			t.Fatalf("read rolled back workspace settings %s: %v", workspace.id, err)
 		}
 		if idle != "" || maxOpen != map[string]string{workspaces[0].id: "7", workspaces[1].id: "8"}[workspace.id] || rollbackMetadata {
 			t.Fatalf("rollback metadata/settings for %s: idle %q max %q metadata=%t", workspace.id, idle, maxOpen, rollbackMetadata)
 		}
-		wantRetention, wantInterval := map[string][2]string{
-			workspaces[0].id: {"72", "31"},
-			workspaces[1].id: {"48", "27"},
-		}[workspace.id][0], map[string][2]string{
-			workspaces[0].id: {"72", "31"},
-			workspaces[1].id: {"48", "27"},
-		}[workspace.id][1]
-		if retention != wantRetention || interval != wantInterval {
-			t.Fatalf("rollback values for %s = retention %q interval %q; want %q %q", workspace.id, retention, interval, wantRetention, wantInterval)
+		wantRetention := map[string]string{
+			workspaces[0].id: "72",
+			workspaces[1].id: "48",
+		}[workspace.id]
+		if retention != wantRetention {
+			t.Fatalf("rollback value for %s = retention %q; want %q", workspace.id, retention, wantRetention)
 		}
 	}
 	if _, err := pool.Exec(ctx, downCardSessions); err != nil {

@@ -34,7 +34,7 @@ WHERE task.id = $3
       OR cs.lease_heartbeat_at <= now() - make_interval(secs => $2::double precision)
       OR cs.lease_owner = $1::text
   )
-RETURNING cs.id, cs.workspace_id, cs.issue_id, cs.agent_id, cs.generation, cs.state, cs.provider, cs.provider_session_id, cs.work_dir, cs.opened_at, cs.last_activity_at, cs.done_at, cs.retain_until, cs.closed_at, cs.lease_owner, cs.lease_epoch, cs.lease_heartbeat_at, cs.created_at, cs.updated_at, cs.last_token_stats_at, cs.pause_reason, cs.token_input_tokens, cs.token_output_tokens, cs.token_cache_read_tokens, cs.token_cache_write_tokens, cs.token_task_count
+RETURNING cs.id, cs.workspace_id, cs.issue_id, cs.agent_id, cs.generation, cs.state, cs.provider, cs.provider_session_id, cs.work_dir, cs.opened_at, cs.last_activity_at, cs.done_at, cs.retain_until, cs.closed_at, cs.lease_owner, cs.lease_epoch, cs.lease_heartbeat_at, cs.created_at, cs.updated_at, cs.pause_reason
 `
 
 type AcquireCardSessionLeaseForTaskParams struct {
@@ -70,13 +70,7 @@ func (q *Queries) AcquireCardSessionLeaseForTask(ctx context.Context, arg Acquir
 		&i.LeaseHeartbeatAt,
 		&i.CreatedAt,
 		&i.UpdatedAt,
-		&i.LastTokenStatsAt,
 		&i.PauseReason,
-		&i.TokenInputTokens,
-		&i.TokenOutputTokens,
-		&i.TokenCacheReadTokens,
-		&i.TokenCacheWriteTokens,
-		&i.TokenTaskCount,
 	)
 	return i, err
 }
@@ -106,7 +100,7 @@ WHERE issue.id = $5
   AND issue.workspace_id = $1
   AND agent.workspace_id = $1
   AND issue_status_allows_agent_task(issue.workspace_id, issue.status)
-RETURNING id, workspace_id, issue_id, agent_id, generation, state, provider, provider_session_id, work_dir, opened_at, last_activity_at, done_at, retain_until, closed_at, lease_owner, lease_epoch, lease_heartbeat_at, created_at, updated_at, last_token_stats_at, pause_reason, token_input_tokens, token_output_tokens, token_cache_read_tokens, token_cache_write_tokens, token_task_count
+RETURNING id, workspace_id, issue_id, agent_id, generation, state, provider, provider_session_id, work_dir, opened_at, last_activity_at, done_at, retain_until, closed_at, lease_owner, lease_epoch, lease_heartbeat_at, created_at, updated_at, pause_reason
 `
 
 type CreateCardSessionParams struct {
@@ -146,13 +140,7 @@ func (q *Queries) CreateCardSession(ctx context.Context, arg CreateCardSessionPa
 		&i.LeaseHeartbeatAt,
 		&i.CreatedAt,
 		&i.UpdatedAt,
-		&i.LastTokenStatsAt,
 		&i.PauseReason,
-		&i.TokenInputTokens,
-		&i.TokenOutputTokens,
-		&i.TokenCacheReadTokens,
-		&i.TokenCacheWriteTokens,
-		&i.TokenTaskCount,
 	)
 	return i, err
 }
@@ -194,7 +182,7 @@ WHERE w.id = cs.workspace_id
             AND task.status IN ('queued', 'deferred')
       )
   )
-RETURNING cs.id, cs.workspace_id, cs.issue_id, cs.agent_id, cs.generation, cs.state, cs.provider, cs.provider_session_id, cs.work_dir, cs.opened_at, cs.last_activity_at, cs.done_at, cs.retain_until, cs.closed_at, cs.lease_owner, cs.lease_epoch, cs.lease_heartbeat_at, cs.created_at, cs.updated_at, cs.last_token_stats_at, cs.pause_reason, cs.token_input_tokens, cs.token_output_tokens, cs.token_cache_read_tokens, cs.token_cache_write_tokens, cs.token_task_count
+RETURNING cs.id, cs.workspace_id, cs.issue_id, cs.agent_id, cs.generation, cs.state, cs.provider, cs.provider_session_id, cs.work_dir, cs.opened_at, cs.last_activity_at, cs.done_at, cs.retain_until, cs.closed_at, cs.lease_owner, cs.lease_epoch, cs.lease_heartbeat_at, cs.created_at, cs.updated_at, cs.pause_reason
 `
 
 func (q *Queries) ExpireCardSessions(ctx context.Context) ([]CardSession, error) {
@@ -226,13 +214,7 @@ func (q *Queries) ExpireCardSessions(ctx context.Context) ([]CardSession, error)
 			&i.LeaseHeartbeatAt,
 			&i.CreatedAt,
 			&i.UpdatedAt,
-			&i.LastTokenStatsAt,
 			&i.PauseReason,
-			&i.TokenInputTokens,
-			&i.TokenOutputTokens,
-			&i.TokenCacheReadTokens,
-			&i.TokenCacheWriteTokens,
-			&i.TokenTaskCount,
 		); err != nil {
 			return nil, err
 		}
@@ -282,7 +264,7 @@ WHERE cs.workspace_id = $1
             AND task.status IN ('queued', 'deferred')
       )
   )
-RETURNING cs.id, cs.workspace_id, cs.issue_id, cs.agent_id, cs.generation, cs.state, cs.provider, cs.provider_session_id, cs.work_dir, cs.opened_at, cs.last_activity_at, cs.done_at, cs.retain_until, cs.closed_at, cs.lease_owner, cs.lease_epoch, cs.lease_heartbeat_at, cs.created_at, cs.updated_at, cs.last_token_stats_at, cs.pause_reason, cs.token_input_tokens, cs.token_output_tokens, cs.token_cache_read_tokens, cs.token_cache_write_tokens, cs.token_task_count
+RETURNING cs.id, cs.workspace_id, cs.issue_id, cs.agent_id, cs.generation, cs.state, cs.provider, cs.provider_session_id, cs.work_dir, cs.opened_at, cs.last_activity_at, cs.done_at, cs.retain_until, cs.closed_at, cs.lease_owner, cs.lease_epoch, cs.lease_heartbeat_at, cs.created_at, cs.updated_at, cs.pause_reason
 `
 
 func (q *Queries) ExpireCardSessionsForWorkspace(ctx context.Context, workspaceID pgtype.UUID) ([]CardSession, error) {
@@ -314,13 +296,7 @@ func (q *Queries) ExpireCardSessionsForWorkspace(ctx context.Context, workspaceI
 			&i.LeaseHeartbeatAt,
 			&i.CreatedAt,
 			&i.UpdatedAt,
-			&i.LastTokenStatsAt,
 			&i.PauseReason,
-			&i.TokenInputTokens,
-			&i.TokenOutputTokens,
-			&i.TokenCacheReadTokens,
-			&i.TokenCacheWriteTokens,
-			&i.TokenTaskCount,
 		); err != nil {
 			return nil, err
 		}
@@ -362,7 +338,7 @@ func (q *Queries) FinalizeCardSessionProviderStateByTask(ctx context.Context, ar
 }
 
 const getCardSession = `-- name: GetCardSession :one
-SELECT id, workspace_id, issue_id, agent_id, generation, state, provider, provider_session_id, work_dir, opened_at, last_activity_at, done_at, retain_until, closed_at, lease_owner, lease_epoch, lease_heartbeat_at, created_at, updated_at, last_token_stats_at, pause_reason, token_input_tokens, token_output_tokens, token_cache_read_tokens, token_cache_write_tokens, token_task_count
+SELECT id, workspace_id, issue_id, agent_id, generation, state, provider, provider_session_id, work_dir, opened_at, last_activity_at, done_at, retain_until, closed_at, lease_owner, lease_epoch, lease_heartbeat_at, created_at, updated_at, pause_reason
 FROM card_session
 WHERE id = $1
 `
@@ -390,58 +366,13 @@ func (q *Queries) GetCardSession(ctx context.Context, id pgtype.UUID) (CardSessi
 		&i.LeaseHeartbeatAt,
 		&i.CreatedAt,
 		&i.UpdatedAt,
-		&i.LastTokenStatsAt,
 		&i.PauseReason,
-		&i.TokenInputTokens,
-		&i.TokenOutputTokens,
-		&i.TokenCacheReadTokens,
-		&i.TokenCacheWriteTokens,
-		&i.TokenTaskCount,
-	)
-	return i, err
-}
-
-const getCardSessionTokenStats = `-- name: GetCardSessionTokenStats :one
-SELECT
-    COALESCE(SUM(usage.input_tokens), 0)::bigint AS input_tokens,
-    COALESCE(SUM(usage.output_tokens), 0)::bigint AS output_tokens,
-    COALESCE(SUM(usage.cache_read_tokens), 0)::bigint AS cache_read_tokens,
-    COALESCE(SUM(usage.cache_write_tokens), 0)::bigint AS cache_write_tokens,
-    COUNT(DISTINCT task.id)::bigint AS task_count,
-    COALESCE(MAX(usage.updated_at), now())::timestamptz AS latest_usage_at
-FROM card_session AS cs
-JOIN agent_task_queue AS task
-  ON task.card_session_id = cs.id
-JOIN task_usage AS usage ON usage.task_id = task.id
-WHERE cs.id = $1
-  AND usage.created_at >= cs.opened_at
-`
-
-type GetCardSessionTokenStatsRow struct {
-	InputTokens      int64              `json:"input_tokens"`
-	OutputTokens     int64              `json:"output_tokens"`
-	CacheReadTokens  int64              `json:"cache_read_tokens"`
-	CacheWriteTokens int64              `json:"cache_write_tokens"`
-	TaskCount        int64              `json:"task_count"`
-	LatestUsageAt    pgtype.Timestamptz `json:"latest_usage_at"`
-}
-
-func (q *Queries) GetCardSessionTokenStats(ctx context.Context, cardSessionID pgtype.UUID) (GetCardSessionTokenStatsRow, error) {
-	row := q.db.QueryRow(ctx, getCardSessionTokenStats, cardSessionID)
-	var i GetCardSessionTokenStatsRow
-	err := row.Scan(
-		&i.InputTokens,
-		&i.OutputTokens,
-		&i.CacheReadTokens,
-		&i.CacheWriteTokens,
-		&i.TaskCount,
-		&i.LatestUsageAt,
 	)
 	return i, err
 }
 
 const getLatestCardSession = `-- name: GetLatestCardSession :one
-SELECT id, workspace_id, issue_id, agent_id, generation, state, provider, provider_session_id, work_dir, opened_at, last_activity_at, done_at, retain_until, closed_at, lease_owner, lease_epoch, lease_heartbeat_at, created_at, updated_at, last_token_stats_at, pause_reason, token_input_tokens, token_output_tokens, token_cache_read_tokens, token_cache_write_tokens, token_task_count
+SELECT id, workspace_id, issue_id, agent_id, generation, state, provider, provider_session_id, work_dir, opened_at, last_activity_at, done_at, retain_until, closed_at, lease_owner, lease_epoch, lease_heartbeat_at, created_at, updated_at, pause_reason
 FROM card_session
 WHERE issue_id = $1
   AND agent_id = $2
@@ -479,19 +410,13 @@ func (q *Queries) GetLatestCardSession(ctx context.Context, arg GetLatestCardSes
 		&i.LeaseHeartbeatAt,
 		&i.CreatedAt,
 		&i.UpdatedAt,
-		&i.LastTokenStatsAt,
 		&i.PauseReason,
-		&i.TokenInputTokens,
-		&i.TokenOutputTokens,
-		&i.TokenCacheReadTokens,
-		&i.TokenCacheWriteTokens,
-		&i.TokenTaskCount,
 	)
 	return i, err
 }
 
 const getResumableCardSession = `-- name: GetResumableCardSession :one
-SELECT id, workspace_id, issue_id, agent_id, generation, state, provider, provider_session_id, work_dir, opened_at, last_activity_at, done_at, retain_until, closed_at, lease_owner, lease_epoch, lease_heartbeat_at, created_at, updated_at, last_token_stats_at, pause_reason, token_input_tokens, token_output_tokens, token_cache_read_tokens, token_cache_write_tokens, token_task_count
+SELECT id, workspace_id, issue_id, agent_id, generation, state, provider, provider_session_id, work_dir, opened_at, last_activity_at, done_at, retain_until, closed_at, lease_owner, lease_epoch, lease_heartbeat_at, created_at, updated_at, pause_reason
 FROM card_session
 WHERE issue_id = $1
   AND agent_id = $2
@@ -530,13 +455,7 @@ func (q *Queries) GetResumableCardSession(ctx context.Context, arg GetResumableC
 		&i.LeaseHeartbeatAt,
 		&i.CreatedAt,
 		&i.UpdatedAt,
-		&i.LastTokenStatsAt,
 		&i.PauseReason,
-		&i.TokenInputTokens,
-		&i.TokenOutputTokens,
-		&i.TokenCacheReadTokens,
-		&i.TokenCacheWriteTokens,
-		&i.TokenTaskCount,
 	)
 	return i, err
 }
@@ -551,7 +470,7 @@ WHERE task.id = $1
   AND cs.state = 'open'
   AND cs.lease_owner = $2::text
   AND cs.lease_epoch = $3
-RETURNING cs.id, cs.workspace_id, cs.issue_id, cs.agent_id, cs.generation, cs.state, cs.provider, cs.provider_session_id, cs.work_dir, cs.opened_at, cs.last_activity_at, cs.done_at, cs.retain_until, cs.closed_at, cs.lease_owner, cs.lease_epoch, cs.lease_heartbeat_at, cs.created_at, cs.updated_at, cs.last_token_stats_at, cs.pause_reason, cs.token_input_tokens, cs.token_output_tokens, cs.token_cache_read_tokens, cs.token_cache_write_tokens, cs.token_task_count
+RETURNING cs.id, cs.workspace_id, cs.issue_id, cs.agent_id, cs.generation, cs.state, cs.provider, cs.provider_session_id, cs.work_dir, cs.opened_at, cs.last_activity_at, cs.done_at, cs.retain_until, cs.closed_at, cs.lease_owner, cs.lease_epoch, cs.lease_heartbeat_at, cs.created_at, cs.updated_at, cs.pause_reason
 `
 
 type HeartbeatCardSessionLeaseByTaskParams struct {
@@ -584,54 +503,9 @@ func (q *Queries) HeartbeatCardSessionLeaseByTask(ctx context.Context, arg Heart
 		&i.LeaseHeartbeatAt,
 		&i.CreatedAt,
 		&i.UpdatedAt,
-		&i.LastTokenStatsAt,
 		&i.PauseReason,
-		&i.TokenInputTokens,
-		&i.TokenOutputTokens,
-		&i.TokenCacheReadTokens,
-		&i.TokenCacheWriteTokens,
-		&i.TokenTaskCount,
 	)
 	return i, err
-}
-
-const listCardSessionsWithStaleTokenStats = `-- name: ListCardSessionsWithStaleTokenStats :many
-SELECT cs.id
-  FROM card_session AS cs
-  WHERE EXISTS (
-      SELECT 1
-      FROM agent_task_queue AS task
-      JOIN task_usage AS usage ON usage.task_id = task.id
-      WHERE task.card_session_id = cs.id
-        AND usage.created_at >= cs.opened_at
-        AND (cs.last_token_stats_at IS NULL OR usage.updated_at > cs.last_token_stats_at)
-  )
-ORDER BY cs.last_token_stats_at NULLS FIRST, cs.id
-LIMIT $1::integer
-`
-
-// Session token totals are cached after each accepted provider usage report.
-// The source remains task_usage so corrections are reflected on refresh. Closed
-// generations remain eligible: a restart can close an idle session before its
-// recovery sweep gets a chance to refresh the final persisted usage totals.
-func (q *Queries) ListCardSessionsWithStaleTokenStats(ctx context.Context, limit int32) ([]pgtype.UUID, error) {
-	rows, err := q.db.Query(ctx, listCardSessionsWithStaleTokenStats, limit)
-	if err != nil {
-		return nil, err
-	}
-	defer rows.Close()
-	items := []pgtype.UUID{}
-	for rows.Next() {
-		var id pgtype.UUID
-		if err := rows.Scan(&id); err != nil {
-			return nil, err
-		}
-		items = append(items, id)
-	}
-	if err := rows.Err(); err != nil {
-		return nil, err
-	}
-	return items, nil
 }
 
 const listDueCardSessionCapacityWaitersForRuntimes = `-- name: ListDueCardSessionCapacityWaitersForRuntimes :many
@@ -692,38 +566,6 @@ func (q *Queries) ListDueCardSessionCapacityWaitersForRuntimes(ctx context.Conte
 		return nil, err
 	}
 	return items, nil
-}
-
-const lockCardSessionForTaskTokenStats = `-- name: LockCardSessionForTaskTokenStats :one
-SELECT cs.id
-FROM card_session AS cs
-JOIN agent_task_queue AS task
-  ON task.card_session_id = cs.id
-WHERE task.id = $1
-ORDER BY cs.generation DESC
-LIMIT 1
-FOR UPDATE OF cs
-`
-
-func (q *Queries) LockCardSessionForTaskTokenStats(ctx context.Context, taskID pgtype.UUID) (pgtype.UUID, error) {
-	row := q.db.QueryRow(ctx, lockCardSessionForTaskTokenStats, taskID)
-	var id pgtype.UUID
-	err := row.Scan(&id)
-	return id, err
-}
-
-const lockCardSessionTokenStats = `-- name: LockCardSessionTokenStats :one
-SELECT id
-FROM card_session
-WHERE id = $1
-FOR UPDATE
-`
-
-func (q *Queries) LockCardSessionTokenStats(ctx context.Context, cardSessionID pgtype.UUID) (pgtype.UUID, error) {
-	row := q.db.QueryRow(ctx, lockCardSessionTokenStats, cardSessionID)
-	var id pgtype.UUID
-	err := row.Scan(&id)
-	return id, err
 }
 
 const lockIssueForCardSession = `-- name: LockIssueForCardSession :one
@@ -808,7 +650,7 @@ WHERE task.id = $1
   AND cs.state <> 'closed'
   AND cs.lease_owner = $2::text
   AND cs.lease_epoch = $3
-RETURNING cs.id, cs.workspace_id, cs.issue_id, cs.agent_id, cs.generation, cs.state, cs.provider, cs.provider_session_id, cs.work_dir, cs.opened_at, cs.last_activity_at, cs.done_at, cs.retain_until, cs.closed_at, cs.lease_owner, cs.lease_epoch, cs.lease_heartbeat_at, cs.created_at, cs.updated_at, cs.last_token_stats_at, cs.pause_reason, cs.token_input_tokens, cs.token_output_tokens, cs.token_cache_read_tokens, cs.token_cache_write_tokens, cs.token_task_count
+RETURNING cs.id, cs.workspace_id, cs.issue_id, cs.agent_id, cs.generation, cs.state, cs.provider, cs.provider_session_id, cs.work_dir, cs.opened_at, cs.last_activity_at, cs.done_at, cs.retain_until, cs.closed_at, cs.lease_owner, cs.lease_epoch, cs.lease_heartbeat_at, cs.created_at, cs.updated_at, cs.pause_reason
 `
 
 type ReleaseCardSessionLeaseByTaskParams struct {
@@ -842,13 +684,7 @@ func (q *Queries) ReleaseCardSessionLeaseByTask(ctx context.Context, arg Release
 		&i.LeaseHeartbeatAt,
 		&i.CreatedAt,
 		&i.UpdatedAt,
-		&i.LastTokenStatsAt,
 		&i.PauseReason,
-		&i.TokenInputTokens,
-		&i.TokenOutputTokens,
-		&i.TokenCacheReadTokens,
-		&i.TokenCacheWriteTokens,
-		&i.TokenTaskCount,
 	)
 	return i, err
 }
@@ -897,7 +733,7 @@ WHERE cs.issue_id = $1
       OR issue.assignee_id IS NULL
       OR cs.agent_id <> issue.assignee_id
   )
-RETURNING cs.id, cs.workspace_id, cs.issue_id, cs.agent_id, cs.generation, cs.state, cs.provider, cs.provider_session_id, cs.work_dir, cs.opened_at, cs.last_activity_at, cs.done_at, cs.retain_until, cs.closed_at, cs.lease_owner, cs.lease_epoch, cs.lease_heartbeat_at, cs.created_at, cs.updated_at, cs.last_token_stats_at, cs.pause_reason, cs.token_input_tokens, cs.token_output_tokens, cs.token_cache_read_tokens, cs.token_cache_write_tokens, cs.token_task_count
+RETURNING cs.id, cs.workspace_id, cs.issue_id, cs.agent_id, cs.generation, cs.state, cs.provider, cs.provider_session_id, cs.work_dir, cs.opened_at, cs.last_activity_at, cs.done_at, cs.retain_until, cs.closed_at, cs.lease_owner, cs.lease_epoch, cs.lease_heartbeat_at, cs.created_at, cs.updated_at, cs.pause_reason
 `
 
 type SyncCardSessionsForIssueParams struct {
@@ -937,13 +773,7 @@ func (q *Queries) SyncCardSessionsForIssue(ctx context.Context, arg SyncCardSess
 			&i.LeaseHeartbeatAt,
 			&i.CreatedAt,
 			&i.UpdatedAt,
-			&i.LastTokenStatsAt,
 			&i.PauseReason,
-			&i.TokenInputTokens,
-			&i.TokenOutputTokens,
-			&i.TokenCacheReadTokens,
-			&i.TokenCacheWriteTokens,
-			&i.TokenTaskCount,
 		); err != nil {
 			return nil, err
 		}
@@ -965,7 +795,7 @@ SET state = 'open',
     updated_at = now()
 WHERE id = $1
   AND state <> 'closed'
-RETURNING id, workspace_id, issue_id, agent_id, generation, state, provider, provider_session_id, work_dir, opened_at, last_activity_at, done_at, retain_until, closed_at, lease_owner, lease_epoch, lease_heartbeat_at, created_at, updated_at, last_token_stats_at, pause_reason, token_input_tokens, token_output_tokens, token_cache_read_tokens, token_cache_write_tokens, token_task_count
+RETURNING id, workspace_id, issue_id, agent_id, generation, state, provider, provider_session_id, work_dir, opened_at, last_activity_at, done_at, retain_until, closed_at, lease_owner, lease_epoch, lease_heartbeat_at, created_at, updated_at, pause_reason
 `
 
 func (q *Queries) TouchCardSession(ctx context.Context, id pgtype.UUID) (CardSession, error) {
@@ -991,13 +821,7 @@ func (q *Queries) TouchCardSession(ctx context.Context, id pgtype.UUID) (CardSes
 		&i.LeaseHeartbeatAt,
 		&i.CreatedAt,
 		&i.UpdatedAt,
-		&i.LastTokenStatsAt,
 		&i.PauseReason,
-		&i.TokenInputTokens,
-		&i.TokenOutputTokens,
-		&i.TokenCacheReadTokens,
-		&i.TokenCacheWriteTokens,
-		&i.TokenTaskCount,
 	)
 	return i, err
 }
@@ -1052,40 +876,5 @@ type UpdateCardSessionProviderStateByTaskParams struct {
 
 func (q *Queries) UpdateCardSessionProviderStateByTask(ctx context.Context, arg UpdateCardSessionProviderStateByTaskParams) error {
 	_, err := q.db.Exec(ctx, updateCardSessionProviderStateByTask, arg.ID, arg.ProviderSessionID, arg.WorkDir)
-	return err
-}
-
-const updateCardSessionTokenStats = `-- name: UpdateCardSessionTokenStats :exec
-UPDATE card_session
-SET token_input_tokens = $1,
-    token_output_tokens = $2,
-    token_cache_read_tokens = $3,
-    token_cache_write_tokens = $4,
-    token_task_count = $5,
-    last_token_stats_at = $6,
-    updated_at = now()
-WHERE id = $7
-`
-
-type UpdateCardSessionTokenStatsParams struct {
-	InputTokens      int64              `json:"input_tokens"`
-	OutputTokens     int64              `json:"output_tokens"`
-	CacheReadTokens  int64              `json:"cache_read_tokens"`
-	CacheWriteTokens int64              `json:"cache_write_tokens"`
-	TaskCount        int64              `json:"task_count"`
-	LatestUsageAt    pgtype.Timestamptz `json:"latest_usage_at"`
-	CardSessionID    pgtype.UUID        `json:"card_session_id"`
-}
-
-func (q *Queries) UpdateCardSessionTokenStats(ctx context.Context, arg UpdateCardSessionTokenStatsParams) error {
-	_, err := q.db.Exec(ctx, updateCardSessionTokenStats,
-		arg.InputTokens,
-		arg.OutputTokens,
-		arg.CacheReadTokens,
-		arg.CacheWriteTokens,
-		arg.TaskCount,
-		arg.LatestUsageAt,
-		arg.CardSessionID,
-	)
 	return err
 }

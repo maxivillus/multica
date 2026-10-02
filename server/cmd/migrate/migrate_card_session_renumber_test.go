@@ -21,7 +21,6 @@ func TestCardSessionMigrationRenumberPreservesLegacyAndAppliesFresh(t *testing.T
 	basePool := openTestPool(t)
 	versions := []cardSessionMigrationVersion{
 		{"564_card_sessions", "420_card_sessions", "card_session_effect"},
-		{"565_card_session_token_stats", "421_card_session_token_stats", "card_session_token_stats_effect"},
 		{"566_card_session_cancel_retention", "422_card_session_cancel_retention", "card_session_cancel_retention_effect"},
 	}
 

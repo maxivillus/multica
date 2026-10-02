@@ -52,13 +52,13 @@ release a replacement lease.
 
 ### Token statistics
 
-After each accepted provider usage update, the server refreshes the generation's
-cumulative token totals in the background from `task_usage`. The refresh is
-scoped to the generation's start time and the tasks bound to that generation.
-A recovery sweep refreshes totals missed during a server restart. Statistics do
-not create card comments or agent input. This lifecycle does not measure or
-claim token savings, and it does not require a final summary comment from the
-agent.
+`task_usage` is the source of truth for per-run `IN`, `OUT`, `Cache read`, and
+`Cache write` values. A cumulative per-card total is derived on demand by
+scoping those rows to the generation's `opened_at` boundary and its bound
+tasks; it is not materialized on `card_session` and needs no recovery sweep.
+Statistics do not create card comments or agent input. This lifecycle does not
+measure or claim token savings, and it does not require a final summary comment
+from the agent.
 
 ### Diagnostics
 

@@ -106,9 +106,6 @@ func TestCreateComment_SquadMentionStampsSquadIDOnLeaderTask(t *testing.T) {
 	if err := testHandler.TaskService.TouchCardSessionActivityForTask(ctx, started.ID); err != nil {
 		t.Fatalf("touch ordinary backlog task activity: %v", err)
 	}
-	if err := testHandler.TaskService.RefreshCardSessionTokenStatsForTask(ctx, started.ID); err != nil {
-		t.Fatalf("refresh ordinary backlog task token stats: %v", err)
-	}
 }
 
 // TestCreateRetryTask_InheritsSquadID locks the retry-clone contract for the

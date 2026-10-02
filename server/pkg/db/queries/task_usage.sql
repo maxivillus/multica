@@ -112,11 +112,10 @@ SELECT
 FROM usage
 CROSS JOIN terminal_runs;
 
--- The opened_at boundary scopes the cumulative snapshot to the current
--- server-owned generation. The issue/agent/workspace joins keep this query
--- tenant-safe and exclude usage from another agent's generation on the same
--- issue.
--- name: GetOpenCardSessionTokenUsage :one
+-- The opened_at boundary and card_session_id scope the cumulative snapshot to
+-- one server-owned generation. This is an on-demand derived value; the
+-- card_session row does not store a second copy of task usage.
+-- name: GetCardSessionTokenUsage :one
 SELECT
     COALESCE(SUM(tu.input_tokens), 0)::bigint AS total_input_tokens,
     COALESCE(SUM(tu.output_tokens), 0)::bigint AS total_output_tokens,
@@ -125,13 +124,9 @@ SELECT
     COUNT(DISTINCT tu.task_id)::int AS task_count
 FROM task_usage AS tu
 JOIN agent_task_queue AS atq ON atq.id = tu.task_id
-JOIN issue AS i ON i.id = atq.issue_id
-JOIN agent AS a ON a.id = atq.agent_id
-WHERE atq.issue_id = sqlc.arg(issue_id)
-  AND atq.agent_id = sqlc.arg(agent_id)
-  AND i.workspace_id = sqlc.arg(workspace_id)
-  AND a.workspace_id = sqlc.arg(workspace_id)
-  AND tu.created_at >= sqlc.arg(since)::timestamptz;
+JOIN card_session AS cs ON cs.id = atq.card_session_id
+WHERE cs.id = sqlc.arg(card_session_id)
+  AND tu.created_at >= cs.opened_at;
 
 -- name: ListDashboardUsageDaily :many
 -- Daily per-(date, provider, model) token aggregates for the workspace, served

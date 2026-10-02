@@ -59,11 +59,12 @@ touch `last_activity_at`. Heartbeat/release operations require the exact
 owner and epoch, and lifecycle state changes clear the lease before a paused
 or closed generation can be reused.
 
-Refresh cumulative token totals in the background after each accepted provider
-usage update. Read totals from `task_usage`, scope them to the generation and
-its tasks, and use a recovery sweep after restart. Do not publish token
-statistics as card comments or agent input. The feature does not require an
-agent final-summary comment and does not include token-savings measurement.
+Keep per-run token usage in `task_usage`, which is the existing usage source.
+Derive cumulative totals on demand by scoping those rows to the generation and
+its tasks; do not add a materialized token snapshot or recovery sweep. Do not
+publish token statistics as card comments or agent input. The feature does not
+require an agent final-summary comment and does not include token-savings
+measurement.
 
 ### Consequences
 

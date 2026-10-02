@@ -5081,7 +5081,6 @@ func (h *Handler) ReportTaskUsage(w http.ResponseWriter, r *http.Request) {
 		if err := h.TaskService.TouchCardSessionActivityForTask(r.Context(), parsedTaskID); err != nil {
 			slog.Warn("touch card session after provider usage update failed", "task_id", taskID, "error", err)
 		}
-		h.TaskService.RefreshCardSessionTokenStatsAsync(parsedTaskID)
 	}
 
 	writeJSON(w, http.StatusOK, map[string]string{"status": "ok"})

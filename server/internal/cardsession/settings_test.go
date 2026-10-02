@@ -23,7 +23,7 @@ func TestParseConfiguredValues(t *testing.T) {
 }
 
 func TestParseLegacySettingsKeepsEffectiveTimeout(t *testing.T) {
-	got, err := Parse([]byte(`{"card_sessions":{"post_done_retention_hours":72,"token_stats_interval_minutes":30,"max_open_sessions":12}}`))
+	got, err := Parse([]byte(`{"card_sessions":{"post_done_retention_hours":72,"max_open_sessions":12}}`))
 	if err != nil {
 		t.Fatalf("Parse: %v", err)
 	}

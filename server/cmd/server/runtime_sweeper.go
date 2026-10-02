@@ -199,11 +199,6 @@ func runCardSessionSweeper(ctx context.Context, taskSvc *service.TaskService) {
 		} else if expired > 0 {
 			slog.Info("card session expiry sweep completed", "count", expired)
 		}
-		if refreshed, err := taskSvc.RecoverCardSessionTokenStats(ctx); err != nil {
-			slog.Warn("card session token stats recovery failed", "error", err)
-		} else if refreshed > 0 {
-			slog.Info("card session token stats recovery completed", "count", refreshed)
-		}
 	})
 }
 

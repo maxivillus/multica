@@ -11,6 +11,44 @@ import (
 	"github.com/jackc/pgx/v5/pgtype"
 )
 
+const getCardSessionTokenUsage = `-- name: GetCardSessionTokenUsage :one
+SELECT
+    COALESCE(SUM(tu.input_tokens), 0)::bigint AS total_input_tokens,
+    COALESCE(SUM(tu.output_tokens), 0)::bigint AS total_output_tokens,
+    COALESCE(SUM(tu.cache_read_tokens), 0)::bigint AS total_cache_read_tokens,
+    COALESCE(SUM(tu.cache_write_tokens), 0)::bigint AS total_cache_write_tokens,
+    COUNT(DISTINCT tu.task_id)::int AS task_count
+FROM task_usage AS tu
+JOIN agent_task_queue AS atq ON atq.id = tu.task_id
+JOIN card_session AS cs ON cs.id = atq.card_session_id
+WHERE cs.id = $1
+  AND tu.created_at >= cs.opened_at
+`
+
+type GetCardSessionTokenUsageRow struct {
+	TotalInputTokens      int64 `json:"total_input_tokens"`
+	TotalOutputTokens     int64 `json:"total_output_tokens"`
+	TotalCacheReadTokens  int64 `json:"total_cache_read_tokens"`
+	TotalCacheWriteTokens int64 `json:"total_cache_write_tokens"`
+	TaskCount             int32 `json:"task_count"`
+}
+
+// The opened_at boundary and card_session_id scope the cumulative snapshot to
+// one server-owned generation. This is an on-demand derived value; the
+// card_session row does not store a second copy of task usage.
+func (q *Queries) GetCardSessionTokenUsage(ctx context.Context, cardSessionID pgtype.UUID) (GetCardSessionTokenUsageRow, error) {
+	row := q.db.QueryRow(ctx, getCardSessionTokenUsage, cardSessionID)
+	var i GetCardSessionTokenUsageRow
+	err := row.Scan(
+		&i.TotalInputTokens,
+		&i.TotalOutputTokens,
+		&i.TotalCacheReadTokens,
+		&i.TotalCacheWriteTokens,
+		&i.TaskCount,
+	)
+	return i, err
+}
+
 const getIssueUsageSummary = `-- name: GetIssueUsageSummary :one
 WITH usage AS (
     SELECT
@@ -85,61 +123,6 @@ func (q *Queries) GetIssueUsageSummary(ctx context.Context, issueID pgtype.UUID)
 		&i.TerminalTaskCount,
 		&i.MeteredTaskCount,
 		&i.UnreportedTaskCount,
-	)
-	return i, err
-}
-
-const getOpenCardSessionTokenUsage = `-- name: GetOpenCardSessionTokenUsage :one
-SELECT
-    COALESCE(SUM(tu.input_tokens), 0)::bigint AS total_input_tokens,
-    COALESCE(SUM(tu.output_tokens), 0)::bigint AS total_output_tokens,
-    COALESCE(SUM(tu.cache_read_tokens), 0)::bigint AS total_cache_read_tokens,
-    COALESCE(SUM(tu.cache_write_tokens), 0)::bigint AS total_cache_write_tokens,
-    COUNT(DISTINCT tu.task_id)::int AS task_count
-FROM task_usage AS tu
-JOIN agent_task_queue AS atq ON atq.id = tu.task_id
-JOIN issue AS i ON i.id = atq.issue_id
-JOIN agent AS a ON a.id = atq.agent_id
-WHERE atq.issue_id = $1
-  AND atq.agent_id = $2
-  AND i.workspace_id = $3
-  AND a.workspace_id = $3
-  AND tu.created_at >= $4::timestamptz
-`
-
-type GetOpenCardSessionTokenUsageParams struct {
-	IssueID     pgtype.UUID        `json:"issue_id"`
-	AgentID     pgtype.UUID        `json:"agent_id"`
-	WorkspaceID pgtype.UUID        `json:"workspace_id"`
-	Since       pgtype.Timestamptz `json:"since"`
-}
-
-type GetOpenCardSessionTokenUsageRow struct {
-	TotalInputTokens      int64 `json:"total_input_tokens"`
-	TotalOutputTokens     int64 `json:"total_output_tokens"`
-	TotalCacheReadTokens  int64 `json:"total_cache_read_tokens"`
-	TotalCacheWriteTokens int64 `json:"total_cache_write_tokens"`
-	TaskCount             int32 `json:"task_count"`
-}
-
-// The opened_at boundary scopes the cumulative snapshot to the current
-// server-owned generation. The issue/agent/workspace joins keep this query
-// tenant-safe and exclude usage from another agent's generation on the same
-// issue.
-func (q *Queries) GetOpenCardSessionTokenUsage(ctx context.Context, arg GetOpenCardSessionTokenUsageParams) (GetOpenCardSessionTokenUsageRow, error) {
-	row := q.db.QueryRow(ctx, getOpenCardSessionTokenUsage,
-		arg.IssueID,
-		arg.AgentID,
-		arg.WorkspaceID,
-		arg.Since,
-	)
-	var i GetOpenCardSessionTokenUsageRow
-	err := row.Scan(
-		&i.TotalInputTokens,
-		&i.TotalOutputTokens,
-		&i.TotalCacheReadTokens,
-		&i.TotalCacheWriteTokens,
-		&i.TaskCount,
 	)
 	return i, err
 }

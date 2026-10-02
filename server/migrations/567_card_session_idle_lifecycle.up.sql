@@ -10,10 +10,6 @@ SET settings = jsonb_set(
             'post_done_retention_hours', CASE
                 WHEN (w.settings->'card_sessions') ? 'post_done_retention_hours'
                 THEN w.settings->'card_sessions'->'post_done_retention_hours'
-            END,
-            'token_stats_interval_minutes', CASE
-                WHEN (w.settings->'card_sessions') ? 'token_stats_interval_minutes'
-                THEN w.settings->'card_sessions'->'token_stats_interval_minutes'
             END
         )),
         true
@@ -28,14 +24,11 @@ SET settings = jsonb_set(
             )
             ELSE w.settings->'card_sessions'
         END
-    ) - 'post_done_retention_hours' - 'token_stats_interval_minutes',
+    ) - 'post_done_retention_hours',
     true
 )
 WHERE jsonb_typeof(w.settings->'card_sessions') = 'object'
-  AND (
-      (w.settings->'card_sessions') ? 'post_done_retention_hours'
-      OR (w.settings->'card_sessions') ? 'token_stats_interval_minutes'
-  );
+  AND (w.settings->'card_sessions') ? 'post_done_retention_hours';
 
 CREATE OR REPLACE FUNCTION issue_status_allows_agent_task(p_workspace_id UUID, p_status TEXT)
 RETURNS BOOLEAN
@@ -54,12 +47,6 @@ AS $function$
 $function$;
 
 ALTER TABLE card_session ADD COLUMN pause_reason TEXT;
-ALTER TABLE card_session
-    ADD COLUMN token_input_tokens BIGINT NOT NULL DEFAULT 0,
-    ADD COLUMN token_output_tokens BIGINT NOT NULL DEFAULT 0,
-    ADD COLUMN token_cache_read_tokens BIGINT NOT NULL DEFAULT 0,
-    ADD COLUMN token_cache_write_tokens BIGINT NOT NULL DEFAULT 0,
-    ADD COLUMN token_task_count BIGINT NOT NULL DEFAULT 0;
 DROP TRIGGER IF EXISTS card_session_close_guard ON card_session;
 DROP TRIGGER IF EXISTS card_session_issue_status_sync ON issue;
 ALTER TABLE card_session DROP CONSTRAINT IF EXISTS card_session_state_check;

@@ -880,11 +880,10 @@ func TestClosedCardSessionRejectsLateTaskCallbacksFromPriorGeneration(t *testing
 			var generationGPlus1 pgtype.UUID
 			var generation int64
 			var beforeActivity time.Time
-			var beforeLastTokenStats *time.Time
 			if err := testPool.QueryRow(ctx, `
-				SELECT id, generation, last_activity_at, last_token_stats_at
+				SELECT id, generation, last_activity_at
 				FROM card_session WHERE issue_id = $1 AND agent_id = $2 AND state = 'open'`, issueID, agentID,
-			).Scan(&generationGPlus1, &generation, &beforeActivity, &beforeLastTokenStats); err != nil {
+			).Scan(&generationGPlus1, &generation, &beforeActivity); err != nil {
 				t.Fatalf("load generation G+1: %v", err)
 			}
 			if generation != generationG.Generation+1 || generationGPlus1 == generationG.ID {
@@ -906,36 +905,29 @@ func TestClosedCardSessionRejectsLateTaskCallbacksFromPriorGeneration(t *testing
 			if err := testHandler.TaskService.TouchCardSessionActivityForTask(ctx, taskID); err != nil {
 				t.Fatalf("late activity touch: %v", err)
 			}
-			if err := testHandler.TaskService.RefreshCardSessionTokenStatsForTask(ctx, taskID); err != nil {
-				t.Fatalf("late token stats refresh: %v", err)
+			derivedUsage, err := testHandler.Queries.GetCardSessionTokenUsage(ctx, generationGPlus1)
+			if err != nil {
+				t.Fatalf("derive new generation token usage after old task callback: %v", err)
+			}
+			if derivedUsage.TotalInputTokens != 0 || derivedUsage.TotalOutputTokens != 0 ||
+				derivedUsage.TotalCacheReadTokens != 0 || derivedUsage.TotalCacheWriteTokens != 0 ||
+				derivedUsage.TaskCount != 0 {
+				t.Fatalf("generation G+1 derived token usage includes old task: %#v", derivedUsage)
 			}
 
 			var afterActivity time.Time
-			var afterLastTokenStats *time.Time
 			var providerSessionID, workDir pgtype.Text
-			var inputTokens, outputTokens, cacheReadTokens, cacheWriteTokens, taskCount int64
 			if err := testPool.QueryRow(ctx, `
-				SELECT last_activity_at, last_token_stats_at, provider_session_id, work_dir,
-				       token_input_tokens, token_output_tokens, token_cache_read_tokens,
-				       token_cache_write_tokens, token_task_count
+				SELECT last_activity_at, provider_session_id, work_dir
 				FROM card_session WHERE id = $1`, generationGPlus1,
-			).Scan(&afterActivity, &afterLastTokenStats, &providerSessionID, &workDir,
-				&inputTokens, &outputTokens, &cacheReadTokens, &cacheWriteTokens, &taskCount); err != nil {
+			).Scan(&afterActivity, &providerSessionID, &workDir); err != nil {
 				t.Fatalf("read generation G+1 after old callbacks: %v", err)
 			}
 			if !afterActivity.Equal(beforeActivity) {
 				t.Fatalf("generation G+1 activity changed from %v to %v after old task callback", beforeActivity, afterActivity)
 			}
-			if (beforeLastTokenStats == nil) != (afterLastTokenStats == nil) ||
-				(beforeLastTokenStats != nil && !afterLastTokenStats.Equal(*beforeLastTokenStats)) {
-				t.Fatalf("generation G+1 last_token_stats_at changed from %v to %v", beforeLastTokenStats, afterLastTokenStats)
-			}
 			if providerSessionID.Valid || workDir.Valid {
 				t.Fatalf("generation G+1 gained old provider state: session=%q workdir=%q", providerSessionID.String, workDir.String)
-			}
-			if inputTokens != 0 || outputTokens != 0 || cacheReadTokens != 0 || cacheWriteTokens != 0 || taskCount != 0 {
-				t.Fatalf("generation G+1 token stats include old task: (%d,%d,%d,%d,%d)",
-					inputTokens, outputTokens, cacheReadTokens, cacheWriteTokens, taskCount)
 			}
 		})
 	}
