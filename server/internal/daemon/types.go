@@ -295,6 +295,7 @@ type SkillFileRefData struct {
 type TaskUsageEntry struct {
 	Provider         string `json:"provider"`
 	Model            string `json:"model"`
+	CardSessionMode  string `json:"card_session_mode,omitempty"`
 	InputTokens      int64  `json:"input_tokens"`
 	OutputTokens     int64  `json:"output_tokens"`
 	CacheReadTokens  int64  `json:"cache_read_tokens"`

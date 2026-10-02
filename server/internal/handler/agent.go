@@ -744,6 +744,8 @@ type CoalescedCommentData struct {
 // Field names match the runtime/dashboard usage rows exactly so the client can
 // feed it to the same `estimateCost` / `estimateCacheSavings` helpers without
 // an adapter.
+// CardSessionMode is set only for card-session runs: `persistent` identifies a
+// live provider host and `resume` identifies the ordinary provider path.
 //
 // CostUsdTicks is the provider's own price for these tokens (1e-10 USD) and is
 // nil when the provider reported none — the client then estimates that slice
@@ -753,6 +755,7 @@ type CoalescedCommentData struct {
 type TaskUsageData struct {
 	Provider         string `json:"provider,omitempty"`
 	Model            string `json:"model"`
+	CardSessionMode  string `json:"card_session_mode,omitempty"`
 	InputTokens      int64  `json:"input_tokens"`
 	OutputTokens     int64  `json:"output_tokens"`
 	CacheReadTokens  int64  `json:"cache_read_tokens"`

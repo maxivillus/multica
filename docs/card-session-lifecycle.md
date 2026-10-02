@@ -100,7 +100,7 @@ while the host is idle.
 
 Backends that implement the persistent multi-turn contract use the live host
 path. Other backends use their ordinary provider `one-shot/resume` path for
-each task; the daemon records this as `card_session_mode=resume` and keeps the
-server-side lease scoped to the current task. They are not reported as
-persistent hosts, and the absence of the optional capability does not by
-itself fail a card task.
+each task; the daemon logs and attaches this as `card_session_mode=resume` to
+each per-run usage row, while keeping the server-side lease scoped to the
+current task. They are not reported as persistent hosts, and the absence of
+the optional capability does not by itself fail a card task.

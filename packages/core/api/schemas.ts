@@ -1894,6 +1894,7 @@ const OptionalStringArraySchema = z.preprocess(
 const TaskUsageSchema = z.object({
   provider: z.string().optional(),
   model: z.string().default(""),
+  card_session_mode: z.enum(["persistent", "resume"]).optional().catch(undefined),
   input_tokens: z.number().default(0),
   output_tokens: z.number().default(0),
   cache_read_tokens: z.number().default(0),

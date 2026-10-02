@@ -9061,6 +9061,7 @@ func (d *Daemon) runTask(ctx context.Context, task Task, provider string, slot i
 		usageEntries = append(usageEntries, TaskUsageEntry{
 			Provider:         provider,
 			Model:            model,
+			CardSessionMode:  string(cardSessionMode),
 			InputTokens:      u.InputTokens,
 			OutputTokens:     u.OutputTokens,
 			CacheReadTokens:  u.CacheReadTokens,

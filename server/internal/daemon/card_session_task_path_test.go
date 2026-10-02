@@ -72,6 +72,9 @@ func TestRunTaskRoutesCardSessionToOneShotBackend(t *testing.T) {
 	if result.Status != "completed" || result.Comment != "done" {
 		t.Fatalf("result = %+v, want completed one-shot result", result)
 	}
+	if len(result.Usage) != 1 || result.Usage[0].CardSessionMode != string(cardSessionExecutionModeResume) {
+		t.Fatalf("usage = %+v, want one resume-mode entry", result.Usage)
+	}
 	if d.cardSessionHosts != nil {
 		t.Fatal("one-shot card task initialized a persistent host registry")
 	}

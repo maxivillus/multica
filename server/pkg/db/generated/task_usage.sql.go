@@ -145,7 +145,7 @@ func (q *Queries) GetOpenCardSessionTokenUsage(ctx context.Context, arg GetOpenC
 }
 
 const getTaskUsage = `-- name: GetTaskUsage :many
-SELECT id, task_id, provider, model, input_tokens, output_tokens, cache_read_tokens, cache_write_tokens, created_at, updated_at, cost_usd_ticks FROM task_usage
+SELECT id, task_id, provider, model, input_tokens, output_tokens, cache_read_tokens, cache_write_tokens, created_at, updated_at, cost_usd_ticks, card_session_mode FROM task_usage
 WHERE task_id = $1
 ORDER BY model
 `
@@ -171,6 +171,7 @@ func (q *Queries) GetTaskUsage(ctx context.Context, taskID pgtype.UUID) ([]TaskU
 			&i.CreatedAt,
 			&i.UpdatedAt,
 			&i.CostUsdTicks,
+			&i.CardSessionMode,
 		); err != nil {
 			return nil, err
 		}
@@ -191,7 +192,8 @@ SELECT
     tu.output_tokens,
     tu.cache_read_tokens,
     tu.cache_write_tokens,
-    tu.cost_usd_ticks
+    tu.cost_usd_ticks,
+    tu.card_session_mode
 FROM task_usage tu
 JOIN agent_task_queue atq ON atq.id = tu.task_id
 WHERE atq.agent_id = $1
@@ -213,6 +215,7 @@ type ListAgentTaskUsageRow struct {
 	CacheReadTokens  int64       `json:"cache_read_tokens"`
 	CacheWriteTokens int64       `json:"cache_write_tokens"`
 	CostUsdTicks     pgtype.Int8 `json:"cost_usd_ticks"`
+	CardSessionMode  pgtype.Text `json:"card_session_mode"`
 }
 
 // Per-(task, provider, model) usage rows for one agent's explicitly requested
@@ -237,6 +240,7 @@ func (q *Queries) ListAgentTaskUsage(ctx context.Context, arg ListAgentTaskUsage
 			&i.CacheReadTokens,
 			&i.CacheWriteTokens,
 			&i.CostUsdTicks,
+			&i.CardSessionMode,
 		); err != nil {
 			return nil, err
 		}
@@ -765,7 +769,8 @@ SELECT
     tu.output_tokens,
     tu.cache_read_tokens,
     tu.cache_write_tokens,
-    tu.cost_usd_ticks
+    tu.cost_usd_ticks,
+    tu.card_session_mode
 FROM task_usage tu
 JOIN agent_task_queue atq ON atq.id = tu.task_id
 WHERE atq.issue_id = $1
@@ -781,6 +786,7 @@ type ListIssueTaskUsageRow struct {
 	CacheReadTokens  int64       `json:"cache_read_tokens"`
 	CacheWriteTokens int64       `json:"cache_write_tokens"`
 	CostUsdTicks     pgtype.Int8 `json:"cost_usd_ticks"`
+	CardSessionMode  pgtype.Text `json:"card_session_mode"`
 }
 
 // Per-(task, provider, model) usage rows for every task on one issue — the
@@ -813,6 +819,7 @@ func (q *Queries) ListIssueTaskUsage(ctx context.Context, issueID pgtype.UUID) (
 			&i.CacheReadTokens,
 			&i.CacheWriteTokens,
 			&i.CostUsdTicks,
+			&i.CardSessionMode,
 		); err != nil {
 			return nil, err
 		}
@@ -825,8 +832,8 @@ func (q *Queries) ListIssueTaskUsage(ctx context.Context, issueID pgtype.UUID) (
 }
 
 const upsertTaskUsage = `-- name: UpsertTaskUsage :exec
-INSERT INTO task_usage (task_id, provider, model, input_tokens, output_tokens, cache_read_tokens, cache_write_tokens, cost_usd_ticks, updated_at)
-VALUES ($1, $2, $3, $4, $5, $6, $7, $8, now())
+INSERT INTO task_usage (task_id, provider, model, input_tokens, output_tokens, cache_read_tokens, cache_write_tokens, cost_usd_ticks, card_session_mode, updated_at)
+VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, now())
 ON CONFLICT (task_id, provider, model)
 DO UPDATE SET
     input_tokens = EXCLUDED.input_tokens,
@@ -834,6 +841,7 @@ DO UPDATE SET
     cache_read_tokens = EXCLUDED.cache_read_tokens,
     cache_write_tokens = EXCLUDED.cache_write_tokens,
     cost_usd_ticks = EXCLUDED.cost_usd_ticks,
+    card_session_mode = EXCLUDED.card_session_mode,
     updated_at = now()
 `
 
@@ -846,6 +854,7 @@ type UpsertTaskUsageParams struct {
 	CacheReadTokens  int64       `json:"cache_read_tokens"`
 	CacheWriteTokens int64       `json:"cache_write_tokens"`
 	CostUsdTicks     pgtype.Int8 `json:"cost_usd_ticks"`
+	CardSessionMode  pgtype.Text `json:"card_session_mode"`
 }
 
 // Bumps `updated_at` on INSERT and on conflict so the hourly-rollup worker
@@ -865,6 +874,7 @@ func (q *Queries) UpsertTaskUsage(ctx context.Context, arg UpsertTaskUsageParams
 		arg.CacheReadTokens,
 		arg.CacheWriteTokens,
 		arg.CostUsdTicks,
+		arg.CardSessionMode,
 	)
 	return err
 }

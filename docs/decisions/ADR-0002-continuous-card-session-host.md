@@ -43,9 +43,9 @@ because it preserves the process while leaving task scheduling available.
   provider process, release the lease, and close the generation.
 - Use the persistent multi-turn host only for provider backends that expose
   that capability. Route other providers through their normal one-shot/resume
-  execution path and mark the mode as `resume`; never report that path as a
-  persistent host or fail a card task only because the optional capability is
-  absent.
+  execution path and mark the mode as `resume` in logs and per-run usage data;
+  never report that path as a persistent host or fail a card task only because
+  the optional capability is absent.
 - If the runtime process itself crashes or is forcibly stopped, the operating
   system necessarily ends its provider process. After fencing the old lease,
   recover from the persisted provider session ID when the provider supports it

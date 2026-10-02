@@ -4980,6 +4980,7 @@ func formatLegacyCommentEntry(comment CoalescedCommentData) string {
 type TaskUsagePayload struct {
 	Provider         string `json:"provider"`
 	Model            string `json:"model"`
+	CardSessionMode  string `json:"card_session_mode,omitempty"`
 	InputTokens      int64  `json:"input_tokens"`
 	OutputTokens     int64  `json:"output_tokens"`
 	CacheReadTokens  int64  `json:"cache_read_tokens"`
@@ -5044,6 +5045,7 @@ func (h *Handler) ReportTaskUsage(w http.ResponseWriter, r *http.Request) {
 			TaskID:           parseUUID(taskID),
 			Provider:         provider,
 			Model:            u.Model,
+			CardSessionMode:  normalizeCardSessionMode(u.CardSessionMode),
 			InputTokens:      u.InputTokens,
 			OutputTokens:     u.OutputTokens,
 			CacheReadTokens:  u.CacheReadTokens,
@@ -5846,7 +5848,7 @@ func (h *Handler) hydrateTaskUsage(ctx context.Context, issueID pgtype.UUID, res
 	for _, row := range rows {
 		appendTaskUsage(byTask, row.TaskID, row.Provider, row.Model,
 			row.InputTokens, row.OutputTokens, row.CacheReadTokens,
-			row.CacheWriteTokens, row.CostUsdTicks)
+			row.CacheWriteTokens, row.CostUsdTicks, row.CardSessionMode)
 	}
 	attachTaskUsage(resp, byTask)
 }
@@ -5875,7 +5877,7 @@ func (h *Handler) hydrateAgentTaskUsage(ctx context.Context, agentID pgtype.UUID
 	for _, row := range rows {
 		appendTaskUsage(byTask, row.TaskID, row.Provider, row.Model,
 			row.InputTokens, row.OutputTokens, row.CacheReadTokens,
-			row.CacheWriteTokens, row.CostUsdTicks)
+			row.CacheWriteTokens, row.CostUsdTicks, row.CardSessionMode)
 	}
 	attachTaskUsage(resp, byTask)
 	return nil
@@ -5891,6 +5893,7 @@ func appendTaskUsage(
 	cacheReadTokens int64,
 	cacheWriteTokens int64,
 	costUsdTicks pgtype.Int8,
+	cardSessionMode pgtype.Text,
 ) {
 	var cost *int64
 	if costUsdTicks.Valid {
@@ -5905,8 +5908,26 @@ func appendTaskUsage(
 		OutputTokens:     outputTokens,
 		CacheReadTokens:  cacheReadTokens,
 		CacheWriteTokens: cacheWriteTokens,
+		CardSessionMode:  optionalTaskUsageMode(cardSessionMode),
 		CostUsdTicks:     cost,
 	})
+}
+
+func normalizeCardSessionMode(mode string) pgtype.Text {
+	mode = strings.TrimSpace(mode)
+	switch mode {
+	case "persistent", "resume":
+		return pgtype.Text{String: mode, Valid: true}
+	default:
+		return pgtype.Text{}
+	}
+}
+
+func optionalTaskUsageMode(mode pgtype.Text) string {
+	if mode.Valid {
+		return mode.String
+	}
+	return ""
 }
 
 func attachTaskUsage(resp []AgentTaskResponse, byTask map[string][]TaskUsageData) {
