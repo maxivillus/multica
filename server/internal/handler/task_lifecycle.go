@@ -63,14 +63,18 @@ func (h *Handler) RecoverOrphanedTasks(w http.ResponseWriter, r *http.Request) {
 // work_dir as soon as they're known — typically right after the agent
 // emits its first system message — so a crash mid-run doesn't lose the
 // resume pointer needed to continue the conversation on the next attempt.
+// Card-session pins also carry the server-issued lease epoch to fence stale
+// provider hosts after a takeover.
 type PinTaskSessionRequest struct {
-	SessionID string `json:"session_id,omitempty"`
-	WorkDir   string `json:"work_dir,omitempty"`
+	SessionID  string `json:"session_id,omitempty"`
+	WorkDir    string `json:"work_dir,omitempty"`
+	LeaseEpoch int64  `json:"lease_epoch,omitempty"`
 }
 
 func (h *Handler) PinTaskSession(w http.ResponseWriter, r *http.Request) {
 	taskID := chi.URLParam(r, "taskId")
-	if _, ok := h.requireDaemonTaskAccess(w, r, taskID); !ok {
+	accessTask, ok := h.requireDaemonTaskAccess(w, r, taskID)
+	if !ok {
 		return
 	}
 
@@ -83,6 +87,24 @@ func (h *Handler) PinTaskSession(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusBadRequest, "session_id or work_dir required")
 		return
 	}
+	if req.LeaseEpoch < 0 {
+		writeError(w, http.StatusBadRequest, "lease_epoch cannot be negative")
+		return
+	}
+	leaseOwner := ""
+	if accessTask.CardSessionID.Valid && ((accessTask.Status == "dispatched" || accessTask.Status == "running") || req.LeaseEpoch > 0) {
+		var err error
+		leaseOwner, err = h.daemonLeaseOwnerForTask(r.Context(), accessTask)
+		if err != nil {
+			slog.Warn("resolve card-session lease owner for pin failed", "task_id", taskID, "error", err)
+			writeError(w, http.StatusInternalServerError, "failed to load task runtime")
+			return
+		}
+		if (accessTask.Status == "dispatched" || accessTask.Status == "running") && (leaseOwner == "" || req.LeaseEpoch <= 0) {
+			writeError(w, http.StatusConflict, "card-session lease is no longer current")
+			return
+		}
+	}
 	started := time.Now()
 	recordCardSessionPin := func(result string) {
 		if h.TaskService != nil {
@@ -91,6 +113,8 @@ func (h *Handler) PinTaskSession(w http.ResponseWriter, r *http.Request) {
 	}
 
 	params := db.UpdateAgentTaskSessionParams{ID: parseUUID(taskID)}
+	params.LeaseOwner = leaseOwner
+	params.LeaseEpoch = req.LeaseEpoch
 	if req.SessionID != "" {
 		params.SessionID = pgtype.Text{String: req.SessionID, Valid: true}
 	}
@@ -134,14 +158,22 @@ func (h *Handler) PinTaskSession(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusInternalServerError, "pin session failed")
 		return
 	}
-	if err := qtx.UpdateCardSessionProviderStateByTask(r.Context(), db.UpdateCardSessionProviderStateByTaskParams{
+	providerStateRows, err := qtx.UpdateCardSessionProviderStateByTask(r.Context(), db.UpdateCardSessionProviderStateByTaskParams{
 		ID:                params.ID,
 		ProviderSessionID: req.SessionID,
 		WorkDir:           req.WorkDir,
-	}); err != nil {
+		LeaseOwner:        leaseOwner,
+		LeaseEpoch:        req.LeaseEpoch,
+	})
+	if err != nil {
 		recordCardSessionPin("error")
 		slog.Warn("pin-session failed to update card session", "task_id", taskID, "error", err)
 		writeError(w, http.StatusInternalServerError, "pin session failed")
+		return
+	}
+	if accessTask.CardSessionID.Valid && (accessTask.Status == "dispatched" || accessTask.Status == "running" || accessTask.Status == "cancelled") && providerStateRows == 0 {
+		recordCardSessionPin("stale_lease")
+		writeError(w, http.StatusConflict, "card-session lease is no longer current")
 		return
 	}
 	// The statement re-reads the row, ignores anything that is not a cancelled

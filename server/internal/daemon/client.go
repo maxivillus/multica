@@ -713,8 +713,9 @@ func (c *Client) failTaskWithRetrySchedule(ctx context.Context, taskID, errMsg, 
 }
 
 // PinTaskSession persists the agent's session_id and work_dir on the task
-// row mid-flight so a daemon crash doesn't lose the resume pointer.
-func (c *Client) PinTaskSession(ctx context.Context, taskID, sessionID, workDir string) error {
+// row mid-flight so a daemon crash doesn't lose the resume pointer. Card
+// sessions include the acquired lease epoch so the server can fence stale hosts.
+func (c *Client) PinTaskSession(ctx context.Context, taskID, sessionID, workDir string, leaseEpoch int64) error {
 	if sessionID == "" && workDir == "" {
 		return nil
 	}
@@ -724,6 +725,9 @@ func (c *Client) PinTaskSession(ctx context.Context, taskID, sessionID, workDir 
 	}
 	if workDir != "" {
 		body["work_dir"] = workDir
+	}
+	if leaseEpoch > 0 {
+		body["lease_epoch"] = leaseEpoch
 	}
 	return c.postJSON(ctx, fmt.Sprintf("/api/daemon/tasks/%s/session", taskID), body, nil)
 }

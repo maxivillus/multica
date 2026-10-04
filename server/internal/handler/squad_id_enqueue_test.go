@@ -100,7 +100,7 @@ func TestCreateComment_SquadMentionStampsSquadIDOnLeaderTask(t *testing.T) {
 	if started.CardSessionID.Valid {
 		t.Fatalf("backlog mention task card_session_id = %s, want NULL", util.UUIDToString(started.CardSessionID))
 	}
-	if err := testHandler.TaskService.UpdateCardSessionProviderState(ctx, started.ID, "backlog-provider-sentinel", "/private/backlog-workdir"); err != nil {
+	if err := testHandler.TaskService.UpdateCardSessionProviderState(ctx, started.ID, "backlog-provider-sentinel", "/private/backlog-workdir", "test-daemon", 0); err != nil {
 		t.Fatalf("pin ordinary backlog task provider state: %v", err)
 	}
 	if err := testHandler.TaskService.TouchCardSessionActivityForTask(ctx, started.ID); err != nil {

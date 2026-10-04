@@ -29,18 +29,7 @@ CREATE TABLE card_session (
     )
 );
 
--- At most one resumable generation exists for an issue/agent pair. Closed
--- generations remain as immutable history and the next one increments the
--- generation number under the workspace lock.
-CREATE UNIQUE INDEX card_session_one_resumable_per_issue_agent
-    ON card_session (issue_id, agent_id)
-    WHERE state <> 'closed';
-
-CREATE INDEX card_session_workspace_state_idx
-    ON card_session (workspace_id, state, retain_until);
-
-CREATE INDEX card_session_issue_idx
-    ON card_session (issue_id, agent_id, generation DESC);
+-- Card-session indexes are built concurrently in separate migrations.
 
 COMMENT ON TABLE card_session IS
     'Server-owned lifecycle for a per-issue agent generation; provider process state is resumable but not the source of truth.';

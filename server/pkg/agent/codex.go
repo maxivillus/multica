@@ -2630,16 +2630,26 @@ func codexRequestContextError(ctx context.Context) error {
 // reached that authoritative completion boundary; callers must force-stop the
 // process tree when it is false.
 func interruptCodexTurn(c *codexClient, threadID string, turnDone <-chan bool, configuredTimeout time.Duration, logger *slog.Logger) bool {
+	_, completed := interruptCodexTurnWithOutcome(c, threadID, turnDone, configuredTimeout, logger)
+	return completed
+}
+
+func interruptCodexTurnWithOutcome(c *codexClient, threadID string, turnDone <-chan bool, configuredTimeout time.Duration, logger *slog.Logger) (aborted, completed bool) {
 	select {
-	case <-turnDone:
+	case aborted := <-turnDone:
 		// Completion won the cancellation race; usage has already been captured.
-		return true
+		return aborted, true
 	default:
 	}
 
 	turnID := c.activeTurnID()
 	if threadID == "" || turnID == "" {
-		return false
+		select {
+		case aborted := <-turnDone:
+			return aborted, true
+		default:
+		}
+		return false, false
 	}
 	if logger == nil {
 		logger = slog.Default()
@@ -2658,16 +2668,26 @@ func interruptCodexTurn(c *codexClient, threadID string, turnDone <-chan bool, c
 	})
 	if err != nil {
 		logger.Warn("codex turn interrupt failed", "thread_id_present", threadID != "", "turn_id_present", turnID != "", "error_present", err != nil, "latency", time.Since(started).Round(time.Millisecond).String(), "timeout", interruptTimeout.String())
-		return false
+		select {
+		case aborted := <-turnDone:
+			return aborted, true
+		default:
+		}
+		return false, false
 	}
 
 	select {
-	case <-turnDone:
+	case aborted := <-turnDone:
 		logger.Info("codex turn interrupted", "thread_id_present", threadID != "", "turn_id_present", turnID != "", "latency", time.Since(started).Round(time.Millisecond).String(), "timeout", interruptTimeout.String())
-		return true
+		return aborted, true
 	case <-interruptCtx.Done():
 		logger.Warn("codex turn interrupt completion timed out", "thread_id_present", threadID != "", "turn_id_present", turnID != "", "latency", time.Since(started).Round(time.Millisecond).String(), "timeout", interruptTimeout.String())
-		return false
+		select {
+		case aborted := <-turnDone:
+			return aborted, true
+		default:
+		}
+		return false, false
 	}
 }
 

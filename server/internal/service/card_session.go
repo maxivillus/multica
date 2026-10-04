@@ -396,20 +396,25 @@ func (s *TaskService) WakeCardSessionCapacityWaiters(ctx context.Context, runtim
 
 // UpdateCardSessionProviderState mirrors the task pin into the durable
 // generation record. A provider process may be replaced, but the generation
-// keeps the latest provider session/workdir pointer for reconnect.
-func (s *TaskService) UpdateCardSessionProviderState(ctx context.Context, taskID pgtype.UUID, providerSessionID, workDir string) error {
+// keeps the latest provider session/workdir pointer for reconnect. The caller
+// supplies the server-issued lease owner and epoch so stale hosts cannot write.
+func (s *TaskService) UpdateCardSessionProviderState(ctx context.Context, taskID pgtype.UUID, providerSessionID, workDir, leaseOwner string, leaseEpoch int64) error {
 	if s == nil || s.Queries == nil {
 		return nil
 	}
 	started := time.Now()
-	err := s.Queries.UpdateCardSessionProviderStateByTask(ctx, db.UpdateCardSessionProviderStateByTaskParams{
+	rows, err := s.Queries.UpdateCardSessionProviderStateByTask(ctx, db.UpdateCardSessionProviderStateByTaskParams{
 		ID:                taskID,
 		ProviderSessionID: providerSessionID,
 		WorkDir:           workDir,
+		LeaseOwner:        leaseOwner,
+		LeaseEpoch:        leaseEpoch,
 	})
 	result := "updated"
 	if err != nil {
 		result = "error"
+	} else if rows == 0 {
+		result = "no_op"
 	}
 	s.ObserveCardSessionProviderPinDuration(ctx, taskID, result, time.Since(started))
 	return err

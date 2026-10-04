@@ -1382,13 +1382,29 @@ RETURNING *;
 -- the mid-flight pin is for; the `session_id IS NULL` guard is what keeps this
 -- from being an overwrite, and completed/failed rows stay untouchable so a
 -- straggler goroutine can never contradict a terminal report.
-UPDATE agent_task_queue
+-- Card-session tasks must still own the open generation at the supplied lease
+-- epoch; the paired provider-state update applies the same fence before commit.
+UPDATE agent_task_queue AS task
 SET session_id = COALESCE(sqlc.narg('session_id'), session_id),
     work_dir  = COALESCE(sqlc.narg('work_dir'), work_dir)
-WHERE id = $1
+WHERE task.id = sqlc.arg('id')
   AND (
-    status IN ('dispatched', 'running')
-    OR (status = 'cancelled' AND session_id IS NULL)
+    (
+      task.status IN ('dispatched', 'running')
+      AND (
+        task.card_session_id IS NULL
+        OR EXISTS (
+          SELECT 1
+          FROM card_session AS cs
+          WHERE cs.id = task.card_session_id
+            AND cs.state = 'open'
+            AND cs.lease_owner = NULLIF(sqlc.arg('lease_owner')::text, '')
+            AND cs.lease_epoch = sqlc.arg('lease_epoch')
+            AND sqlc.arg('lease_epoch') > 0
+        )
+      )
+    )
+    OR (task.status = 'cancelled' AND task.session_id IS NULL)
   );
 
 -- name: RecoverOrphanedTasksForRuntime :many

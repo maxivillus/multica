@@ -9311,20 +9311,36 @@ func (q *Queries) UpdateAgentStatus(ctx context.Context, arg UpdateAgentStatusPa
 }
 
 const updateAgentTaskSession = `-- name: UpdateAgentTaskSession :exec
-UPDATE agent_task_queue
-SET session_id = COALESCE($2, session_id),
-    work_dir  = COALESCE($3, work_dir)
-WHERE id = $1
+UPDATE agent_task_queue AS task
+SET session_id = COALESCE($1, session_id),
+    work_dir  = COALESCE($2, work_dir)
+WHERE task.id = $3
   AND (
-    status IN ('dispatched', 'running')
-    OR (status = 'cancelled' AND session_id IS NULL)
+    (
+      task.status IN ('dispatched', 'running')
+      AND (
+        task.card_session_id IS NULL
+        OR EXISTS (
+          SELECT 1
+          FROM card_session AS cs
+          WHERE cs.id = task.card_session_id
+            AND cs.state = 'open'
+            AND cs.lease_owner = NULLIF($4::text, '')
+            AND cs.lease_epoch = $5
+            AND $5 > 0
+        )
+      )
+    )
+    OR (task.status = 'cancelled' AND task.session_id IS NULL)
   )
 `
 
 type UpdateAgentTaskSessionParams struct {
-	ID        pgtype.UUID `json:"id"`
-	SessionID pgtype.Text `json:"session_id"`
-	WorkDir   pgtype.Text `json:"work_dir"`
+	SessionID  pgtype.Text `json:"session_id"`
+	WorkDir    pgtype.Text `json:"work_dir"`
+	ID         pgtype.UUID `json:"id"`
+	LeaseOwner string      `json:"lease_owner"`
+	LeaseEpoch int64       `json:"lease_epoch"`
 }
 
 // Pins the resume pointer mid-flight so a daemon crash leaves a usable
@@ -9340,7 +9356,15 @@ type UpdateAgentTaskSessionParams struct {
 // the mid-flight pin is for; the `session_id IS NULL` guard is what keeps this
 // from being an overwrite, and completed/failed rows stay untouchable so a
 // straggler goroutine can never contradict a terminal report.
+// Card-session tasks must still own the open generation at the supplied lease
+// epoch; the paired provider-state update applies the same fence before commit.
 func (q *Queries) UpdateAgentTaskSession(ctx context.Context, arg UpdateAgentTaskSessionParams) error {
-	_, err := q.db.Exec(ctx, updateAgentTaskSession, arg.ID, arg.SessionID, arg.WorkDir)
+	_, err := q.db.Exec(ctx, updateAgentTaskSession,
+		arg.SessionID,
+		arg.WorkDir,
+		arg.ID,
+		arg.LeaseOwner,
+		arg.LeaseEpoch,
+	)
 	return err
 }

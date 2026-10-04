@@ -322,13 +322,17 @@ func TestCancelledTaskLateProviderPinIsRetainedForFollowUp(t *testing.T) {
 	if !started.CardSessionID.Valid || started.CardSessionID != generation.ID {
 		t.Fatalf("task bound generation = %s (valid=%t), want %s", util.UUIDToString(started.CardSessionID), started.CardSessionID.Valid, util.UUIDToString(generation.ID))
 	}
+	lease, err := testHandler.Queries.GetCardSession(ctx, started.CardSessionID)
+	if err != nil {
+		t.Fatalf("load card-session lease: %v", err)
+	}
 	if _, err := testPool.Exec(ctx, `UPDATE issue SET status = 'cancelled' WHERE id = $1`, issueID); err != nil {
 		t.Fatalf("cancel issue: %v", err)
 	}
 	if _, err := testPool.Exec(ctx, `UPDATE agent_task_queue SET status = 'cancelled', completed_at = now() WHERE id = $1`, taskID); err != nil {
 		t.Fatalf("cancel task: %v", err)
 	}
-	if err := testHandler.TaskService.UpdateCardSessionProviderState(ctx, taskID, "late-cancelled-provider-marker", "/private/late-cancelled-workdir-marker"); err != nil {
+	if err := testHandler.TaskService.UpdateCardSessionProviderState(ctx, taskID, "late-cancelled-provider-marker", "/private/late-cancelled-workdir-marker", lease.LeaseOwner.String, lease.LeaseEpoch); err != nil {
 		t.Fatalf("late provider pin: %v", err)
 	}
 	var state, pauseReason, providerSessionID, workDir string
@@ -860,7 +864,11 @@ func TestClosedCardSessionRejectsLateTaskCallbacksFromPriorGeneration(t *testing
 				t.Fatalf("task card_session_id = %s (valid=%v), want generation G %s",
 					util.UUIDToString(started.CardSessionID), started.CardSessionID.Valid, util.UUIDToString(generationG.ID))
 			}
-			if err := testHandler.TaskService.UpdateCardSessionProviderState(ctx, taskID, "generation-G-provider", "/private/generation-G-workdir"); err != nil {
+			lease, err := testHandler.Queries.GetCardSession(ctx, generationG.ID)
+			if err != nil {
+				t.Fatalf("load generation G lease: %v", err)
+			}
+			if err := testHandler.TaskService.UpdateCardSessionProviderState(ctx, taskID, "generation-G-provider", "/private/generation-G-workdir", lease.LeaseOwner.String, lease.LeaseEpoch); err != nil {
 				t.Fatalf("pin generation G provider state: %v", err)
 			}
 
@@ -893,7 +901,7 @@ func TestClosedCardSessionRejectsLateTaskCallbacksFromPriorGeneration(t *testing
 
 			// Simulate a delayed pin and usage callback from task G after G+1 is
 			// active. The callbacks must remain scoped to the task's fixed UUID.
-			if err := testHandler.TaskService.UpdateCardSessionProviderState(ctx, taskID, "late-generation-G-provider", "/private/late-generation-G-workdir"); err != nil {
+			if err := testHandler.TaskService.UpdateCardSessionProviderState(ctx, taskID, "late-generation-G-provider", "/private/late-generation-G-workdir", lease.LeaseOwner.String, lease.LeaseEpoch); err != nil {
 				t.Fatalf("late provider pin: %v", err)
 			}
 			if err := testHandler.Queries.UpsertTaskUsage(ctx, db.UpsertTaskUsageParams{

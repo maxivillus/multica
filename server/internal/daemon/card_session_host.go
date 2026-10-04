@@ -193,8 +193,20 @@ func (h *cardSessionHost) execute(ctx context.Context, prompt string, opts agent
 	go func() {
 		defer close(messages)
 		defer close(result)
+		forwardMessages := true
 		for msg := range raw.Messages {
-			messages <- msg
+			if !forwardMessages {
+				continue
+			}
+			if ctx.Err() != nil {
+				forwardMessages = false
+				continue
+			}
+			select {
+			case messages <- msg:
+			case <-ctx.Done():
+				forwardMessages = false
+			}
 		}
 		if final, ok := <-raw.Result; ok {
 			result <- final

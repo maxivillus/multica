@@ -409,6 +409,33 @@ func (p *codexPersistentSession) runTurn(ctx context.Context, prompt string, opt
 	if err != nil {
 		status = "failed"
 		finalErr = err.Error()
+		select {
+		case aborted := <-turn.turnDone:
+			status = "completed"
+			if aborted {
+				status = "aborted"
+				finalErr = "turn was aborted"
+			} else if turnErr := p.client.getTurnError(); turnErr != "" {
+				status = "failed"
+				finalErr = turnErr
+			} else {
+				finalErr = ""
+			}
+		default:
+			aborted, completed := interruptCodexTurnWithOutcome(p.client, p.threadID, turn.turnDone, opts.TurnInterruptTimeout, p.cfg.Logger)
+			if !completed {
+				_ = p.Close()
+			} else if aborted {
+				status = "aborted"
+				finalErr = "turn was aborted"
+			} else if turnErr := p.client.getTurnError(); turnErr != "" {
+				status = "failed"
+				finalErr = turnErr
+			} else {
+				status = "completed"
+				finalErr = ""
+			}
+		}
 	} else {
 		semanticTimeout := opts.SemanticInactivityTimeout
 		if semanticTimeout <= 0 {

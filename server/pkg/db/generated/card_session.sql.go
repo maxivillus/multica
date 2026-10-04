@@ -843,7 +843,7 @@ func (q *Queries) TouchCardSessionsForTasks(ctx context.Context, taskIds []pgtyp
 	return err
 }
 
-const updateCardSessionProviderStateByTask = `-- name: UpdateCardSessionProviderStateByTask :exec
+const updateCardSessionProviderStateByTask = `-- name: UpdateCardSessionProviderStateByTask :execrows
 UPDATE card_session AS cs
 SET provider_session_id = COALESCE(NULLIF($2, ''), cs.provider_session_id),
     work_dir = COALESCE(NULLIF($3, ''), cs.work_dir),
@@ -854,11 +854,25 @@ WHERE t.id = $1
   AND t.card_session_id = cs.id
   AND w.id = cs.workspace_id
   AND (
-      (t.status IN ('dispatched', 'running') AND cs.state = 'open')
+      (
+          t.status IN ('dispatched', 'running')
+          AND cs.state = 'open'
+          AND cs.lease_owner = NULLIF($4::text, '')
+          AND cs.lease_epoch = $5
+          AND $5 > 0
+      )
       OR (
           t.status = 'cancelled'
           AND cs.state = 'paused'
           AND cs.pause_reason = 'cancelled'
+          AND (
+              cs.lease_owner IS NULL
+              OR (
+                  cs.lease_owner = NULLIF($4::text, '')
+                  AND cs.lease_epoch = $5
+                  AND $5 > 0
+              )
+          )
           AND cs.last_activity_at > now() - make_interval(hours => CASE
               WHEN w.settings->'card_sessions'->>'idle_timeout_hours' ~ '^[0-9]{1,3}$'
                   THEN GREATEST(1, LEAST(999, (w.settings->'card_sessions'->>'idle_timeout_hours')::INTEGER))
@@ -872,9 +886,20 @@ type UpdateCardSessionProviderStateByTaskParams struct {
 	ID                pgtype.UUID `json:"id"`
 	ProviderSessionID interface{} `json:"provider_session_id"`
 	WorkDir           interface{} `json:"work_dir"`
+	LeaseOwner        string      `json:"lease_owner"`
+	LeaseEpoch        int64       `json:"lease_epoch"`
 }
 
-func (q *Queries) UpdateCardSessionProviderStateByTask(ctx context.Context, arg UpdateCardSessionProviderStateByTaskParams) error {
-	_, err := q.db.Exec(ctx, updateCardSessionProviderStateByTask, arg.ID, arg.ProviderSessionID, arg.WorkDir)
-	return err
+func (q *Queries) UpdateCardSessionProviderStateByTask(ctx context.Context, arg UpdateCardSessionProviderStateByTaskParams) (int64, error) {
+	result, err := q.db.Exec(ctx, updateCardSessionProviderStateByTask,
+		arg.ID,
+		arg.ProviderSessionID,
+		arg.WorkDir,
+		arg.LeaseOwner,
+		arg.LeaseEpoch,
+	)
+	if err != nil {
+		return 0, err
+	}
+	return result.RowsAffected(), nil
 }

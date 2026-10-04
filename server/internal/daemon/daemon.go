@@ -8972,7 +8972,7 @@ func (d *Daemon) runTask(ctx context.Context, task Task, provider string, slot i
 			"persistent", false,
 		)
 	}
-	result, tools, err := d.executeAndDrainWith(executionCtx, executeTurn, prompt, execOpts, taskLog, task.ID, env.CodexHome, &msgSeq)
+	result, tools, err := d.executeAndDrainWith(executionCtx, executeTurn, prompt, execOpts, taskLog, task.ID, env.CodexHome, &msgSeq, cardSessionLease.LeaseEpoch)
 	if err != nil {
 		return TaskResult{}, err
 	}
@@ -9028,7 +9028,7 @@ func (d *Daemon) runTask(ctx context.Context, task Task, provider string, slot i
 		}
 		freshPrompt := BuildPrompt(task, provider, promptOptions...)
 
-		retryResult, retryTools, retryErr := d.executeAndDrainWith(executionCtx, executeTurn, freshPrompt, execOpts, taskLog, task.ID, env.CodexHome, &msgSeq)
+		retryResult, retryTools, retryErr := d.executeAndDrainWith(executionCtx, executeTurn, freshPrompt, execOpts, taskLog, task.ID, env.CodexHome, &msgSeq, cardSessionLease.LeaseEpoch)
 		if retryErr != nil {
 			logFreshSessionStartFailure(taskLog, retryErr)
 		} else if retryResult.Status != "completed" && retryResult.SessionID == "" {
@@ -9476,7 +9476,7 @@ func freshSessionMayHelp(errText string) bool {
 // sequence instead of restarting at 1 — the server orders the transcript by
 // seq alone, and duplicate seqs would interleave the two attempts' rows.
 func (d *Daemon) executeAndDrain(ctx context.Context, backend agent.Backend, prompt string, opts agent.ExecOptions, taskLog *slog.Logger, taskID, codexHome string, msgSeq *atomic.Int32) (agent.Result, int32, error) {
-	return d.executeAndDrainWith(ctx, backend.Execute, prompt, opts, taskLog, taskID, codexHome, msgSeq)
+	return d.executeAndDrainWith(ctx, backend.Execute, prompt, opts, taskLog, taskID, codexHome, msgSeq, 0)
 }
 
 // executeAndDrainWith is the common transcript/watchdog boundary for both
@@ -9484,7 +9484,7 @@ func (d *Daemon) executeAndDrain(ctx context.Context, backend agent.Backend, pro
 // is intentionally injected instead of branching inside the drain loop: a
 // persistent host keeps its process after the returned Result, while all
 // server reporting and liveness accounting remains identical to a normal run.
-func (d *Daemon) executeAndDrainWith(ctx context.Context, execute func(context.Context, string, agent.ExecOptions) (*agent.Session, error), prompt string, opts agent.ExecOptions, taskLog *slog.Logger, taskID, codexHome string, msgSeq *atomic.Int32) (agent.Result, int32, error) {
+func (d *Daemon) executeAndDrainWith(ctx context.Context, execute func(context.Context, string, agent.ExecOptions) (*agent.Session, error), prompt string, opts agent.ExecOptions, taskLog *slog.Logger, taskID, codexHome string, msgSeq *atomic.Int32, leaseEpoch int64) (agent.Result, int32, error) {
 	phaseRecorder := taskPhaseRecorderFromContext(ctx)
 	// Wrap the caller's ctx so the idle watchdog (below) can interrupt both
 	// the agent subprocess (via the ctx passed to backend.Execute) AND the
@@ -9769,7 +9769,7 @@ func (d *Daemon) executeAndDrainWith(ctx context.Context, execute func(context.C
 							}
 							pinCtx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 							defer cancel()
-							if err := d.client.PinTaskSession(pinCtx, taskID, sid, wd); err != nil {
+							if err := d.client.PinTaskSession(pinCtx, taskID, sid, wd, leaseEpoch); err != nil {
 								taskLog.Debug("pin session failed", "error", err)
 							}
 						}()

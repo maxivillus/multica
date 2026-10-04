@@ -212,7 +212,7 @@ WHERE w.id = cs.workspace_id
   )
 RETURNING cs.*;
 
--- name: UpdateCardSessionProviderStateByTask :exec
+-- name: UpdateCardSessionProviderStateByTask :execrows
 UPDATE card_session AS cs
 SET provider_session_id = COALESCE(NULLIF(sqlc.arg(provider_session_id), ''), cs.provider_session_id),
     work_dir = COALESCE(NULLIF(sqlc.arg(work_dir), ''), cs.work_dir),
@@ -223,11 +223,25 @@ WHERE t.id = $1
   AND t.card_session_id = cs.id
   AND w.id = cs.workspace_id
   AND (
-      (t.status IN ('dispatched', 'running') AND cs.state = 'open')
+      (
+          t.status IN ('dispatched', 'running')
+          AND cs.state = 'open'
+          AND cs.lease_owner = NULLIF(sqlc.arg(lease_owner)::text, '')
+          AND cs.lease_epoch = sqlc.arg(lease_epoch)
+          AND sqlc.arg(lease_epoch) > 0
+      )
       OR (
           t.status = 'cancelled'
           AND cs.state = 'paused'
           AND cs.pause_reason = 'cancelled'
+          AND (
+              cs.lease_owner IS NULL
+              OR (
+                  cs.lease_owner = NULLIF(sqlc.arg(lease_owner)::text, '')
+                  AND cs.lease_epoch = sqlc.arg(lease_epoch)
+                  AND sqlc.arg(lease_epoch) > 0
+              )
+          )
           AND cs.last_activity_at > now() - make_interval(hours => CASE
               WHEN w.settings->'card_sessions'->>'idle_timeout_hours' ~ '^[0-9]{1,3}$'
                   THEN GREATEST(1, LEAST(999, (w.settings->'card_sessions'->>'idle_timeout_hours')::INTEGER))
