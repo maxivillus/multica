@@ -1,6 +1,6 @@
 ## ADR-0002: Continuous live card-session hosts
 
-- Status: Implemented for Codex; AppSec verification pending
+- Status: Implemented for Codex; bounded AppSec verification complete; owner approval pending
 - Date: 2026-09-30
 - Issue: NTSI-899
 - Source: NTSI-713
