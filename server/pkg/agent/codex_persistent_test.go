@@ -105,11 +105,18 @@ while IFS= read -r line; do
 done
 `
 	writeTestExecutable(t, fakePath, []byte(script))
-	backend, err := New("codex", Config{ExecutablePath: fakePath})
+	backend, err := New("codex", Config{
+		ExecutablePath: fakePath,
+		Env:            map[string]string{"MULTICA_SERVER_URL": "http://127.0.0.1:1"},
+	})
 	if err != nil {
 		t.Fatalf("new codex backend: %v", err)
 	}
-	host, err := backend.(PersistentBackend).OpenPersistent(context.Background(), ExecOptions{HandshakeTimeout: time.Second, ThreadHandshakeTimeout: time.Second})
+	host, err := backend.(PersistentBackend).OpenPersistent(context.Background(), ExecOptions{
+		TaskAuthToken:          "mat_task_a",
+		HandshakeTimeout:       time.Second,
+		ThreadHandshakeTimeout: time.Second,
+	})
 	if err != nil {
 		t.Fatalf("open persistent backend: %v", err)
 	}
@@ -117,15 +124,39 @@ done
 	defer persistent.Close()
 
 	ready := make(chan struct{})
-	release := make(chan struct{})
-	var once sync.Once
+	secondReady := make(chan struct{})
+	releaseFirst := make(chan struct{})
+	releaseSecondCleanup := make(chan struct{})
+	firstCleaned := make(chan struct{})
+	var hookMu sync.Mutex
+	hookCount := 0
 	persistent.beforeResultPublish = func() {
-		once.Do(func() {
+		hookMu.Lock()
+		hookCount++
+		count := hookCount
+		hookMu.Unlock()
+		if count == 1 {
 			close(ready)
-			<-release
-		})
+			<-releaseFirst
+		}
 	}
-	first, err := host.Execute(context.Background(), "first", ExecOptions{Timeout: 3 * time.Second, SemanticInactivityTimeout: time.Second})
+	var cleanupGateMu sync.Mutex
+	cleanupGateCount := 0
+	persistent.beforeTurnTokenCleanup = func() {
+		cleanupGateMu.Lock()
+		cleanupGateCount++
+		count := cleanupGateCount
+		cleanupGateMu.Unlock()
+		if count == 2 {
+			close(secondReady)
+			<-releaseSecondCleanup
+		}
+	}
+	var cleanupOnce sync.Once
+	persistent.afterTurnTokenCleanup = func() {
+		cleanupOnce.Do(func() { close(firstCleaned) })
+	}
+	first, err := host.Execute(context.Background(), "first", ExecOptions{TaskAuthToken: "mat_task_a", Timeout: 3 * time.Second, SemanticInactivityTimeout: time.Second})
 	if err != nil {
 		t.Fatalf("first execute: %v", err)
 	}
@@ -134,16 +165,33 @@ done
 	case <-time.After(2 * time.Second):
 		t.Fatal("first turn did not reach result handoff barrier")
 	}
-	second, err := host.Execute(context.Background(), "second", ExecOptions{Timeout: 3 * time.Second, SemanticInactivityTimeout: time.Second})
+	second, err := host.Execute(context.Background(), "second", ExecOptions{TaskAuthToken: "mat_task_b", Timeout: 3 * time.Second, SemanticInactivityTimeout: time.Second})
 	if err != nil {
 		t.Fatalf("second execute before first result publish: %v", err)
 	}
-	close(release)
+	select {
+	case <-secondReady:
+	case <-time.After(2 * time.Second):
+		t.Fatal("second turn did not reach token cleanup barrier")
+	}
+	close(releaseFirst)
 	for range first.Messages {
 	}
 	if result, ok := <-first.Result; !ok || result.Status != "completed" {
 		t.Fatalf("first result = %+v, open=%t", result, ok)
 	}
+	select {
+	case <-firstCleaned:
+	case <-time.After(2 * time.Second):
+		t.Fatal("first turn did not finish token cleanup")
+	}
+	persistent.proxy.mu.RLock()
+	current := persistent.proxy.currentToken
+	persistent.proxy.mu.RUnlock()
+	if current != "mat_task_b" {
+		t.Fatalf("first turn cleanup changed next token to %q, want mat_task_b", current)
+	}
+	close(releaseSecondCleanup)
 	for range second.Messages {
 	}
 	if result, ok := <-second.Result; !ok || result.Status != "completed" {

@@ -33,6 +33,7 @@ type codexCredentialProxy struct {
 
 	mu           sync.RWMutex
 	currentToken string
+	tokenEpoch   uint64
 }
 
 func newCodexCredentialProxy(upstreamURL, daemonPort, initialToken string) (*codexCredentialProxy, error) {
@@ -144,17 +145,27 @@ func joinProxyPath(base, path string) string {
 }
 
 func (p *codexCredentialProxy) setToken(token string) error {
+	_, err := p.setTokenForTurn(token)
+	return err
+}
+
+// setTokenForTurn installs a credential and returns the generation that owns
+// it. A turn may clear only its own generation; otherwise a late cleanup from
+// the previous turn could erase the next turn's credential.
+func (p *codexCredentialProxy) setTokenForTurn(token string) (uint64, error) {
 	if p == nil {
-		return nil
+		return 0, nil
 	}
 	token = strings.TrimSpace(token)
 	if token == "" || !strings.HasPrefix(token, "mat_") {
-		return fmt.Errorf("persistent card session requires a task-scoped mat_ credential")
+		return 0, fmt.Errorf("persistent card session requires a task-scoped mat_ credential")
 	}
 	p.mu.Lock()
+	p.tokenEpoch++
+	epoch := p.tokenEpoch
 	p.currentToken = token
 	p.mu.Unlock()
-	return nil
+	return epoch, nil
 }
 
 func (p *codexCredentialProxy) clearToken() {
@@ -163,6 +174,17 @@ func (p *codexCredentialProxy) clearToken() {
 	}
 	p.mu.Lock()
 	p.currentToken = ""
+	p.mu.Unlock()
+}
+
+func (p *codexCredentialProxy) clearTokenForEpoch(epoch uint64) {
+	if p == nil || epoch == 0 {
+		return
+	}
+	p.mu.Lock()
+	if p.tokenEpoch == epoch {
+		p.currentToken = ""
+	}
 	p.mu.Unlock()
 }
 

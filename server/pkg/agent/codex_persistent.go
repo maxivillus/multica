@@ -42,6 +42,14 @@ type codexPersistentSession struct {
 	// It remains nil in production.
 	beforeResultPublish func()
 
+	// afterTurnTokenCleanup is test-only synchronization for the per-turn token
+	// generation guard. It remains nil in production.
+	afterTurnTokenCleanup func()
+
+	// beforeTurnTokenCleanup is test-only synchronization for the handoff race
+	// between setting the next token and clearing the previous one.
+	beforeTurnTokenCleanup func()
+
 	closeOnce sync.Once
 	closeErr  error
 }
@@ -56,6 +64,7 @@ type codexPersistentTurn struct {
 	mu           sync.Mutex
 	finalAnswer  string
 	lastMessage  string
+	tokenEpoch   uint64
 	terminalSeen atomic.Bool
 }
 
@@ -354,12 +363,14 @@ func (p *codexPersistentSession) Execute(ctx context.Context, prompt string, opt
 	p.current = turn
 	p.mu.Unlock()
 	if p.proxy != nil {
-		if err := p.proxy.setToken(opts.TaskAuthToken); err != nil {
+		epoch, err := p.proxy.setTokenForTurn(opts.TaskAuthToken)
+		if err != nil {
 			p.mu.Lock()
 			p.current = nil
 			p.mu.Unlock()
 			return nil, err
 		}
+		turn.tokenEpoch = epoch
 	}
 
 	p.resetClientForTurn()
@@ -394,7 +405,10 @@ func (p *codexPersistentSession) resetClientForTurn() {
 func (p *codexPersistentSession) runTurn(ctx context.Context, prompt string, opts ExecOptions, turn *codexPersistentTurn) {
 	defer func() {
 		if p.proxy != nil {
-			p.proxy.clearToken()
+			p.proxy.clearTokenForEpoch(turn.tokenEpoch)
+		}
+		if p.afterTurnTokenCleanup != nil {
+			p.afterTurnTokenCleanup()
 		}
 	}()
 	start := time.Now()
@@ -508,8 +522,11 @@ func (p *codexPersistentSession) runTurn(ctx context.Context, prompt string, opt
 	// daemon can observe Result as soon as it is sent; clearing only in the
 	// function defer would leave a small window where an idle host still held
 	// the just-finished task token.
+	if p.beforeTurnTokenCleanup != nil {
+		p.beforeTurnTokenCleanup()
+	}
 	if p.proxy != nil {
-		p.proxy.clearToken()
+		p.proxy.clearTokenForEpoch(turn.tokenEpoch)
 	}
 	p.mu.Lock()
 	if p.current == turn {
