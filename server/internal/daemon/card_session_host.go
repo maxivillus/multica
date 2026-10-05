@@ -58,26 +58,47 @@ func (r *cardSessionHostRegistry) acquire(ctx context.Context, key string, backe
 	if r == nil || key == "" {
 		return nil, fmt.Errorf("card session host key is required")
 	}
-	r.mu.Lock()
-	defer r.mu.Unlock()
-	if host, ok := r.hosts[key]; ok {
-		if host.isClosed() {
-			delete(r.hosts, key)
-		} else {
+	// A heartbeat marks the lease lost before it invokes the cleanup callback.
+	// Evict that host under the registry lock so a task racing in this window
+	// cannot reuse a process that the server has already fenced.
+	for {
+		r.mu.Lock()
+		host, ok := r.hosts[key]
+		if !ok {
+			break
+		}
+		if !host.isUnavailable() {
 			if len(idleTimeout) > 0 && idleTimeout[0] > 0 {
 				host.mu.Lock()
 				host.idle = idleTimeout[0]
 				host.mu.Unlock()
 			}
+			r.mu.Unlock()
 			return host, nil
+		}
+		delete(r.hosts, key)
+		r.mu.Unlock()
+		// Do not release a lease that has already been fenced. A provider that
+		// merely reported itself closed still owns a live lease, so use the
+		// normal close path to stop its heartbeat and release that lease.
+		var closeErr error
+		if host.leaseLost() {
+			closeErr = host.closeAfterLeaseLoss()
+		} else {
+			closeErr = host.close()
+		}
+		if closeErr != nil {
+			r.log.Warn("persistent card-session host close after registry eviction failed", "card_session_id", host.key, "error", closeErr)
 		}
 	}
 	persistent, ok := backend.(agent.PersistentBackend)
 	if !ok {
+		r.mu.Unlock()
 		return nil, fmt.Errorf("%w: %T", ErrCardSessionPersistentUnsupported, backend)
 	}
 	session, err := persistent.OpenPersistent(ctx, opts)
 	if err != nil {
+		r.mu.Unlock()
 		return nil, fmt.Errorf("open persistent card session: %w", err)
 	}
 	idle := 24 * time.Hour
@@ -96,6 +117,7 @@ func (r *cardSessionHostRegistry) acquire(ctx context.Context, key string, backe
 		"card_session_id", key,
 		"pid", session.ProcessID(),
 	)
+	r.mu.Unlock()
 	return host, nil
 }
 
@@ -109,6 +131,34 @@ func (h *cardSessionHost) isClosed() bool {
 	return h.session == nil || h.session.IsClosed()
 }
 
+// isUnavailable includes a lost lease even before its callback closes the
+// provider. The registry calls it while holding its own lock, which is the
+// linearization point that excludes the host from new work.
+func (h *cardSessionHost) isUnavailable() bool {
+	if h == nil {
+		return true
+	}
+	h.mu.Lock()
+	closed := h.closed
+	session := h.session
+	lease := h.lease
+	h.mu.Unlock()
+	if closed || session == nil || session.IsClosed() {
+		return true
+	}
+	return lease != nil && lease.isLost()
+}
+
+func (h *cardSessionHost) leaseLost() bool {
+	if h == nil {
+		return true
+	}
+	h.mu.Lock()
+	lease := h.lease
+	h.mu.Unlock()
+	return lease != nil && lease.isLost()
+}
+
 func (h *cardSessionHost) hasLease() bool {
 	if h == nil {
 		return false
@@ -119,16 +169,17 @@ func (h *cardSessionHost) hasLease() bool {
 	return has
 }
 
-func (h *cardSessionHost) updateLease(taskID string, epoch int64, onLost func()) {
+func (h *cardSessionHost) updateLease(taskID string, epoch int64, onLost func()) bool {
 	if h == nil {
-		return
+		return false
 	}
 	h.mu.Lock()
 	lease := h.lease
 	h.mu.Unlock()
-	if lease != nil {
-		lease.update(taskID, epoch, onLost)
+	if lease == nil {
+		return false
 	}
+	return lease.update(taskID, epoch, onLost)
 }
 
 func (h *cardSessionHost) attachLease(lease *cardSessionLeaseHandle) bool {
@@ -160,6 +211,36 @@ func (h *cardSessionHost) closeAfterLeaseLoss() error {
 	session := h.session
 	h.mu.Unlock()
 	return session.Close()
+}
+
+// evict removes host only when the registry still points at this exact
+// process handle. A delayed callback from an older generation therefore
+// cannot remove or close a replacement acquired for the same card key.
+func (r *cardSessionHostRegistry) evict(host *cardSessionHost) bool {
+	if r == nil || host == nil {
+		return false
+	}
+	r.mu.Lock()
+	current, ok := r.hosts[host.key]
+	if ok && current == host {
+		delete(r.hosts, host.key)
+		ok = true
+	} else {
+		ok = false
+	}
+	r.mu.Unlock()
+	return ok
+}
+
+// closeAfterLeaseLoss evicts before closing so a replacement can be acquired
+// while the provider's close is in progress without being exposed to the old
+// callback.
+func (r *cardSessionHostRegistry) closeAfterLeaseLoss(host *cardSessionHost) error {
+	if host == nil {
+		return nil
+	}
+	r.evict(host)
+	return host.closeAfterLeaseLoss()
 }
 
 func (h *cardSessionHost) execute(ctx context.Context, prompt string, opts agent.ExecOptions) (*agent.Session, error) {

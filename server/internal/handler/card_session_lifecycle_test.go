@@ -3,9 +3,12 @@ package handler
 import (
 	"context"
 	"errors"
+	"net/http"
+	"net/http/httptest"
 	"testing"
 	"time"
 
+	"github.com/go-chi/chi/v5"
 	"github.com/jackc/pgx/v5/pgtype"
 	"github.com/multica-ai/multica/server/internal/service"
 	"github.com/multica-ai/multica/server/internal/testutil"
@@ -273,6 +276,151 @@ func TestTerminalTaskFencesStaleCardSessionProviderState(t *testing.T) {
 	}
 	if providerSessionID != "provider-current" || workDir != "/work/current" {
 		t.Fatalf("current terminal callback provider state = (%q, %q), want current values", providerSessionID, workDir)
+	}
+}
+
+func TestTerminalTaskEndpointsRejectStaleCardSessionLease(t *testing.T) {
+	if testHandler == nil || testPool == nil {
+		t.Skip("database not available")
+	}
+
+	for _, terminal := range []string{"complete", "fail"} {
+		t.Run(terminal, func(t *testing.T) {
+			ctx := context.Background()
+			workspaceID, runtimeID, agentID, _, issueID := createCardSessionCapacityFixture(t, ctx)
+			issue, err := testHandler.Queries.GetIssue(ctx, util.MustParseUUID(issueID))
+			if err != nil {
+				t.Fatalf("load issue: %v", err)
+			}
+			agent, err := testHandler.Queries.GetAgent(ctx, util.MustParseUUID(agentID))
+			if err != nil {
+				t.Fatalf("load agent: %v", err)
+			}
+			session, err := testHandler.TaskService.EnsureCardSession(ctx, issue.ID, issue.WorkspaceID, agent.ID, agent.RuntimeMode)
+			if err != nil {
+				t.Fatalf("open card session: %v", err)
+			}
+
+			var taskID pgtype.UUID
+			if err := testPool.QueryRow(ctx, `
+				INSERT INTO agent_task_queue (
+					agent_id, runtime_id, issue_id, card_session_id, status, priority, started_at,
+					session_id, work_dir, result, error
+				)
+				VALUES ($1, $2, $3, $4, 'dispatched', 0, now(), 'session-before', '/work/before', '{}'::jsonb, 'error-before')
+				RETURNING id`, agentID, runtimeID, issueID, session.ID).Scan(&taskID); err != nil {
+				t.Fatalf("insert terminal-fence task: %v", err)
+			}
+			t.Cleanup(func() {
+				_, _ = testPool.Exec(context.Background(), `DELETE FROM agent_task_queue WHERE id = $1`, taskID)
+			})
+
+			started, err := testHandler.TaskService.StartTaskWithCardSessionLease(ctx, taskID, "daemon-a")
+			if err != nil {
+				t.Fatalf("start task: %v", err)
+			}
+			initialLease, err := testHandler.Queries.GetCardSession(ctx, started.CardSessionID)
+			if err != nil {
+				t.Fatalf("load initial lease: %v", err)
+			}
+			var beforeActivity time.Time
+			if err := testPool.QueryRow(ctx, `
+				SELECT last_activity_at FROM card_session WHERE id = $1`, started.CardSessionID).Scan(&beforeActivity); err != nil {
+				t.Fatalf("read initial activity: %v", err)
+			}
+			const replacementProvider = "provider-replacement"
+			const replacementWorkDir = "/work/replacement"
+			if _, err := testPool.Exec(ctx, `
+				UPDATE card_session
+				SET lease_owner = 'daemon-b', lease_epoch = lease_epoch + 1,
+					provider_session_id = $2, work_dir = $3
+				WHERE id = $1`, started.CardSessionID, replacementProvider, replacementWorkDir); err != nil {
+				t.Fatalf("take over card-session lease: %v", err)
+			}
+
+			body := map[string]any{
+				"card_session_lease_epoch": initialLease.LeaseEpoch,
+				"session_id":               "provider-stale",
+				"work_dir":                 "/work/stale",
+			}
+			if terminal == "fail" {
+				body["error"] = "stale failure"
+				body["failure_reason"] = "agent_error"
+			}
+			path := "/api/daemon/tasks/" + util.UUIDToString(taskID) + "/" + terminal
+			w := httptest.NewRecorder()
+			req := newDaemonTokenRequest(http.MethodPost, path, body, workspaceID, "daemon-a")
+			rctx := chi.NewRouteContext()
+			rctx.URLParams.Add("taskId", util.UUIDToString(taskID))
+			req = req.WithContext(context.WithValue(req.Context(), chi.RouteCtxKey, rctx))
+			if terminal == "complete" {
+				testHandler.CompleteTask(w, req)
+			} else {
+				testHandler.FailTask(w, req)
+			}
+			if w.Code != http.StatusConflict {
+				t.Fatalf("stale %s status = %d, want 409: %s", terminal, w.Code, w.Body.String())
+			}
+
+			var status, result, taskError, taskSession, taskWorkDir string
+			if err := testPool.QueryRow(ctx, `
+				SELECT status, COALESCE(result::text, ''), COALESCE(error, ''),
+					COALESCE(session_id, ''), COALESCE(work_dir, '')
+				FROM agent_task_queue WHERE id = $1`, taskID).Scan(&status, &result, &taskError, &taskSession, &taskWorkDir); err != nil {
+				t.Fatalf("read task after stale %s: %v", terminal, err)
+			}
+			if status != "running" || result != "{}" || taskError != "error-before" || taskSession != "session-before" || taskWorkDir != "/work/before" {
+				t.Fatalf("stale %s changed task state: status=%q result=%q error=%q session=%q work_dir=%q", terminal, status, result, taskError, taskSession, taskWorkDir)
+			}
+			var relatedTasks int
+			if err := testPool.QueryRow(ctx, `
+				SELECT count(*) FROM agent_task_queue
+				WHERE id = $1 OR parent_task_id = $1`, taskID).Scan(&relatedTasks); err != nil {
+				t.Fatalf("count task side effects after stale %s: %v", terminal, err)
+			}
+			if relatedTasks != 1 {
+				t.Fatalf("stale %s created task side effects: related task count=%d, want 1", terminal, relatedTasks)
+			}
+			var providerSession, providerWorkDir string
+			var afterActivity time.Time
+			if err := testPool.QueryRow(ctx, `
+				SELECT COALESCE(provider_session_id, ''), COALESCE(work_dir, ''), last_activity_at
+				FROM card_session WHERE id = $1`, started.CardSessionID).Scan(&providerSession, &providerWorkDir, &afterActivity); err != nil {
+				t.Fatalf("read card session after stale %s: %v", terminal, err)
+			}
+			if providerSession != replacementProvider || providerWorkDir != replacementWorkDir || !afterActivity.Equal(beforeActivity) {
+				t.Fatalf("stale %s changed replacement provider state: provider=%q work_dir=%q activity=%v", terminal, providerSession, providerWorkDir, afterActivity)
+			}
+
+			// The replacement owner/epoch remains valid and must still be able
+			// to finalize the same task after the stale callback is rejected.
+			currentLease, err := testHandler.Queries.GetCardSession(ctx, started.CardSessionID)
+			if err != nil {
+				t.Fatalf("load replacement lease: %v", err)
+			}
+			currentBody := map[string]any{
+				"card_session_lease_epoch": currentLease.LeaseEpoch,
+				"session_id":               "provider-current",
+				"work_dir":                 "/work/current",
+			}
+			if terminal == "fail" {
+				currentBody["error"] = "current failure"
+				currentBody["failure_reason"] = "agent_error"
+			}
+			w = httptest.NewRecorder()
+			req = newDaemonTokenRequest(http.MethodPost, path, currentBody, workspaceID, "daemon-b")
+			rctx = chi.NewRouteContext()
+			rctx.URLParams.Add("taskId", util.UUIDToString(taskID))
+			req = req.WithContext(context.WithValue(req.Context(), chi.RouteCtxKey, rctx))
+			if terminal == "complete" {
+				testHandler.CompleteTask(w, req)
+			} else {
+				testHandler.FailTask(w, req)
+			}
+			if w.Code != http.StatusOK {
+				t.Fatalf("current %s status = %d, want 200: %s", terminal, w.Code, w.Body.String())
+			}
+		})
 	}
 }
 

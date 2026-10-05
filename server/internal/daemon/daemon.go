@@ -8518,7 +8518,11 @@ func (d *Daemon) runTask(ctx context.Context, task Task, provider string, slot i
 			host := cardHost
 			cardHostMu.Unlock()
 			if host != nil {
-				_ = host.closeAfterLeaseLoss()
+				if d.cardSessionHosts != nil {
+					_ = d.cardSessionHosts.closeAfterLeaseLoss(host)
+				} else {
+					_ = host.closeAfterLeaseLoss()
+				}
 			}
 		}
 		// Start heartbeating before provider setup so a slow initialize cannot
@@ -8939,12 +8943,35 @@ func (d *Daemon) runTask(ctx context.Context, task Task, provider string, slot i
 				// The host already owns this generation (a later comment). Move
 				// the authenticated lookup to the current task while retaining
 				// the one daemon-lifetime heartbeat.
-				openedHost.updateLease(task.ID, cardSessionLease.LeaseEpoch, func() {
+				rebound := openedHost.updateLease(task.ID, cardSessionLease.LeaseEpoch, func() {
 					cancelExecution()
-					_ = openedHost.closeAfterLeaseLoss()
+					_ = d.cardSessionHosts.closeAfterLeaseLoss(openedHost)
 				})
-				cardLeaseHandle.stop(false)
-				cardLeaseHandle = nil
+				if rebound {
+					cardLeaseHandle.stop(false)
+					cardLeaseHandle = nil
+				} else {
+					// The lease was fenced between acquire and rebinding. The
+					// old host is no longer eligible for this task; evict it and
+					// attach the current task's still-live lease to a replacement.
+					_ = d.cardSessionHosts.closeAfterLeaseLoss(openedHost)
+					openedHost, hostErr = d.cardSessionHosts.acquire(d.daemonLifecycleCtx(), cardSessionID, backend, execOpts, idleTimeout)
+					if hostErr != nil {
+						cardLeaseHandle.stop(false)
+						cardLeaseHandle = nil
+						return TaskResult{}, hostErr
+					}
+					cardHostMu.Lock()
+					cardHost = openedHost
+					cardHostMu.Unlock()
+					if !openedHost.attachLease(cardLeaseHandle) {
+						cardLeaseHandle.stop(false)
+						cardLeaseHandle = nil
+						_ = openedHost.close()
+						return TaskResult{}, errors.New("replacement card session host could not attach lease")
+					}
+					cardLeaseHandle = nil
+				}
 			} else if openedHost.attachLease(cardLeaseHandle) {
 				cardLeaseHandle = nil
 			} else {
@@ -8956,7 +8983,7 @@ func (d *Daemon) runTask(ctx context.Context, task Task, provider string, slot i
 			// the registry. Attach a fresh daemon-lifetime keeper after setup.
 			leaseLost := func() {
 				cancelExecution()
-				_ = openedHost.closeAfterLeaseLoss()
+				_ = d.cardSessionHosts.closeAfterLeaseLoss(openedHost)
 			}
 			freshLease := d.newCardSessionLeaseHandle(
 				d.daemonLifecycleCtx(), task.ID, cardSessionLease.LeaseEpoch, leaseLost, taskLog,

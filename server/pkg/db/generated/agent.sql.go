@@ -2138,7 +2138,7 @@ func (q *Queries) ClearAgentThinkingLevel(ctx context.Context, id pgtype.UUID) (
 }
 
 const completeAgentTask = `-- name: CompleteAgentTask :one
-UPDATE agent_task_queue
+UPDATE agent_task_queue AS task
 SET status = 'completed', completed_at = now(), result = $2,
     session_id = CASE WHEN $5 THEN NULL ELSE $3 END,
     work_dir = $4,
@@ -2147,7 +2147,33 @@ SET status = 'completed', completed_at = now(), result = $2,
     session_rollout_missing = $5,
     retired_session_id = COALESCE($8, retired_session_id),
     prepare_lease_expires_at = NULL
-WHERE id = $1 AND status = 'running'
+WHERE task.id = $1
+  AND task.status = 'running'
+  -- The task-row CAS is the first terminal write. For a card task it must
+  -- prove the same server-issued lease that guards the provider-state
+  -- finalizer; otherwise a stale callback could still run chat/retry/notify
+  -- side effects after the finalizer correctly no-ops.
+  AND (
+      task.card_session_id IS NULL
+      OR (
+          $9::bigint > 0
+          AND EXISTS (
+              SELECT 1
+              FROM card_session AS cs
+              WHERE cs.id = task.card_session_id
+                AND cs.state <> 'closed'
+                AND cs.lease_epoch = $9::bigint
+                AND (
+                    cs.lease_owner IS NULL
+                    OR cs.lease_owner = NULLIF($10::text, '')
+                )
+          )
+      )
+      OR (
+          $9::bigint <= 0
+          AND NULLIF($10::text, '') IS NULL
+      )
+  )
 RETURNING id, agent_id, issue_id, status, priority, dispatched_at, started_at, completed_at, result, error, created_at, context, runtime_id, session_id, work_dir, trigger_comment_id, chat_session_id, autopilot_run_id, attempt, max_attempts, parent_task_id, failure_reason, trigger_summary, force_fresh_session, is_leader_task, wait_reason, initiator_user_id, handoff_note, prepare_lease_expires_at, squad_id, runtime_mcp_overlay, escalation_for_task_id, fire_at, originator_user_id, runtime_connected_apps, coalesced_comment_ids, delivered_comment_ids, chat_input_task_id, chat_finalize_deferred_at, originator_source, delegated_from_task_id, retry_of_task_id, rerun_of_task_id, rule_version_id, trigger_evidence_kind, trigger_evidence_ref_id, accountable_user_id, session_rollout_missing, retired_session_id, quick_actions_disabled, regenerate_quick_actions_for, branch_name, durable_work_dir, channel_context_revision, comment_thread_id, cancelled_by_type, cancelled_by_id, cancelled_by_name, issue_snapshot, card_session_id
 `
 
@@ -2160,6 +2186,8 @@ type CompleteAgentTaskParams struct {
 	DurableWorkDir        pgtype.Text `json:"durable_work_dir"`
 	BranchName            pgtype.Text `json:"branch_name"`
 	RetiredSessionID      pgtype.Text `json:"retired_session_id"`
+	LeaseEpoch            int64       `json:"lease_epoch"`
+	LeaseOwner            string      `json:"lease_owner"`
 }
 
 // session_rollout_missing (MUL-5305): when true the daemon withheld this task's
@@ -2183,6 +2211,8 @@ func (q *Queries) CompleteAgentTask(ctx context.Context, arg CompleteAgentTaskPa
 		arg.DurableWorkDir,
 		arg.BranchName,
 		arg.RetiredSessionID,
+		arg.LeaseEpoch,
+		arg.LeaseOwner,
 	)
 	var i AgentTaskQueue
 	err := row.Scan(
@@ -3687,7 +3717,7 @@ func (q *Queries) ExtendAgentTaskPrepareLease(ctx context.Context, arg ExtendAge
 }
 
 const failAgentTask = `-- name: FailAgentTask :one
-UPDATE agent_task_queue
+UPDATE agent_task_queue AS task
 SET status = 'failed',
     completed_at = now(),
     error = $2,
@@ -3699,7 +3729,32 @@ SET status = 'failed',
     session_rollout_missing = $4,
     retired_session_id = COALESCE($9, retired_session_id),
     prepare_lease_expires_at = NULL
-WHERE id = $1 AND status IN ('dispatched', 'running', 'waiting_local_directory')
+WHERE task.id = $1
+  AND task.status IN ('dispatched', 'running', 'waiting_local_directory')
+  -- Keep the task transition itself behind the same lease fence as the
+  -- provider-state finalizer. A stale failure must not create retries or
+  -- notifications after it loses the card-session generation.
+  AND (
+      task.card_session_id IS NULL
+      OR (
+          $10::bigint > 0
+          AND EXISTS (
+              SELECT 1
+              FROM card_session AS cs
+              WHERE cs.id = task.card_session_id
+                AND cs.state <> 'closed'
+                AND cs.lease_epoch = $10::bigint
+                AND (
+                    cs.lease_owner IS NULL
+                    OR cs.lease_owner = NULLIF($11::text, '')
+                )
+          )
+      )
+      OR (
+          $10::bigint <= 0
+          AND NULLIF($11::text, '') IS NULL
+      )
+  )
 RETURNING id, agent_id, issue_id, status, priority, dispatched_at, started_at, completed_at, result, error, created_at, context, runtime_id, session_id, work_dir, trigger_comment_id, chat_session_id, autopilot_run_id, attempt, max_attempts, parent_task_id, failure_reason, trigger_summary, force_fresh_session, is_leader_task, wait_reason, initiator_user_id, handoff_note, prepare_lease_expires_at, squad_id, runtime_mcp_overlay, escalation_for_task_id, fire_at, originator_user_id, runtime_connected_apps, coalesced_comment_ids, delivered_comment_ids, chat_input_task_id, chat_finalize_deferred_at, originator_source, delegated_from_task_id, retry_of_task_id, rerun_of_task_id, rule_version_id, trigger_evidence_kind, trigger_evidence_ref_id, accountable_user_id, session_rollout_missing, retired_session_id, quick_actions_disabled, regenerate_quick_actions_for, branch_name, durable_work_dir, channel_context_revision, comment_thread_id, cancelled_by_type, cancelled_by_id, cancelled_by_name, issue_snapshot, card_session_id
 `
 
@@ -3713,6 +3768,8 @@ type FailAgentTaskParams struct {
 	DurableWorkDir        pgtype.Text `json:"durable_work_dir"`
 	BranchName            pgtype.Text `json:"branch_name"`
 	RetiredSessionID      pgtype.Text `json:"retired_session_id"`
+	LeaseEpoch            int64       `json:"lease_epoch"`
+	LeaseOwner            string      `json:"lease_owner"`
 }
 
 // Marks a task as failed. session_id and work_dir are merged via COALESCE so
@@ -3741,6 +3798,8 @@ func (q *Queries) FailAgentTask(ctx context.Context, arg FailAgentTaskParams) (A
 		arg.DurableWorkDir,
 		arg.BranchName,
 		arg.RetiredSessionID,
+		arg.LeaseEpoch,
+		arg.LeaseOwner,
 	)
 	var i AgentTaskQueue
 	err := row.Scan(

@@ -67,14 +67,10 @@ func (h *cardSessionLeaseHandle) loop() {
 				if h.ctx.Err() != nil {
 					return
 				}
-				h.mu.Lock()
-				if h.lost {
-					h.mu.Unlock()
+				onLost, markedLost := h.markLost()
+				if !markedLost {
 					return
 				}
-				h.lost = true
-				onLost := h.onLost
-				h.mu.Unlock()
 				h.log.Warn("card session lease heartbeat failed; stopping provider host",
 					"task_id", taskID, "lease_epoch", epoch, "error", err)
 				if onLost != nil {
@@ -86,15 +82,43 @@ func (h *cardSessionLeaseHandle) loop() {
 	}
 }
 
-func (h *cardSessionLeaseHandle) update(taskID string, epoch int64, onLost func()) {
+// markLost fences the handle before invoking its callback. Tests and the
+// heartbeat loop use the same transition so registry eviction can be checked
+// in the deterministic window between these two operations.
+func (h *cardSessionLeaseHandle) markLost() (func(), bool) {
 	if h == nil {
-		return
+		return nil, false
 	}
 	h.mu.Lock()
+	defer h.mu.Unlock()
+	if h.lost {
+		return nil, false
+	}
+	h.lost = true
+	return h.onLost, true
+}
+
+func (h *cardSessionLeaseHandle) isLost() bool {
+	if h == nil {
+		return true
+	}
+	h.mu.Lock()
+	lost := h.lost
+	h.mu.Unlock()
+	return lost
+}
+
+func (h *cardSessionLeaseHandle) update(taskID string, epoch int64, onLost func()) bool {
+	if h == nil {
+		return false
+	}
+	h.mu.Lock()
+	defer h.mu.Unlock()
 	if !h.lost {
 		h.taskID, h.epoch, h.onLost = taskID, epoch, onLost
+		return true
 	}
-	h.mu.Unlock()
+	return false
 }
 
 // stop ends the heartbeat. A failed heartbeat must not issue a stale release

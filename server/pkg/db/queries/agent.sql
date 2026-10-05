@@ -1100,7 +1100,7 @@ RETURNING *;
 -- resume lookups could not see — a fresh-session retry that SUCCEEDS still has
 -- to retire the transcript it retried away from, or an older completed row
 -- pointing at the same id resurrects it on the next run.
-UPDATE agent_task_queue
+UPDATE agent_task_queue AS task
 SET status = 'completed', completed_at = now(), result = $2,
     session_id = CASE WHEN sqlc.arg('session_rollout_missing') THEN NULL ELSE $3 END,
     work_dir = $4,
@@ -1109,7 +1109,33 @@ SET status = 'completed', completed_at = now(), result = $2,
     session_rollout_missing = sqlc.arg('session_rollout_missing'),
     retired_session_id = COALESCE(sqlc.narg('retired_session_id'), retired_session_id),
     prepare_lease_expires_at = NULL
-WHERE id = $1 AND status = 'running'
+WHERE task.id = $1
+  AND task.status = 'running'
+  -- The task-row CAS is the first terminal write. For a card task it must
+  -- prove the same server-issued lease that guards the provider-state
+  -- finalizer; otherwise a stale callback could still run chat/retry/notify
+  -- side effects after the finalizer correctly no-ops.
+  AND (
+      task.card_session_id IS NULL
+      OR (
+          sqlc.arg('lease_epoch')::bigint > 0
+          AND EXISTS (
+              SELECT 1
+              FROM card_session AS cs
+              WHERE cs.id = task.card_session_id
+                AND cs.state <> 'closed'
+                AND cs.lease_epoch = sqlc.arg('lease_epoch')::bigint
+                AND (
+                    cs.lease_owner IS NULL
+                    OR cs.lease_owner = NULLIF(sqlc.arg('lease_owner')::text, '')
+                )
+          )
+      )
+      OR (
+          sqlc.arg('lease_epoch')::bigint <= 0
+          AND NULLIF(sqlc.arg('lease_owner')::text, '') IS NULL
+      )
+  )
 RETURNING *;
 
 -- name: GetLastTaskSession :one
@@ -1353,7 +1379,7 @@ LIMIT 1;
 -- the COALESCE that would otherwise preserve a stale mid-flight pin — and flag
 -- the row, in the SAME transaction that creates and wakes the auto-retry, so the
 -- retry can never claim the bad pointer or miss the continuity gap.
-UPDATE agent_task_queue
+UPDATE agent_task_queue AS task
 SET status = 'failed',
     completed_at = now(),
     error = $2,
@@ -1365,7 +1391,32 @@ SET status = 'failed',
     session_rollout_missing = sqlc.arg('session_rollout_missing'),
     retired_session_id = COALESCE(sqlc.narg('retired_session_id'), retired_session_id),
     prepare_lease_expires_at = NULL
-WHERE id = $1 AND status IN ('dispatched', 'running', 'waiting_local_directory')
+WHERE task.id = $1
+  AND task.status IN ('dispatched', 'running', 'waiting_local_directory')
+  -- Keep the task transition itself behind the same lease fence as the
+  -- provider-state finalizer. A stale failure must not create retries or
+  -- notifications after it loses the card-session generation.
+  AND (
+      task.card_session_id IS NULL
+      OR (
+          sqlc.arg('lease_epoch')::bigint > 0
+          AND EXISTS (
+              SELECT 1
+              FROM card_session AS cs
+              WHERE cs.id = task.card_session_id
+                AND cs.state <> 'closed'
+                AND cs.lease_epoch = sqlc.arg('lease_epoch')::bigint
+                AND (
+                    cs.lease_owner IS NULL
+                    OR cs.lease_owner = NULLIF(sqlc.arg('lease_owner')::text, '')
+                )
+          )
+      )
+      OR (
+          sqlc.arg('lease_epoch')::bigint <= 0
+          AND NULLIF(sqlc.arg('lease_owner')::text, '') IS NULL
+      )
+  )
 RETURNING *;
 
 -- name: UpdateAgentTaskSession :exec

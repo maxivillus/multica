@@ -42,6 +42,7 @@ func (f *fakePersistentBackend) OpenPersistent(context.Context, agent.ExecOption
 type fakePersistentSession struct {
 	backend *fakePersistentBackend
 	pid     int
+	closed  atomic.Bool
 }
 
 func (s *fakePersistentSession) Execute(ctx context.Context, prompt string, _ agent.ExecOptions) (*agent.Session, error) {
@@ -75,6 +76,7 @@ func (s *fakePersistentSession) Execute(ctx context.Context, prompt string, _ ag
 }
 
 func (s *fakePersistentSession) Close() error {
+	s.closed.Store(true)
 	s.backend.mu.Lock()
 	s.backend.closes++
 	s.backend.mu.Unlock()
@@ -84,7 +86,7 @@ func (s *fakePersistentSession) Close() error {
 func (s *fakePersistentSession) ProcessID() int { return s.pid }
 
 func (s *fakePersistentSession) IsClosed() bool {
-	return false
+	return s.closed.Load()
 }
 
 func TestCardSessionIDForTurnPrefersStartAcknowledgement(t *testing.T) {
@@ -163,6 +165,46 @@ func TestCardSessionHostRegistryReusesOnePersistentProcess(t *testing.T) {
 	backend.mu.Unlock()
 	if opens != 1 {
 		t.Fatalf("OpenPersistent calls = %d, want 1", opens)
+	}
+}
+
+func TestCardSessionHostRegistryEvictsLostHostBeforeCallback(t *testing.T) {
+	backend := &fakePersistentBackend{}
+	registry := newCardSessionHostRegistry(nil)
+	var oldHost *cardSessionHost
+	lease := &cardSessionLeaseHandle{}
+	lease.onLost = func() {
+		_ = registry.closeAfterLeaseLoss(oldHost)
+	}
+
+	var err error
+	oldHost, err = registry.acquire(context.Background(), "card-1", backend, agent.ExecOptions{})
+	if err != nil {
+		t.Fatalf("acquire old host: %v", err)
+	}
+	if !oldHost.attachLease(lease) {
+		t.Fatal("attach old lease")
+	}
+	onLost, markedLost := lease.markLost()
+	if !markedLost || onLost == nil {
+		t.Fatal("lease was not marked lost with a callback")
+	}
+
+	// The heartbeat has fenced the lease, but its callback is deliberately
+	// paused. acquire must still remove the old process before returning it.
+	replacement, err := registry.acquire(context.Background(), "card-1", backend, agent.ExecOptions{})
+	if err != nil {
+		t.Fatalf("acquire replacement host: %v", err)
+	}
+	if replacement == oldHost {
+		t.Fatal("registry reused a host whose lease was already lost")
+	}
+
+	// A delayed callback from the old generation must not evict or close the
+	// replacement now stored under the same card key.
+	onLost()
+	if replacement.isClosed() {
+		t.Fatal("delayed old lease callback closed replacement host")
 	}
 }
 

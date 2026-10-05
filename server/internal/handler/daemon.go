@@ -4481,6 +4481,10 @@ func (h *Handler) CompleteTask(w http.ResponseWriter, r *http.Request) {
 	// missing continuity-gap flag.
 	task, transitioned, err := h.TaskService.CompleteTaskWithTransitionFenced(r.Context(), parseUUID(taskID), result, req.SessionID, req.WorkDir, req.BranchName, req.SessionRolloutMissing, req.RetiredSessionID, req.DurableWorkDir, leaseOwner, req.CardSessionLeaseEpoch)
 	if err != nil {
+		if errors.Is(err, service.ErrCardSessionLeaseUnavailable) {
+			writeError(w, http.StatusConflict, "card-session lease is no longer current")
+			return
+		}
 		// A CompleteTask error is an infrastructure failure (transaction /
 		// assistant-outcome write), not a bad request: an already-finalized
 		// callback is treated as idempotent success and returns no error. Return
@@ -5213,6 +5217,10 @@ func (h *Handler) failTask(w http.ResponseWriter, r *http.Request, taskID, works
 	// pointer or miss the continuity gap.
 	task, transitioned, err := h.TaskService.FailTaskWithTransitionFenced(r.Context(), parseUUID(taskID), req.Error, req.SessionID, req.WorkDir, req.BranchName, req.FailureReason, req.SessionRolloutMissing, req.RetiredSessionID, req.DurableWorkDir, leaseOwner, req.CardSessionLeaseEpoch)
 	if err != nil {
+		if errors.Is(err, service.ErrCardSessionLeaseUnavailable) {
+			writeError(w, http.StatusConflict, "card-session lease is no longer current")
+			return
+		}
 		// A FailTask error is an infrastructure failure (the terminal
 		// transaction that also clears the withheld session, writes the
 		// continuity-gap flag, and creates the auto-retry rolled back), not a bad

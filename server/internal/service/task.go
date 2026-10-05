@@ -4786,6 +4786,24 @@ func (s *TaskService) CompleteTaskWithTransition(ctx context.Context, taskID pgt
 	return s.CompleteTaskWithTransitionFenced(ctx, taskID, result, sessionID, workDir, branchName, sessionRolloutMissing, retiredSessionID, durableWorkDir, "", 0)
 }
 
+// staleCardSessionTerminalLease identifies the only no-row terminal update
+// that is not an idempotent replay: the task is still active, carries a
+// card-session generation, and the daemon supplied a positive lease proof
+// that no longer matches the current card_session row. Keeping this check
+// separate from the SQL predicate lets non-card and legacy internal callers
+// retain their existing idempotent behavior.
+func staleCardSessionTerminalLease(task db.AgentTaskQueue, leaseEpoch int64) bool {
+	if !task.CardSessionID.Valid || leaseEpoch <= 0 {
+		return false
+	}
+	switch task.Status {
+	case "dispatched", "running", "waiting_local_directory":
+		return true
+	default:
+		return false
+	}
+}
+
 // CompleteTaskWithTransitionFenced is the daemon terminal path. Card-session
 // provider-state finalization is fenced by the server-derived lease owner and
 // the lease epoch reported by the daemon. Non-card tasks keep the same
@@ -4809,6 +4827,8 @@ func (s *TaskService) CompleteTaskWithTransitionFenced(ctx context.Context, task
 			BranchName:            pgtype.Text{String: branchName, Valid: branchName != ""},
 			SessionRolloutMissing: sessionRolloutMissing,
 			RetiredSessionID:      pgtype.Text{String: retiredSessionID, Valid: retiredSessionID != ""},
+			LeaseOwner:            leaseOwner,
+			LeaseEpoch:            leaseEpoch,
 		})
 		if err != nil {
 			return err
@@ -4890,6 +4910,14 @@ func (s *TaskService) CompleteTaskWithTransitionFenced(ctx context.Context, task
 		// Treat it as an idempotent success — same pattern as CancelTask.
 		if existing, lookupErr := s.Queries.GetAgentTask(ctx, taskID); lookupErr == nil {
 			if errors.Is(err, pgx.ErrNoRows) {
+				if staleCardSessionTerminalLease(existing, leaseEpoch) {
+					slog.Info("complete task: stale card-session lease rejected",
+						"task_id", util.UUIDToString(taskID),
+						"lease_epoch", leaseEpoch,
+						"agent_id", util.UUIDToString(existing.AgentID),
+					)
+					return nil, false, fmt.Errorf("%w: task=%s", ErrCardSessionLeaseUnavailable, util.UUIDToString(taskID))
+				}
 				slog.Info("complete task: already finalized",
 					"task_id", util.UUIDToString(taskID),
 					"current_status", existing.Status,
@@ -5325,6 +5353,8 @@ func (s *TaskService) FailTaskWithTransitionFenced(ctx context.Context, taskID p
 			BranchName:            pgtype.Text{String: branchName, Valid: branchName != ""},
 			SessionRolloutMissing: sessionRolloutMissing,
 			RetiredSessionID:      pgtype.Text{String: retiredSessionID, Valid: retiredSessionID != ""},
+			LeaseOwner:            leaseOwner,
+			LeaseEpoch:            leaseEpoch,
 		})
 		if err != nil {
 			return err
@@ -5555,6 +5585,14 @@ func (s *TaskService) FailTaskWithTransitionFenced(ctx context.Context, taskID p
 	}); err != nil {
 		if existing, lookupErr := s.Queries.GetAgentTask(ctx, taskID); lookupErr == nil {
 			if errors.Is(err, pgx.ErrNoRows) {
+				if staleCardSessionTerminalLease(existing, leaseEpoch) {
+					slog.Info("fail task: stale card-session lease rejected",
+						"task_id", util.UUIDToString(taskID),
+						"lease_epoch", leaseEpoch,
+						"agent_id", util.UUIDToString(existing.AgentID),
+					)
+					return nil, false, fmt.Errorf("%w: task=%s", ErrCardSessionLeaseUnavailable, util.UUIDToString(taskID))
+				}
 				slog.Info("fail task: already finalized",
 					"task_id", util.UUIDToString(taskID),
 					"current_status", existing.Status,
