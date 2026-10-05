@@ -1,17 +1,25 @@
--- Every lifecycle state transition invalidates the previous provider proof.
 -- Cancellation changes the card session to paused in the same transaction as
 -- the issue status write, while task cancellation is durable in a separate
--- outbox. Advancing the epoch here closes that interval: a stale terminal
--- callback cannot use the NULL owner as proof after the cancellation commit.
+-- outbox. Advancing the epoch when cancellation starts (or ends) closes that
+-- interval: a stale terminal callback cannot use the NULL owner as proof after
+-- the cancellation commit. An ordinary pause still clears the owner, but
+-- keeps the epoch so the already-running task can finish through its normal
+-- terminal callback; ordinary pause does not cancel the task.
 CREATE OR REPLACE FUNCTION clear_card_session_lease_on_state_change()
 RETURNS trigger
 LANGUAGE plpgsql
 AS $$
 BEGIN
-    IF OLD.state IS DISTINCT FROM NEW.state THEN
+    IF OLD.state IS DISTINCT FROM NEW.state
+       OR OLD.pause_reason IS DISTINCT FROM NEW.pause_reason THEN
         NEW.lease_owner := NULL;
         NEW.lease_heartbeat_at := NULL;
-        NEW.lease_epoch := OLD.lease_epoch + 1;
+        IF (OLD.pause_reason IS DISTINCT FROM 'cancelled'
+                AND NEW.pause_reason = 'cancelled')
+           OR (OLD.pause_reason = 'cancelled'
+                AND NEW.pause_reason IS DISTINCT FROM 'cancelled') THEN
+            NEW.lease_epoch := OLD.lease_epoch + 1;
+        END IF;
     END IF;
     RETURN NEW;
 END;
@@ -29,7 +37,8 @@ WHERE state <> 'open';
 
 DROP TRIGGER IF EXISTS card_session_lease_state_fence ON card_session;
 CREATE TRIGGER card_session_lease_state_fence
-BEFORE UPDATE OF state ON card_session
+BEFORE UPDATE OF state, pause_reason ON card_session
 FOR EACH ROW
-WHEN (OLD.state IS DISTINCT FROM NEW.state)
+WHEN (OLD.state IS DISTINCT FROM NEW.state
+      OR OLD.pause_reason IS DISTINCT FROM NEW.pause_reason)
 EXECUTE FUNCTION clear_card_session_lease_on_state_change();

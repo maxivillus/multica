@@ -119,11 +119,15 @@ func TestRuntimeAccessGatesQueuedTaskClaims(t *testing.T) {
 			}
 			q := db.New(fixture.pool)
 
-			candidates, err := q.ListQueuedClaimCandidatesByRuntime(ctx, fixture.runtimeID)
+			candidates, err := q.ListQueuedClaimCandidatesByRuntime(ctx, db.ListQueuedClaimCandidatesByRuntimeParams{
+				RuntimeID: fixture.runtimeID,
+			})
 			if err != nil {
 				t.Fatalf("list singular candidates: %v", err)
 			}
-			batchCandidates, err := q.ListQueuedClaimCandidatesByRuntimes(ctx, []pgtype.UUID{fixture.runtimeID})
+			batchCandidates, err := q.ListQueuedClaimCandidatesByRuntimes(ctx, db.ListQueuedClaimCandidatesByRuntimesParams{
+				RuntimeIds: []pgtype.UUID{fixture.runtimeID},
+			})
 			if err != nil {
 				t.Fatalf("list batch candidates: %v", err)
 			}
@@ -164,6 +168,97 @@ func TestRuntimeAccessGatesQueuedTaskClaims(t *testing.T) {
 				t.Fatalf("claimed task = %s, want %s", util.UUIDToString(claimed.ID), fixture.taskID)
 			}
 		})
+	}
+}
+
+func TestRuntimeClaimCapabilityGatesOnlyActiveIssueTasks(t *testing.T) {
+	ctx := context.Background()
+	fixture := newRuntimeClaimAccessFixture(t, "private", true, true, "queued")
+	q := db.New(fixture.pool)
+	withoutLease := pgtype.Bool{Bool: false, Valid: true}
+
+	candidates, err := q.ListQueuedClaimCandidatesByRuntime(ctx, db.ListQueuedClaimCandidatesByRuntimeParams{
+		RuntimeID:                fixture.runtimeID,
+		SupportsCardSessionLease: withoutLease,
+	})
+	if err != nil {
+		t.Fatalf("list active candidates: %v", err)
+	}
+	if len(candidates) != 0 {
+		t.Fatalf("active issue candidates without lease capability = %d, want 0", len(candidates))
+	}
+	batchCandidates, err := q.ListQueuedClaimCandidatesByRuntimes(ctx, db.ListQueuedClaimCandidatesByRuntimesParams{
+		RuntimeIds:               []pgtype.UUID{fixture.runtimeID},
+		SupportsCardSessionLease: withoutLease,
+	})
+	if err != nil {
+		t.Fatalf("list active batch candidates: %v", err)
+	}
+	if len(batchCandidates) != 0 {
+		t.Fatalf("active issue batch candidates without lease capability = %d, want 0", len(batchCandidates))
+	}
+	if _, err := q.ClaimAgentTask(ctx, db.ClaimAgentTaskParams{
+		AgentID:                  fixture.agentID,
+		RuntimeID:                fixture.runtimeID,
+		PrepareLeaseSecs:         60,
+		RuntimeStaleSecs:         RuntimeClaimFreshnessSeconds,
+		SupportsCardSessionLease: withoutLease,
+	}); !errors.Is(err, pgx.ErrNoRows) {
+		t.Fatalf("active issue claim without lease capability error = %v, want no rows", err)
+	}
+
+	if _, err := fixture.pool.Exec(ctx, `UPDATE issue SET status = 'blocked' WHERE id = (SELECT issue_id FROM agent_task_queue WHERE id = $1)`, fixture.taskID); err != nil {
+		t.Fatalf("park issue task: %v", err)
+	}
+	candidates, err = q.ListQueuedClaimCandidatesByRuntime(ctx, db.ListQueuedClaimCandidatesByRuntimeParams{
+		RuntimeID:                fixture.runtimeID,
+		SupportsCardSessionLease: withoutLease,
+	})
+	if err != nil {
+		t.Fatalf("list parked candidates: %v", err)
+	}
+	if len(candidates) != 1 {
+		t.Fatalf("parked issue candidates without lease capability = %d, want 1", len(candidates))
+	}
+	claimed, err := q.ClaimAgentTask(ctx, db.ClaimAgentTaskParams{
+		AgentID:                  fixture.agentID,
+		RuntimeID:                fixture.runtimeID,
+		PrepareLeaseSecs:         60,
+		RuntimeStaleSecs:         RuntimeClaimFreshnessSeconds,
+		SupportsCardSessionLease: withoutLease,
+	})
+	if err != nil {
+		t.Fatalf("parked issue claim without lease capability: %v", err)
+	}
+	if util.UUIDToString(claimed.ID) != fixture.taskID {
+		t.Fatalf("parked issue claimed task = %s, want %s", util.UUIDToString(claimed.ID), fixture.taskID)
+	}
+}
+
+func TestRuntimeClaimCapabilityGatesStaleReclaim(t *testing.T) {
+	ctx := context.Background()
+	fixture := newRuntimeClaimAccessFixture(t, "private", true, true, "dispatched")
+	q := db.New(fixture.pool)
+	withoutLease := pgtype.Bool{Bool: false, Valid: true}
+	params := db.ReclaimStaleDispatchedTaskForRuntimeParams{
+		RuntimeID:                fixture.runtimeID,
+		PrepareLeaseSecs:         60,
+		ClaimRecoverySecs:        30,
+		SupportsCardSessionLease: withoutLease,
+		RuntimeStaleSecs:         RuntimeClaimFreshnessSeconds,
+	}
+	if _, err := q.ReclaimStaleDispatchedTaskForRuntime(ctx, params); !errors.Is(err, pgx.ErrNoRows) {
+		t.Fatalf("active issue stale reclaim without lease capability error = %v, want no rows", err)
+	}
+	if _, err := fixture.pool.Exec(ctx, `UPDATE issue SET status = 'blocked' WHERE id = (SELECT issue_id FROM agent_task_queue WHERE id = $1)`, fixture.taskID); err != nil {
+		t.Fatalf("park stale issue task: %v", err)
+	}
+	reclaimed, err := q.ReclaimStaleDispatchedTaskForRuntime(ctx, params)
+	if err != nil {
+		t.Fatalf("parked issue stale reclaim without lease capability: %v", err)
+	}
+	if util.UUIDToString(reclaimed.ID) != fixture.taskID {
+		t.Fatalf("parked issue reclaimed task = %s, want %s", util.UUIDToString(reclaimed.ID), fixture.taskID)
 	}
 }
 

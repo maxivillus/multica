@@ -188,6 +188,16 @@ func TestStartClaimInvalidBodiesAndLegacy(t *testing.T) {
 	testutil.Call(t, testHandler.StartTask, capabilityReq).Want(http.StatusOK)
 	replayReq := withURLParam(newDaemonTokenRequest("POST", "/start", nil, testWorkspaceID, "legacy-test"), "taskId", id)
 	testutil.Call(t, testHandler.StartTask, replayReq).Want(http.StatusConflict)
+
+	// A parked issue task is an ordinary comment/mention task. An old daemon
+	// without the card-session capability may still start it; only active issue
+	// tasks require the lease handshake.
+	parkedID, parkedRuntimeID, parkedGeneration := startClaimFixture(t, "dispatched")
+	dbfx.Exec(t, `UPDATE issue SET status = 'blocked' WHERE id = (SELECT issue_id FROM agent_task_queue WHERE id = $1)`, parkedID)
+	parkedReq := withURLParam(newDaemonTokenRequest("POST", "/start", map[string]any{
+		"runtime_id": parkedRuntimeID, "dispatched_at": parkedGeneration.Format(time.RFC3339Nano),
+	}, testWorkspaceID, "legacy-test"), "taskId", parkedID)
+	testutil.Call(t, testHandler.StartTask, parkedReq).Want(http.StatusOK)
 }
 
 func TestStartClaimWirePrecision(t *testing.T) {

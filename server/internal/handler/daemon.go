@@ -1845,7 +1845,10 @@ func (h *Handler) ClaimTasksByRuntime(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	claimed, err := h.TaskService.ClaimTasksForRuntimes(r.Context(), authorized, maxTasks)
+	claimed, err := h.TaskService.ClaimTasksForRuntimes(
+		r.Context(), authorized, maxTasks,
+		requestHasClientCapability(r, protocol.DaemonCapabilityCardSessionLeaseV1),
+	)
 	if err != nil {
 		writeError(w, http.StatusInternalServerError, "failed to claim tasks: "+err.Error())
 		return
@@ -3844,7 +3847,11 @@ func (h *Handler) ClaimTaskByRuntime(w http.ResponseWriter, r *http.Request) {
 	authMs = time.Since(start).Milliseconds()
 
 	claimStart := time.Now()
-	task, err := h.TaskService.ClaimTaskForRuntime(r.Context(), parseUUID(runtimeID))
+	task, err := h.TaskService.ClaimTaskForRuntime(
+		r.Context(),
+		parseUUID(runtimeID),
+		requestHasClientCapability(r, protocol.DaemonCapabilityCardSessionLeaseV1),
+	)
 	claimMs = time.Since(claimStart).Milliseconds()
 	if err != nil {
 		outcome = "error_claim"
@@ -4198,22 +4205,39 @@ func (h *Handler) StartTask(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 	enableTaskSupplement := slices.Contains(req.Capabilities, protocol.DaemonCapabilityTaskSupplementV1)
+	// New daemons advertise the capability in the common header; the body is
+	// retained for start-request compatibility and is authoritative for tests
+	// and older clients that only negotiated per-task capabilities.
+	supportsCardSessionLease := requestHasClientCapability(r, protocol.DaemonCapabilityCardSessionLeaseV1) || slices.Contains(req.Capabilities, protocol.DaemonCapabilityCardSessionLeaseV1)
 	var task *db.AgentTaskQueue
 	var err error
 	legacy := req.RuntimeID == "" && req.DispatchedAt == ""
-	if legacy {
-		if accessTask.IssueID.Valid && !slices.Contains(req.Capabilities, protocol.DaemonCapabilityCardSessionLeaseV1) {
-			// Issue tasks may be bound to a card-session lease during this start
-			// transaction. Without the capability an older daemon can acquire that
-			// lease and then reach /complete or /fail without the epoch proof,
-			// leaving the task stuck behind a 409. Fail closed before it enters a
-			// generation the daemon cannot finalize, regardless of request shape.
+	requireCardSessionCapability := func() bool {
+		if supportsCardSessionLease || !accessTask.IssueID.Valid {
+			return true
+		}
+		// Only active issue tasks need the card-session lease capability. Older
+		// daemons remain compatible with backlog/blocked/cancelled comment tasks,
+		// which deliberately stay outside the persistent card-session path.
+		issue, issueErr := h.Queries.GetIssue(r.Context(), accessTask.IssueID)
+		if issueErr != nil {
+			slog.Warn("load issue for card-session capability gate failed", "task_id", taskID, "error", issueErr)
+			writeError(w, http.StatusInternalServerError, "failed to load task issue")
+			return false
+		}
+		if issuestatus.AllowsAgentTask(r.Context(), h.Queries, issue.WorkspaceID, issue.Status) {
 			writeError(w, http.StatusConflict, "card-session lease capability required; update daemon")
+			return false
+		}
+		return true
+	}
+	if legacy {
+		if !requireCardSessionCapability() {
 			return
 		}
 		// Older daemons send {}. Keep their single-winner behavior; in
 		// particular, they cannot acknowledge an already-running task.
-		task, err = h.TaskService.StartTaskWithCardSessionLease(r.Context(), parseUUID(taskID), leaseOwner, enableTaskSupplement)
+		task, err = h.TaskService.StartTaskWithCardSessionLeaseCapability(r.Context(), parseUUID(taskID), leaseOwner, supportsCardSessionLease, enableTaskSupplement)
 	} else {
 		runtimeID, ok := parseUUIDOrBadRequest(w, req.RuntimeID, "runtime_id")
 		if !ok {
@@ -4224,16 +4248,13 @@ func (h *Handler) StartTask(w http.ResponseWriter, r *http.Request) {
 			writeError(w, http.StatusBadRequest, "dispatched_at must be a PostgreSQL claim timestamp")
 			return
 		}
-		if accessTask.IssueID.Valid && !slices.Contains(req.Capabilities, protocol.DaemonCapabilityCardSessionLeaseV1) {
-			// The validated claim would otherwise start a card-session generation
-			// that an older daemon cannot finalize with its terminal callback.
-			writeError(w, http.StatusConflict, "card-session lease capability required; update daemon")
+		if !requireCardSessionCapability() {
 			return
 		}
-		task, err = h.TaskService.StartTaskForClaimWithCardSessionLease(r.Context(), db.LockAgentTaskStartClaimParams{
+		task, err = h.TaskService.StartTaskForClaimWithCardSessionLeaseCapability(r.Context(), db.LockAgentTaskStartClaimParams{
 			ID: parseUUID(taskID), RuntimeID: runtimeID,
 			DispatchedAt: pgtype.Timestamptz{Time: generation, Valid: true},
-		}, leaseOwner, enableTaskSupplement)
+		}, leaseOwner, supportsCardSessionLease, enableTaskSupplement)
 	}
 	if err != nil {
 		slog.Warn("start task failed", "task_id", taskID, "error", err)

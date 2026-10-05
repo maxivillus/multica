@@ -730,12 +730,22 @@ WITH candidate AS MATERIALIZED (
     JOIN agent_runtime r ON r.id = t.runtime_id
     WHERE t.id = $1
       AND t.status IN ('dispatched', 'waiting_local_directory')
+      AND (
+          COALESCE($2::bool, true)
+          OR t.issue_id IS NULL
+          OR NOT EXISTS (
+              SELECT 1
+              FROM issue i
+              WHERE i.id = t.issue_id
+                AND issue_status_allows_agent_task(i.workspace_id, i.status)
+          )
+      )
     FOR UPDATE OF t
 ), capability AS (
     INSERT INTO task_supplement_capability (task_id, workspace_id, issue_id, capability)
     SELECT id, workspace_id, issue_id, 'task-supplement-v1'
     FROM candidate
-    WHERE $2::boolean
+    WHERE $3::boolean
       AND provider IN ('codex', 'claude', 'grok')
       AND issue_id IS NOT NULL
     ON CONFLICT DO NOTHING
@@ -755,15 +765,16 @@ RETURNING t.id, t.agent_id, t.issue_id, t.status, t.priority, t.dispatched_at, t
 `
 
 type StartAgentTaskWithSupplementParams struct {
-	TaskID               pgtype.UUID `json:"task_id"`
-	EnableTaskSupplement bool        `json:"enable_task_supplement"`
+	TaskID                   pgtype.UUID `json:"task_id"`
+	SupportsCardSessionLease pgtype.Bool `json:"supports_card_session_lease"`
+	EnableTaskSupplement     bool        `json:"enable_task_supplement"`
 }
 
 // Starting the task and recording the exact daemon/server capability handshake
 // are one state transition. A missing row is the fail-closed value for old
 // daemons, old servers, unsupported providers and application rollback.
 func (q *Queries) StartAgentTaskWithSupplement(ctx context.Context, arg StartAgentTaskWithSupplementParams) (AgentTaskQueue, error) {
-	row := q.db.QueryRow(ctx, startAgentTaskWithSupplement, arg.TaskID, arg.EnableTaskSupplement)
+	row := q.db.QueryRow(ctx, startAgentTaskWithSupplement, arg.TaskID, arg.SupportsCardSessionLease, arg.EnableTaskSupplement)
 	var i AgentTaskQueue
 	err := row.Scan(
 		&i.ID,

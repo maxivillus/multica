@@ -3806,7 +3806,9 @@ func (s *TaskService) broadcastChatCancelFinalized(ctx context.Context, task db.
 // ClaimTask atomically claims the next queued task for an agent on its current
 // runtime, respecting max_concurrent_tasks.
 func (s *TaskService) ClaimTask(ctx context.Context, agentID pgtype.UUID) (*db.AgentTaskQueue, error) {
-	return s.claimTask(ctx, agentID, pgtype.UUID{})
+	// Internal callers are trusted server paths. Daemon claim endpoints pass the
+	// explicit capability flag through the runtime-scoped methods below.
+	return s.claimTask(ctx, agentID, pgtype.UUID{}, true)
 }
 
 // claimTask is the runtime-scoped claim primitive used by daemon poll paths.
@@ -3814,7 +3816,8 @@ func (s *TaskService) ClaimTask(ctx context.Context, agentID pgtype.UUID) (*db.A
 // agent's currently bound runtime. Scoping the SQL claim itself prevents an
 // offline candidate on runtime A from causing the same agent's task on runtime
 // B to be dispatched and then dropped by the caller's runtime guard.
-func (s *TaskService) claimTask(ctx context.Context, agentID, runtimeID pgtype.UUID) (*db.AgentTaskQueue, error) {
+func (s *TaskService) claimTask(ctx context.Context, agentID, runtimeID pgtype.UUID, cardSessionCapability ...bool) (*db.AgentTaskQueue, error) {
+	supportsCardSessionLease := len(cardSessionCapability) == 0 || cardSessionCapability[0]
 	start := time.Now()
 	outcome := "unknown"
 	var getAgentMs, countRunningMs, claimAgentMs, reanchorMs, updateStatusMs, dispatchMs int64
@@ -3866,10 +3869,11 @@ func (s *TaskService) claimTask(ctx context.Context, agentID, runtimeID pgtype.U
 		t0 = time.Now()
 		reclaimCheckAfter = t0.Add(claimResponseRecoveryWindow + ReclaimCheckHintSafetyMargin)
 		task, err := qtx.ClaimAgentTask(ctx, db.ClaimAgentTaskParams{
-			AgentID:          agentID,
-			RuntimeID:        claimRuntimeID,
-			PrepareLeaseSecs: prepareLeaseDuration.Seconds(),
-			RuntimeStaleSecs: RuntimeClaimFreshnessSeconds,
+			AgentID:                  agentID,
+			RuntimeID:                claimRuntimeID,
+			PrepareLeaseSecs:         prepareLeaseDuration.Seconds(),
+			RuntimeStaleSecs:         RuntimeClaimFreshnessSeconds,
+			SupportsCardSessionLease: pgtype.Bool{Bool: supportsCardSessionLease, Valid: true},
 		})
 		claimAgentMs = time.Since(t0).Milliseconds()
 		if err != nil {
@@ -3946,7 +3950,8 @@ func (s *TaskService) claimTask(ctx context.Context, agentID, runtimeID pgtype.U
 // without touching Postgres. The cache is invalidated synchronously on
 // every enqueue (notifyTaskAvailable), so a queued task becomes
 // claimable on the next call rather than waiting for the TTL.
-func (s *TaskService) ClaimTaskForRuntime(ctx context.Context, runtimeID pgtype.UUID) (*db.AgentTaskQueue, error) {
+func (s *TaskService) ClaimTaskForRuntime(ctx context.Context, runtimeID pgtype.UUID, cardSessionCapability ...bool) (*db.AgentTaskQueue, error) {
+	supportsCardSessionLease := len(cardSessionCapability) == 0 || cardSessionCapability[0]
 	start := time.Now()
 	var (
 		outcome          = "no_task"
@@ -3988,10 +3993,11 @@ func (s *TaskService) ClaimTaskForRuntime(ctx context.Context, runtimeID pgtype.
 	if due := s.ReclaimCheck.DueRuntimeIDs(ctx, []string{runtimeKey}, checkStarted); len(due) > 0 {
 		reclaimCheckAfter := time.Now().Add(claimResponseRecoveryWindow + ReclaimCheckHintSafetyMargin)
 		stale, err := s.Queries.ReclaimStaleDispatchedTaskForRuntime(ctx, db.ReclaimStaleDispatchedTaskForRuntimeParams{
-			RuntimeID:         runtimeID,
-			ClaimRecoverySecs: claimResponseRecoveryWindow.Seconds(),
-			PrepareLeaseSecs:  prepareLeaseDuration.Seconds(),
-			RuntimeStaleSecs:  RuntimeClaimFreshnessSeconds,
+			RuntimeID:                runtimeID,
+			ClaimRecoverySecs:        claimResponseRecoveryWindow.Seconds(),
+			PrepareLeaseSecs:         prepareLeaseDuration.Seconds(),
+			RuntimeStaleSecs:         RuntimeClaimFreshnessSeconds,
+			SupportsCardSessionLease: pgtype.Bool{Bool: supportsCardSessionLease, Valid: true},
 		})
 		if err == nil {
 			s.ReclaimCheck.MarkChecked(
@@ -4036,7 +4042,10 @@ func (s *TaskService) ClaimTaskForRuntime(ctx context.Context, runtimeID pgtype.
 	preSelectVersion := s.EmptyClaim.CurrentVersion(ctx, runtimeKey)
 
 	t0 := time.Now()
-	tasks, err := s.Queries.ListQueuedClaimCandidatesByRuntime(ctx, runtimeID)
+	tasks, err := s.Queries.ListQueuedClaimCandidatesByRuntime(ctx, db.ListQueuedClaimCandidatesByRuntimeParams{
+		RuntimeID:                runtimeID,
+		SupportsCardSessionLease: pgtype.Bool{Bool: supportsCardSessionLease, Valid: true},
+	})
 	listMs = time.Since(t0).Milliseconds()
 	listCount = len(tasks)
 	if err != nil {
@@ -4061,7 +4070,7 @@ func (s *TaskService) ClaimTaskForRuntime(ctx context.Context, runtimeID pgtype.
 		triedAgents[agentKey] = struct{}{}
 		tried++
 
-		task, err := s.claimTask(ctx, candidate.AgentID, runtimeID)
+		task, err := s.claimTask(ctx, candidate.AgentID, runtimeID, supportsCardSessionLease)
 		if err != nil {
 			loopMs = time.Since(loopStart).Milliseconds()
 			outcome = "error_claim"
@@ -4235,10 +4244,11 @@ func (s *TaskService) RequeueTaskAfterClaimFailure(ctx context.Context, task db.
 // The returned slice contains both reclaimed and freshly-claimed tasks, each
 // already carrying its runtime_id so the daemon routes it to the matching
 // runtime locally.
-func (s *TaskService) ClaimTasksForRuntimes(ctx context.Context, runtimeIDs []pgtype.UUID, maxTasks int) ([]db.AgentTaskQueue, error) {
+func (s *TaskService) ClaimTasksForRuntimes(ctx context.Context, runtimeIDs []pgtype.UUID, maxTasks int, cardSessionCapability ...bool) ([]db.AgentTaskQueue, error) {
 	if len(runtimeIDs) == 0 || maxTasks <= 0 {
 		return nil, nil
 	}
+	supportsCardSessionLease := len(cardSessionCapability) == 0 || cardSessionCapability[0]
 
 	// De-dup runtime IDs defensively so MarkEmpty/version bookkeeping stays
 	// unambiguous even if a daemon ever sends a duplicate.
@@ -4309,11 +4319,12 @@ func (s *TaskService) ClaimTasksForRuntimes(ctx context.Context, runtimeIDs []pg
 	if len(dueKeys) > 0 {
 		reclaimCheckAfter = time.Now().Add(claimResponseRecoveryWindow + ReclaimCheckHintSafetyMargin)
 		reclaimed, err = s.Queries.ReclaimStaleDispatchedTasksForRuntimes(ctx, db.ReclaimStaleDispatchedTasksForRuntimesParams{
-			RuntimeIds:        uniqueIDs,
-			ClaimRecoverySecs: claimResponseRecoveryWindow.Seconds(),
-			PrepareLeaseSecs:  prepareLeaseDuration.Seconds(),
-			RuntimeStaleSecs:  RuntimeClaimFreshnessSeconds,
-			MaxTasks:          int32(maxTasks),
+			RuntimeIds:               uniqueIDs,
+			ClaimRecoverySecs:        claimResponseRecoveryWindow.Seconds(),
+			PrepareLeaseSecs:         prepareLeaseDuration.Seconds(),
+			RuntimeStaleSecs:         RuntimeClaimFreshnessSeconds,
+			MaxTasks:                 int32(maxTasks),
+			SupportsCardSessionLease: pgtype.Bool{Bool: supportsCardSessionLease, Valid: true},
 		})
 		if err != nil {
 			return nil, fmt.Errorf("reclaim stale dispatched tasks: %w", err)
@@ -4357,7 +4368,10 @@ func (s *TaskService) ClaimTasksForRuntimes(ctx context.Context, runtimeIDs []pg
 	}
 
 	// 4. One candidate SELECT across the non-empty set.
-	candidates, err := s.Queries.ListQueuedClaimCandidatesByRuntimes(ctx, nonEmpty)
+	candidates, err := s.Queries.ListQueuedClaimCandidatesByRuntimes(ctx, db.ListQueuedClaimCandidatesByRuntimesParams{
+		RuntimeIds:               nonEmpty,
+		SupportsCardSessionLease: pgtype.Bool{Bool: supportsCardSessionLease, Valid: true},
+	})
 	if err != nil {
 		// Steps 2/6 commit reclaimed/claimed tasks in their own transactions,
 		// so `claimed` may already hold tasks dispatched server-side. Dropping
@@ -4403,7 +4417,7 @@ func (s *TaskService) ClaimTasksForRuntimes(ctx context.Context, runtimeIDs []pg
 		}
 		triedAgents[agentKey] = struct{}{}
 
-		task, err := s.claimTask(ctx, candidates[i].AgentID, candidates[i].RuntimeID)
+		task, err := s.claimTask(ctx, candidates[i].AgentID, candidates[i].RuntimeID, supportsCardSessionLease)
 		if err != nil {
 			// Each scoped claim commits in its own transaction, so earlier
 			// iterations (and step-2 reclaims) are already dispatched
@@ -4515,17 +4529,26 @@ func (s *TaskService) maybeLogClaimSlow(agentID pgtype.UUID, outcome string, sta
 // StartTask transitions a dispatched task to running.
 // Issue status is NOT changed here — the agent manages it via the CLI.
 func (s *TaskService) StartTask(ctx context.Context, taskID pgtype.UUID, supplementSupport ...bool) (*db.AgentTaskQueue, error) {
-	return s.startTask(ctx, taskID, "", supplementSupport...)
+	return s.startTask(ctx, taskID, "", true, supplementSupport...)
 }
 
 // StartTaskWithCardSessionLease is the daemon-owned start path. The lease is
 // acquired in the same transaction as the dispatched -> running transition so
 // no provider host can begin a card turn without owning its generation.
 func (s *TaskService) StartTaskWithCardSessionLease(ctx context.Context, taskID pgtype.UUID, leaseOwner string, supplementSupport ...bool) (*db.AgentTaskQueue, error) {
-	return s.startTask(ctx, taskID, leaseOwner, supplementSupport...)
+	return s.startTask(ctx, taskID, leaseOwner, true, supplementSupport...)
 }
 
-func (s *TaskService) startTask(ctx context.Context, taskID pgtype.UUID, leaseOwner string, supplementSupport ...bool) (*db.AgentTaskQueue, error) {
+// StartTaskWithCardSessionLeaseCapability is the daemon-facing start path. The
+// capability is evaluated inside the same transaction as the dispatched ->
+// running transition, so an old daemon cannot start an active issue task and
+// then reach a terminal callback without an epoch proof. Inactive issue tasks
+// and non-issue tasks remain eligible for the legacy daemon path.
+func (s *TaskService) StartTaskWithCardSessionLeaseCapability(ctx context.Context, taskID pgtype.UUID, leaseOwner string, supportsCardSessionLease bool, supplementSupport ...bool) (*db.AgentTaskQueue, error) {
+	return s.startTask(ctx, taskID, leaseOwner, supportsCardSessionLease, supplementSupport...)
+}
+
+func (s *TaskService) startTask(ctx context.Context, taskID pgtype.UUID, leaseOwner string, supportsCardSessionLease bool, supplementSupport ...bool) (*db.AgentTaskQueue, error) {
 	enableTaskSupplement := len(supplementSupport) > 0 && supplementSupport[0]
 	if s.TxStarter == nil {
 		if strings.TrimSpace(leaseOwner) != "" {
@@ -4535,8 +4558,9 @@ func (s *TaskService) startTask(ctx context.Context, taskID pgtype.UUID, leaseOw
 		// production service always has a transaction starter so issue tasks are
 		// bound to their card-session generation before StartTask returns.
 		task, err := s.Queries.StartAgentTaskWithSupplement(ctx, db.StartAgentTaskWithSupplementParams{
-			TaskID:               taskID,
-			EnableTaskSupplement: enableTaskSupplement,
+			TaskID:                   taskID,
+			EnableTaskSupplement:     enableTaskSupplement,
+			SupportsCardSessionLease: pgtype.Bool{Bool: supportsCardSessionLease, Valid: true},
 		})
 		if err != nil {
 			return nil, fmt.Errorf("start task: %w", err)
@@ -4554,8 +4578,9 @@ func (s *TaskService) startTask(ctx context.Context, taskID pgtype.UUID, leaseOw
 	defer tx.Rollback(ctx)
 	qtx := s.Queries.WithTx(tx)
 	task, err := qtx.StartAgentTaskWithSupplement(ctx, db.StartAgentTaskWithSupplementParams{
-		TaskID:               taskID,
-		EnableTaskSupplement: enableTaskSupplement,
+		TaskID:                   taskID,
+		EnableTaskSupplement:     enableTaskSupplement,
+		SupportsCardSessionLease: pgtype.Bool{Bool: supportsCardSessionLease, Valid: true},
 	})
 	if err != nil {
 		return nil, fmt.Errorf("start task: %w", err)
@@ -4583,17 +4608,24 @@ func (s *TaskService) startTask(ctx context.Context, taskID pgtype.UUID, leaseOw
 // cancellation and other start requests. A replay linearizes at the locked read;
 // a cancellation that commits later can still cancel the acknowledged task.
 func (s *TaskService) StartTaskForClaim(ctx context.Context, claim db.LockAgentTaskStartClaimParams, supplementSupport ...bool) (*db.AgentTaskQueue, error) {
-	return s.startTaskForClaim(ctx, claim, "", supplementSupport...)
+	return s.startTaskForClaim(ctx, claim, "", true, supplementSupport...)
 }
 
 // StartTaskForClaimWithCardSessionLease is the claim-validated daemon path.
 // The owner is kept separate from the task row so a stale process cannot
 // replay a task and silently take the current generation.
 func (s *TaskService) StartTaskForClaimWithCardSessionLease(ctx context.Context, claim db.LockAgentTaskStartClaimParams, leaseOwner string, supplementSupport ...bool) (*db.AgentTaskQueue, error) {
-	return s.startTaskForClaim(ctx, claim, leaseOwner, supplementSupport...)
+	return s.startTaskForClaim(ctx, claim, leaseOwner, true, supplementSupport...)
 }
 
-func (s *TaskService) startTaskForClaim(ctx context.Context, claim db.LockAgentTaskStartClaimParams, leaseOwner string, supplementSupport ...bool) (*db.AgentTaskQueue, error) {
+// StartTaskForClaimWithCardSessionLeaseCapability is the claim-validated
+// daemon path with the same transactional capability gate as the legacy start
+// path.
+func (s *TaskService) StartTaskForClaimWithCardSessionLeaseCapability(ctx context.Context, claim db.LockAgentTaskStartClaimParams, leaseOwner string, supportsCardSessionLease bool, supplementSupport ...bool) (*db.AgentTaskQueue, error) {
+	return s.startTaskForClaim(ctx, claim, leaseOwner, supportsCardSessionLease, supplementSupport...)
+}
+
+func (s *TaskService) startTaskForClaim(ctx context.Context, claim db.LockAgentTaskStartClaimParams, leaseOwner string, supportsCardSessionLease bool, supplementSupport ...bool) (*db.AgentTaskQueue, error) {
 	if !claim.ID.Valid || !claim.RuntimeID.Valid || !claim.DispatchedAt.Valid {
 		return nil, fmt.Errorf("start task: incomplete claim")
 	}
@@ -4610,8 +4642,9 @@ func (s *TaskService) startTaskForClaim(ctx context.Context, claim db.LockAgentT
 	replay := task.Status == "running"
 	if !replay {
 		task, err = qtx.StartAgentTaskWithSupplement(ctx, db.StartAgentTaskWithSupplementParams{
-			TaskID:               task.ID,
-			EnableTaskSupplement: len(supplementSupport) > 0 && supplementSupport[0],
+			TaskID:                   task.ID,
+			EnableTaskSupplement:     len(supplementSupport) > 0 && supplementSupport[0],
+			SupportsCardSessionLease: pgtype.Bool{Bool: supportsCardSessionLease, Valid: true},
 		})
 		if err != nil {
 			return nil, fmt.Errorf("start claimed task: %w", err)

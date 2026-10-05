@@ -48,7 +48,10 @@ fenced release. Heartbeat updates only the lease timestamp; it never updates
 `last_activity_at`, so an idle provider host cannot keep a card generation
 alive indefinitely. State transitions to `paused` or `closed` clear the lease
 in both the service and database-trigger paths, and a stale owner cannot
-release a replacement lease.
+release a replacement lease. An ordinary `backlog` or `blocked` pause keeps
+the epoch so a task that was already running can finish its terminal callback;
+entering or leaving `cancelled` advances the epoch and invalidates that old
+callback before the cancellation outbox settles the task.
 
 ### Token statistics
 

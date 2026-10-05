@@ -812,6 +812,10 @@ WHERE atq.id = $1 AND a.workspace_id = $2;
 -- "any other quick-create-shaped task" (all four FKs NULL) for the same agent —
 -- otherwise a user mashing the create button could fire concurrent quick-creates
 -- whose completion lookup would race over "most recent issue by this agent".
+-- Active issue tasks require the card-session lease capability. Inactive issue
+-- tasks (backlog/blocked/cancelled/custom closed) and non-issue tasks remain
+-- compatible with older daemons because they do not enter the card-session
+-- start path.
 UPDATE agent_task_queue
 SET status = 'dispatched',
     dispatched_at = now(),
@@ -822,6 +826,16 @@ WHERE id = (
       AND atq.runtime_id = @runtime_id
       AND atq.status = 'queued'
       AND (atq.context->>'wakeup_id' IS NULL OR EXISTS (SELECT 1 FROM issue_wakeup w WHERE w.id=(atq.context->>'wakeup_id')::uuid AND w.disabled_at IS NULL AND w.revision=(atq.context->>'wakeup_revision')::bigint))
+      AND (
+          COALESCE(sqlc.narg('supports_card_session_lease')::bool, true)
+          OR atq.issue_id IS NULL
+          OR NOT EXISTS (
+              SELECT 1
+              FROM issue i
+              WHERE i.id = atq.issue_id
+                AND issue_status_allows_agent_task(i.workspace_id, i.status)
+          )
+      )
       AND EXISTS (
           SELECT 1
           FROM agent a
@@ -939,6 +953,16 @@ WHERE id = (
       AND atq.started_at IS NULL
       AND atq.dispatched_at < now() - make_interval(secs => @claim_recovery_secs::double precision)
       AND (atq.prepare_lease_expires_at IS NULL OR atq.prepare_lease_expires_at < now())
+      AND (
+          COALESCE(sqlc.narg('supports_card_session_lease')::bool, true)
+          OR atq.issue_id IS NULL
+          OR NOT EXISTS (
+              SELECT 1
+              FROM issue i
+              WHERE i.id = atq.issue_id
+                AND issue_status_allows_agent_task(i.workspace_id, i.status)
+          )
+      )
       AND EXISTS (
           -- Keep the dispatched-reclaim owner fence intentionally stricter
           -- than the queued claim carve-out below.
@@ -986,6 +1010,16 @@ WHERE id IN (
       AND atq.started_at IS NULL
       AND atq.dispatched_at < now() - make_interval(secs => @claim_recovery_secs::double precision)
       AND (atq.prepare_lease_expires_at IS NULL OR atq.prepare_lease_expires_at < now())
+      AND (
+          COALESCE(sqlc.narg('supports_card_session_lease')::bool, true)
+          OR atq.issue_id IS NULL
+          OR NOT EXISTS (
+              SELECT 1
+              FROM issue i
+              WHERE i.id = atq.issue_id
+                AND issue_status_allows_agent_task(i.workspace_id, i.status)
+          )
+      )
       AND EXISTS (
           -- Keep the dispatched-reclaim owner fence intentionally stricter
           -- than the queued claim carve-out below.
@@ -2442,6 +2476,16 @@ SELECT atq.* FROM agent_task_queue atq
 WHERE atq.runtime_id = $1
   AND atq.status = 'queued'
       AND (atq.context->>'wakeup_id' IS NULL OR EXISTS (SELECT 1 FROM issue_wakeup w WHERE w.id=(atq.context->>'wakeup_id')::uuid AND w.disabled_at IS NULL AND w.revision=(atq.context->>'wakeup_revision')::bigint))
+  AND (
+      COALESCE(sqlc.narg('supports_card_session_lease')::bool, true)
+      OR atq.issue_id IS NULL
+      OR NOT EXISTS (
+          SELECT 1
+          FROM issue i
+          WHERE i.id = atq.issue_id
+            AND issue_status_allows_agent_task(i.workspace_id, i.status)
+      )
+  )
   AND EXISTS (
       -- Keep this authorization fence in sync with ClaimAgentTask.
       SELECT 1
@@ -2567,6 +2611,16 @@ SELECT atq.* FROM agent_task_queue atq
 WHERE atq.runtime_id = ANY(@runtime_ids::uuid[])
   AND atq.status = 'queued'
       AND (atq.context->>'wakeup_id' IS NULL OR EXISTS (SELECT 1 FROM issue_wakeup w WHERE w.id=(atq.context->>'wakeup_id')::uuid AND w.disabled_at IS NULL AND w.revision=(atq.context->>'wakeup_revision')::bigint))
+  AND (
+      COALESCE(sqlc.narg('supports_card_session_lease')::bool, true)
+      OR atq.issue_id IS NULL
+      OR NOT EXISTS (
+          SELECT 1
+          FROM issue i
+          WHERE i.id = atq.issue_id
+            AND issue_status_allows_agent_task(i.workspace_id, i.status)
+      )
+  )
   AND EXISTS (
       -- Keep this authorization fence in sync with ClaimAgentTask.
       SELECT 1

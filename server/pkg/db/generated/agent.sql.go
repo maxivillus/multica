@@ -1744,6 +1744,16 @@ WHERE id = (
       AND atq.runtime_id = $3
       AND atq.status = 'queued'
       AND (atq.context->>'wakeup_id' IS NULL OR EXISTS (SELECT 1 FROM issue_wakeup w WHERE w.id=(atq.context->>'wakeup_id')::uuid AND w.disabled_at IS NULL AND w.revision=(atq.context->>'wakeup_revision')::bigint))
+      AND (
+          COALESCE($4::bool, true)
+          OR atq.issue_id IS NULL
+          OR NOT EXISTS (
+              SELECT 1
+              FROM issue i
+              WHERE i.id = atq.issue_id
+                AND issue_status_allows_agent_task(i.workspace_id, i.status)
+          )
+      )
       AND EXISTS (
           SELECT 1
           FROM agent a
@@ -1761,7 +1771,7 @@ WHERE id = (
             )
             AND r.status = 'online'
             AND COALESCE(r.last_seen_at, r.updated_at) >=
-                now() - make_interval(secs => $4::double precision)
+                now() - make_interval(secs => $5::double precision)
       )
       AND NOT EXISTS (
           SELECT 1 FROM agent_task_queue active
@@ -1788,10 +1798,11 @@ RETURNING id, agent_id, issue_id, status, priority, dispatched_at, started_at, c
 `
 
 type ClaimAgentTaskParams struct {
-	PrepareLeaseSecs float64     `json:"prepare_lease_secs"`
-	AgentID          pgtype.UUID `json:"agent_id"`
-	RuntimeID        pgtype.UUID `json:"runtime_id"`
-	RuntimeStaleSecs float64     `json:"runtime_stale_secs"`
+	PrepareLeaseSecs         float64     `json:"prepare_lease_secs"`
+	AgentID                  pgtype.UUID `json:"agent_id"`
+	RuntimeID                pgtype.UUID `json:"runtime_id"`
+	SupportsCardSessionLease pgtype.Bool `json:"supports_card_session_lease"`
+	RuntimeStaleSecs         float64     `json:"runtime_stale_secs"`
 }
 
 // Claims the next queued task for an agent on one healthy runtime, enforcing
@@ -1804,11 +1815,16 @@ type ClaimAgentTaskParams struct {
 // "any other quick-create-shaped task" (all four FKs NULL) for the same agent —
 // otherwise a user mashing the create button could fire concurrent quick-creates
 // whose completion lookup would race over "most recent issue by this agent".
+// Active issue tasks require the card-session lease capability. Inactive issue
+// tasks (backlog/blocked/cancelled/custom closed) and non-issue tasks remain
+// compatible with older daemons because they do not enter the card-session
+// start path.
 func (q *Queries) ClaimAgentTask(ctx context.Context, arg ClaimAgentTaskParams) (AgentTaskQueue, error) {
 	row := q.db.QueryRow(ctx, claimAgentTask,
 		arg.PrepareLeaseSecs,
 		arg.AgentID,
 		arg.RuntimeID,
+		arg.SupportsCardSessionLease,
 		arg.RuntimeStaleSecs,
 	)
 	var i AgentTaskQueue
@@ -6392,6 +6408,16 @@ SELECT atq.id, atq.agent_id, atq.issue_id, atq.status, atq.priority, atq.dispatc
 WHERE atq.runtime_id = $1
   AND atq.status = 'queued'
       AND (atq.context->>'wakeup_id' IS NULL OR EXISTS (SELECT 1 FROM issue_wakeup w WHERE w.id=(atq.context->>'wakeup_id')::uuid AND w.disabled_at IS NULL AND w.revision=(atq.context->>'wakeup_revision')::bigint))
+  AND (
+      COALESCE($2::bool, true)
+      OR atq.issue_id IS NULL
+      OR NOT EXISTS (
+          SELECT 1
+          FROM issue i
+          WHERE i.id = atq.issue_id
+            AND issue_status_allows_agent_task(i.workspace_id, i.status)
+      )
+  )
   AND EXISTS (
       -- Keep this authorization fence in sync with ClaimAgentTask.
       SELECT 1
@@ -6407,6 +6433,11 @@ WHERE atq.runtime_id = $1
 ORDER BY atq.priority DESC, atq.created_at ASC
 `
 
+type ListQueuedClaimCandidatesByRuntimeParams struct {
+	RuntimeID                pgtype.UUID `json:"runtime_id"`
+	SupportsCardSessionLease pgtype.Bool `json:"supports_card_session_lease"`
+}
+
 // Returns rows the runtime is authorized to attempt to claim. Status is restricted to
 // 'queued' (in contrast to ListPendingTasksByRuntime which also includes
 // 'dispatched') because dispatched rows are by definition already owned
@@ -6415,8 +6446,8 @@ ORDER BY atq.priority DESC, atq.created_at ASC
 // ClaimAgentTask, wasting CPU and a SELECT every poll cycle when the
 // runtime is busy on a long-running task. Backed by the partial index
 // idx_agent_task_queue_claim_candidates so the warm path is cheap.
-func (q *Queries) ListQueuedClaimCandidatesByRuntime(ctx context.Context, runtimeID pgtype.UUID) ([]AgentTaskQueue, error) {
-	rows, err := q.db.Query(ctx, listQueuedClaimCandidatesByRuntime, runtimeID)
+func (q *Queries) ListQueuedClaimCandidatesByRuntime(ctx context.Context, arg ListQueuedClaimCandidatesByRuntimeParams) ([]AgentTaskQueue, error) {
+	rows, err := q.db.Query(ctx, listQueuedClaimCandidatesByRuntime, arg.RuntimeID, arg.SupportsCardSessionLease)
 	if err != nil {
 		return nil, err
 	}
@@ -6501,6 +6532,16 @@ SELECT atq.id, atq.agent_id, atq.issue_id, atq.status, atq.priority, atq.dispatc
 WHERE atq.runtime_id = ANY($1::uuid[])
   AND atq.status = 'queued'
       AND (atq.context->>'wakeup_id' IS NULL OR EXISTS (SELECT 1 FROM issue_wakeup w WHERE w.id=(atq.context->>'wakeup_id')::uuid AND w.disabled_at IS NULL AND w.revision=(atq.context->>'wakeup_revision')::bigint))
+  AND (
+      COALESCE($2::bool, true)
+      OR atq.issue_id IS NULL
+      OR NOT EXISTS (
+          SELECT 1
+          FROM issue i
+          WHERE i.id = atq.issue_id
+            AND issue_status_allows_agent_task(i.workspace_id, i.status)
+      )
+  )
   AND EXISTS (
       -- Keep this authorization fence in sync with ClaimAgentTask.
       SELECT 1
@@ -6516,6 +6557,11 @@ WHERE atq.runtime_id = ANY($1::uuid[])
 ORDER BY atq.priority DESC, atq.created_at ASC
 `
 
+type ListQueuedClaimCandidatesByRuntimesParams struct {
+	RuntimeIds               []pgtype.UUID `json:"runtime_ids"`
+	SupportsCardSessionLease pgtype.Bool   `json:"supports_card_session_lease"`
+}
+
 // Batch variant of ListQueuedClaimCandidatesByRuntime (MUL-4257): returns
 // queued claim candidates across every runtime_id in the input set in ONE round
 // trip, so a daemon can list candidates for all of its runtimes with a single
@@ -6526,8 +6572,8 @@ ORDER BY atq.priority DESC, atq.created_at ASC
 // a sort step (each runtime's slice is index-ordered, but merging several
 // runtimes' rows into one priority/FIFO order is not). The per-machine
 // candidate set is small, so this is cheap in practice.
-func (q *Queries) ListQueuedClaimCandidatesByRuntimes(ctx context.Context, runtimeIds []pgtype.UUID) ([]AgentTaskQueue, error) {
-	rows, err := q.db.Query(ctx, listQueuedClaimCandidatesByRuntimes, runtimeIds)
+func (q *Queries) ListQueuedClaimCandidatesByRuntimes(ctx context.Context, arg ListQueuedClaimCandidatesByRuntimesParams) ([]AgentTaskQueue, error) {
+	rows, err := q.db.Query(ctx, listQueuedClaimCandidatesByRuntimes, arg.RuntimeIds, arg.SupportsCardSessionLease)
 	if err != nil {
 		return nil, err
 	}
@@ -8143,6 +8189,16 @@ WHERE id = (
       AND atq.started_at IS NULL
       AND atq.dispatched_at < now() - make_interval(secs => $3::double precision)
       AND (atq.prepare_lease_expires_at IS NULL OR atq.prepare_lease_expires_at < now())
+      AND (
+          COALESCE($4::bool, true)
+          OR atq.issue_id IS NULL
+          OR NOT EXISTS (
+              SELECT 1
+              FROM issue i
+              WHERE i.id = atq.issue_id
+                AND issue_status_allows_agent_task(i.workspace_id, i.status)
+          )
+      )
       AND EXISTS (
           -- Keep the dispatched-reclaim owner fence intentionally stricter
           -- than the queued claim carve-out below.
@@ -8164,7 +8220,7 @@ WHERE id = (
             )
             AND r.status = 'online'
             AND COALESCE(r.last_seen_at, r.updated_at) >=
-                now() - make_interval(secs => $4::double precision)
+                now() - make_interval(secs => $5::double precision)
       )
     ORDER BY atq.priority DESC, atq.dispatched_at ASC
     LIMIT 1
@@ -8174,10 +8230,11 @@ RETURNING id, agent_id, issue_id, status, priority, dispatched_at, started_at, c
 `
 
 type ReclaimStaleDispatchedTaskForRuntimeParams struct {
-	RuntimeID         pgtype.UUID `json:"runtime_id"`
-	PrepareLeaseSecs  float64     `json:"prepare_lease_secs"`
-	ClaimRecoverySecs float64     `json:"claim_recovery_secs"`
-	RuntimeStaleSecs  float64     `json:"runtime_stale_secs"`
+	RuntimeID                pgtype.UUID `json:"runtime_id"`
+	PrepareLeaseSecs         float64     `json:"prepare_lease_secs"`
+	ClaimRecoverySecs        float64     `json:"claim_recovery_secs"`
+	SupportsCardSessionLease pgtype.Bool `json:"supports_card_session_lease"`
+	RuntimeStaleSecs         float64     `json:"runtime_stale_secs"`
 }
 
 // Re-delivers a task whose previous claim likely succeeded server-side but
@@ -8190,6 +8247,7 @@ func (q *Queries) ReclaimStaleDispatchedTaskForRuntime(ctx context.Context, arg 
 		arg.RuntimeID,
 		arg.PrepareLeaseSecs,
 		arg.ClaimRecoverySecs,
+		arg.SupportsCardSessionLease,
 		arg.RuntimeStaleSecs,
 	)
 	var i AgentTaskQueue
@@ -8269,6 +8327,16 @@ WHERE id IN (
       AND atq.started_at IS NULL
       AND atq.dispatched_at < now() - make_interval(secs => $3::double precision)
       AND (atq.prepare_lease_expires_at IS NULL OR atq.prepare_lease_expires_at < now())
+      AND (
+          COALESCE($4::bool, true)
+          OR atq.issue_id IS NULL
+          OR NOT EXISTS (
+              SELECT 1
+              FROM issue i
+              WHERE i.id = atq.issue_id
+                AND issue_status_allows_agent_task(i.workspace_id, i.status)
+          )
+      )
       AND EXISTS (
           -- Keep the dispatched-reclaim owner fence intentionally stricter
           -- than the queued claim carve-out below.
@@ -8290,21 +8358,22 @@ WHERE id IN (
             )
             AND r.status = 'online'
             AND COALESCE(r.last_seen_at, r.updated_at) >=
-                now() - make_interval(secs => $4::double precision)
+                now() - make_interval(secs => $5::double precision)
       )
     ORDER BY atq.priority DESC, atq.dispatched_at ASC
-    LIMIT $5::int
+    LIMIT $6::int
     FOR UPDATE SKIP LOCKED
 )
 RETURNING id, agent_id, issue_id, status, priority, dispatched_at, started_at, completed_at, result, error, created_at, context, runtime_id, session_id, work_dir, trigger_comment_id, chat_session_id, autopilot_run_id, attempt, max_attempts, parent_task_id, failure_reason, trigger_summary, force_fresh_session, is_leader_task, wait_reason, initiator_user_id, handoff_note, prepare_lease_expires_at, squad_id, runtime_mcp_overlay, escalation_for_task_id, fire_at, originator_user_id, runtime_connected_apps, coalesced_comment_ids, delivered_comment_ids, chat_input_task_id, chat_finalize_deferred_at, originator_source, delegated_from_task_id, retry_of_task_id, rerun_of_task_id, rule_version_id, trigger_evidence_kind, trigger_evidence_ref_id, accountable_user_id, session_rollout_missing, retired_session_id, quick_actions_disabled, regenerate_quick_actions_for, branch_name, durable_work_dir, channel_context_revision, comment_thread_id, cancelled_by_type, cancelled_by_id, cancelled_by_name, issue_snapshot, card_session_id
 `
 
 type ReclaimStaleDispatchedTasksForRuntimesParams struct {
-	PrepareLeaseSecs  float64       `json:"prepare_lease_secs"`
-	RuntimeIds        []pgtype.UUID `json:"runtime_ids"`
-	ClaimRecoverySecs float64       `json:"claim_recovery_secs"`
-	RuntimeStaleSecs  float64       `json:"runtime_stale_secs"`
-	MaxTasks          int32         `json:"max_tasks"`
+	PrepareLeaseSecs         float64       `json:"prepare_lease_secs"`
+	RuntimeIds               []pgtype.UUID `json:"runtime_ids"`
+	ClaimRecoverySecs        float64       `json:"claim_recovery_secs"`
+	SupportsCardSessionLease pgtype.Bool   `json:"supports_card_session_lease"`
+	RuntimeStaleSecs         float64       `json:"runtime_stale_secs"`
+	MaxTasks                 int32         `json:"max_tasks"`
 }
 
 // Batch variant of ReclaimStaleDispatchedTaskForRuntime (MUL-4257): re-delivers
@@ -8319,6 +8388,7 @@ func (q *Queries) ReclaimStaleDispatchedTasksForRuntimes(ctx context.Context, ar
 		arg.PrepareLeaseSecs,
 		arg.RuntimeIds,
 		arg.ClaimRecoverySecs,
+		arg.SupportsCardSessionLease,
 		arg.RuntimeStaleSecs,
 		arg.MaxTasks,
 	)
