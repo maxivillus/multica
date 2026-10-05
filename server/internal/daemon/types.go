@@ -329,8 +329,12 @@ type TaskResult struct {
 	// abandoned as unresumable (GH #6066). Forwarded on every terminal path,
 	// including the completed one: a fresh-session retry that SUCCEEDS is
 	// precisely when the abandoned id would otherwise stay selectable.
-	RetiredSessionID string           `json:"-"`
-	Usage            []TaskUsageEntry `json:"usage,omitempty"` // per-model token usage
+	RetiredSessionID string `json:"-"`
+	// CardSessionLeaseEpoch is the server-issued generation held for this
+	// task. It is copied into the terminal callback and is never exposed in the
+	// task result JSON sent to an agent.
+	CardSessionLeaseEpoch int64            `json:"-"`
+	Usage                 []TaskUsageEntry `json:"usage,omitempty"` // per-model token usage
 }
 
 // PluginHookTool is one agent-trigger plugin hook, as the agent will see it.

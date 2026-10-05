@@ -166,6 +166,116 @@ func TestTerminalTaskPersistsCardSessionProviderState(t *testing.T) {
 	}
 }
 
+func TestTerminalTaskFencesStaleCardSessionProviderState(t *testing.T) {
+	if testHandler == nil || testPool == nil {
+		t.Skip("database not available")
+	}
+
+	ctx := context.Background()
+	_, runtimeID, agentID, _, issueID := createCardSessionCapacityFixture(t, ctx)
+	issue, err := testHandler.Queries.GetIssue(ctx, util.MustParseUUID(issueID))
+	if err != nil {
+		t.Fatalf("load issue: %v", err)
+	}
+	agent, err := testHandler.Queries.GetAgent(ctx, util.MustParseUUID(agentID))
+	if err != nil {
+		t.Fatalf("load agent: %v", err)
+	}
+	if _, err := testHandler.TaskService.EnsureCardSession(ctx, issue.ID, issue.WorkspaceID, agent.ID, agent.RuntimeMode); err != nil {
+		t.Fatalf("open card session: %v", err)
+	}
+
+	var staleTaskID pgtype.UUID
+	if err := testPool.QueryRow(ctx, `
+		INSERT INTO agent_task_queue (
+			agent_id, runtime_id, issue_id, status, priority, started_at
+		)
+		VALUES ($1, $2, $3, 'dispatched', 0, now())
+		RETURNING id`, agentID, runtimeID, issueID).Scan(&staleTaskID); err != nil {
+		t.Fatalf("insert stale task: %v", err)
+	}
+	t.Cleanup(func() {
+		_, _ = testPool.Exec(context.Background(), `DELETE FROM agent_task_queue WHERE id = $1`, staleTaskID)
+	})
+
+	started, err := testHandler.TaskService.StartTaskWithCardSessionLease(ctx, staleTaskID, "daemon-a")
+	if err != nil {
+		t.Fatalf("start stale task: %v", err)
+	}
+	lease, err := testHandler.Queries.GetCardSession(ctx, started.CardSessionID)
+	if err != nil {
+		t.Fatalf("load initial lease: %v", err)
+	}
+	if lease.LeaseEpoch <= 0 || !lease.LeaseOwner.Valid || lease.LeaseOwner.String != "daemon-a" {
+		t.Fatalf("initial lease = owner=%q valid=%t epoch=%d, want daemon-a and positive epoch", lease.LeaseOwner.String, lease.LeaseOwner.Valid, lease.LeaseEpoch)
+	}
+
+	const replacementProvider = "provider-replacement"
+	const replacementWorkDir = "/work/replacement"
+	if _, err := testPool.Exec(ctx, `
+		UPDATE card_session
+		SET lease_owner = 'daemon-b', lease_epoch = lease_epoch + 1,
+			provider_session_id = $2, work_dir = $3
+		WHERE id = $1`, started.CardSessionID, replacementProvider, replacementWorkDir); err != nil {
+		t.Fatalf("take over card session lease: %v", err)
+	}
+
+	var providerSessionID, workDir string
+	var activityBefore time.Time
+	if err := testPool.QueryRow(ctx, `SELECT provider_session_id, work_dir, last_activity_at FROM card_session WHERE id = $1`, started.CardSessionID).Scan(&providerSessionID, &workDir, &activityBefore); err != nil {
+		t.Fatalf("read replacement provider state: %v", err)
+	}
+
+	if _, _, err := testHandler.TaskService.CompleteTaskWithTransitionFenced(
+		ctx, staleTaskID, []byte(`{"output":"stale"}`),
+		"provider-stale", "/work/stale", "", false, "", "", "daemon-a", lease.LeaseEpoch,
+	); err != nil {
+		t.Fatalf("complete stale task: %v", err)
+	}
+
+	var activityAfter time.Time
+	if err := testPool.QueryRow(ctx, `SELECT provider_session_id, work_dir, last_activity_at FROM card_session WHERE id = $1`, started.CardSessionID).Scan(&providerSessionID, &workDir, &activityAfter); err != nil {
+		t.Fatalf("read stale provider state: %v", err)
+	}
+	if providerSessionID != replacementProvider || workDir != replacementWorkDir {
+		t.Fatalf("stale terminal callback changed provider state to (%q, %q), want replacement values", providerSessionID, workDir)
+	}
+	if !activityAfter.Equal(activityBefore) {
+		t.Fatalf("stale terminal callback changed last_activity_at from %v to %v", activityBefore, activityAfter)
+	}
+
+	var currentTaskID pgtype.UUID
+	if err := testPool.QueryRow(ctx, `
+		INSERT INTO agent_task_queue (
+			agent_id, runtime_id, issue_id, card_session_id, status, priority, started_at
+		)
+		VALUES ($1, $2, $3, $4, 'running', 0, now())
+		RETURNING id`, agentID, runtimeID, issueID, started.CardSessionID).Scan(&currentTaskID); err != nil {
+		t.Fatalf("insert current task: %v", err)
+	}
+	t.Cleanup(func() {
+		_, _ = testPool.Exec(context.Background(), `DELETE FROM agent_task_queue WHERE id = $1`, currentTaskID)
+	})
+
+	current, err := testHandler.Queries.GetCardSession(ctx, started.CardSessionID)
+	if err != nil {
+		t.Fatalf("reload replacement lease: %v", err)
+	}
+	if _, _, err := testHandler.TaskService.CompleteTaskWithTransitionFenced(
+		ctx, currentTaskID, []byte(`{"output":"current"}`),
+		"provider-current", "/work/current", "", false, "", "", "daemon-b", current.LeaseEpoch,
+	); err != nil {
+		t.Fatalf("complete current task: %v", err)
+	}
+
+	if err := testPool.QueryRow(ctx, `SELECT provider_session_id, work_dir FROM card_session WHERE id = $1`, started.CardSessionID).Scan(&providerSessionID, &workDir); err != nil {
+		t.Fatalf("read current provider state: %v", err)
+	}
+	if providerSessionID != "provider-current" || workDir != "/work/current" {
+		t.Fatalf("current terminal callback provider state = (%q, %q), want current values", providerSessionID, workDir)
+	}
+}
+
 func TestCancelledIssueCancelsOnlyItsTasksAfterRequestDisconnect(t *testing.T) {
 	if testHandler == nil || testPool == nil {
 		t.Skip("database not available")

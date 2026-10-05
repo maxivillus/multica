@@ -4783,6 +4783,14 @@ func (s *TaskService) CompleteTask(ctx context.Context, taskID pgtype.UUID, resu
 // must only run them when transitioned is true; a replay against an already
 // terminal task is still an idempotent success but must not emit them again.
 func (s *TaskService) CompleteTaskWithTransition(ctx context.Context, taskID pgtype.UUID, result []byte, sessionID, workDir, branchName string, sessionRolloutMissing bool, retiredSessionID, durableWorkDir string) (*db.AgentTaskQueue, bool, error) {
+	return s.CompleteTaskWithTransitionFenced(ctx, taskID, result, sessionID, workDir, branchName, sessionRolloutMissing, retiredSessionID, durableWorkDir, "", 0)
+}
+
+// CompleteTaskWithTransitionFenced is the daemon terminal path. Card-session
+// provider-state finalization is fenced by the server-derived lease owner and
+// the lease epoch reported by the daemon. Non-card tasks keep the same
+// behavior because their finalizer query has no card-session row to update.
+func (s *TaskService) CompleteTaskWithTransitionFenced(ctx context.Context, taskID pgtype.UUID, result []byte, sessionID, workDir, branchName string, sessionRolloutMissing bool, retiredSessionID, durableWorkDir, leaseOwner string, leaseEpoch int64) (*db.AgentTaskQueue, bool, error) {
 	var task db.AgentTaskQueue
 	// chatAssistantMsg is the single assistant outcome row written for a chat
 	// task inside the completion transaction below. It is broadcast (chat:done)
@@ -4820,6 +4828,8 @@ func (s *TaskService) CompleteTaskWithTransition(ctx context.Context, taskID pgt
 			TaskID:            t.ID,
 			ProviderSessionID: sessionID,
 			WorkDir:           workDir,
+			LeaseOwner:        leaseOwner,
+			LeaseEpoch:        leaseEpoch,
 		}); err != nil {
 			return fmt.Errorf("finalize card session provider state: %w", err)
 		}
@@ -5220,6 +5230,13 @@ func (s *TaskService) FailTask(ctx context.Context, taskID pgtype.UUID, errMsg, 
 // CompleteTaskWithTransition. The bool is false for an idempotent replay that
 // observed an already-terminal row.
 func (s *TaskService) FailTaskWithTransition(ctx context.Context, taskID pgtype.UUID, errMsg, sessionID, workDir, branchName, failureReason string, sessionRolloutMissing bool, retiredSessionID, durableWorkDir string) (*db.AgentTaskQueue, bool, error) {
+	return s.FailTaskWithTransitionFenced(ctx, taskID, errMsg, sessionID, workDir, branchName, failureReason, sessionRolloutMissing, retiredSessionID, durableWorkDir, "", 0)
+}
+
+// FailTaskWithTransitionFenced is the daemon terminal failure path. It uses
+// the same server-derived owner and lease epoch fence as completion so a
+// stale failure cannot overwrite the replacement provider pointer.
+func (s *TaskService) FailTaskWithTransitionFenced(ctx context.Context, taskID pgtype.UUID, errMsg, sessionID, workDir, branchName, failureReason string, sessionRolloutMissing bool, retiredSessionID, durableWorkDir, leaseOwner string, leaseEpoch int64) (*db.AgentTaskQueue, bool, error) {
 	// Strip bytes PostgreSQL cannot store before anything else reads errMsg, so
 	// the classifier, the transaction and every downstream consumer see the one
 	// text we will actually persist (GH #7098). Kept at the service boundary
@@ -5327,6 +5344,8 @@ func (s *TaskService) FailTaskWithTransition(ctx context.Context, taskID pgtype.
 			TaskID:            t.ID,
 			ProviderSessionID: sessionID,
 			WorkDir:           workDir,
+			LeaseOwner:        leaseOwner,
+			LeaseEpoch:        leaseEpoch,
 		}); err != nil {
 			return fmt.Errorf("finalize card session provider state: %w", err)
 		}

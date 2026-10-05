@@ -319,12 +319,28 @@ WHERE t.id = $3
   AND t.card_session_id = cs.id
   AND cs.state <> 'closed'
   AND t.status IN ('completed', 'failed', 'cancelled')
+  AND (
+      (
+          $4::bigint > 0
+          AND cs.lease_epoch = $4::bigint
+          AND (
+              cs.lease_owner IS NULL
+              OR cs.lease_owner = NULLIF($5::text, '')
+          )
+      )
+      OR (
+          $4::bigint <= 0
+          AND NULLIF($5::text, '') IS NULL
+      )
+  )
 `
 
 type FinalizeCardSessionProviderStateByTaskParams struct {
 	ProviderSessionID interface{} `json:"provider_session_id"`
 	WorkDir           interface{} `json:"work_dir"`
 	TaskID            pgtype.UUID `json:"task_id"`
+	LeaseEpoch        int64       `json:"lease_epoch"`
+	LeaseOwner        string      `json:"lease_owner"`
 }
 
 // The provider can reveal its session only in the terminal result. Persist
@@ -332,8 +348,21 @@ type FinalizeCardSessionProviderStateByTaskParams struct {
 // comment cannot claim the card between completion and the asynchronous pin.
 // Empty values intentionally preserve the last known pointer: a provider
 // turn may finish without repeating its stable session id.
+// Card-session terminal callbacks carry the server-issued lease epoch. A
+// callback from a previous owner/generation must not overwrite the pointer
+// selected by the replacement host. The NULL-owner branch is intentional:
+// the short resume path releases its lease before the terminal HTTP callback,
+// while the epoch still fences a takeover. Empty owner/epoch is retained only
+// for internal service callers that do not cross the daemon boundary; the
+// daemon handler supplies both proofs for card-session callbacks.
 func (q *Queries) FinalizeCardSessionProviderStateByTask(ctx context.Context, arg FinalizeCardSessionProviderStateByTaskParams) error {
-	_, err := q.db.Exec(ctx, finalizeCardSessionProviderStateByTask, arg.ProviderSessionID, arg.WorkDir, arg.TaskID)
+	_, err := q.db.Exec(ctx, finalizeCardSessionProviderStateByTask,
+		arg.ProviderSessionID,
+		arg.WorkDir,
+		arg.TaskID,
+		arg.LeaseEpoch,
+		arg.LeaseOwner,
+	)
 	return err
 }
 

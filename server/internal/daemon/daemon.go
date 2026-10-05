@@ -245,6 +245,9 @@ type terminalTaskReport struct {
 	// run on the issue or chat can select it again, however many clean rows
 	// still reference it.
 	retiredSessionID string
+	// cardSessionLeaseEpoch is the server-issued generation held by this task.
+	// It fences terminal provider-state writes after a host takeover.
+	cardSessionLeaseEpoch int64
 }
 
 type terminalReportSendFunc func(context.Context, terminalTaskReport, []time.Duration) error
@@ -5922,13 +5925,14 @@ func (d *Daemon) handleTask(ctx context.Context, task Task, slot int) {
 		// shape of the failure (provider 5xx, network, process crash,
 		// …) rather than the coarse legacy "agent_error" bucket.
 		if failErr := d.reportTerminalTask(ctx, terminalTaskReport{
-			kind:           terminalTaskReportFail,
-			taskID:         task.ID,
-			errorMessage:   err.Error(),
-			branchName:     result.BranchName,
-			workDir:        result.WorkDir,
-			durableWorkDir: result.DurableWorkDir,
-			failureReason:  taskRunFailureReason(err),
+			kind:                  terminalTaskReportFail,
+			taskID:                task.ID,
+			errorMessage:          err.Error(),
+			branchName:            result.BranchName,
+			workDir:               result.WorkDir,
+			durableWorkDir:        result.DurableWorkDir,
+			cardSessionLeaseEpoch: result.CardSessionLeaseEpoch,
+			failureReason:         taskRunFailureReason(err),
 		}); failErr != nil {
 			taskLog.Error("fail task callback failed", "error", failErr)
 		}
@@ -6288,6 +6292,7 @@ func (d *Daemon) reportTaskResult(ctx context.Context, taskID string, result Tas
 			sessionID:             result.SessionID,
 			workDir:               result.WorkDir,
 			durableWorkDir:        result.DurableWorkDir,
+			cardSessionLeaseEpoch: result.CardSessionLeaseEpoch,
 			sessionRolloutMissing: result.SessionRolloutMissing,
 			retiredSessionID:      result.RetiredSessionID,
 		})
@@ -6320,12 +6325,13 @@ func (d *Daemon) reportTaskResult(ctx context.Context, taskID string, result Tas
 		}
 		taskLog.Info("task did not complete, reporting failure", "status", result.Status, "failure_reason", failureReason)
 		if err := d.reportTerminalTask(ctx, terminalTaskReport{
-			kind:           terminalTaskReportFail,
-			taskID:         taskID,
-			errorMessage:   result.Comment,
-			sessionID:      result.SessionID,
-			workDir:        result.WorkDir,
-			durableWorkDir: result.DurableWorkDir,
+			kind:                  terminalTaskReportFail,
+			taskID:                taskID,
+			errorMessage:          result.Comment,
+			sessionID:             result.SessionID,
+			workDir:               result.WorkDir,
+			durableWorkDir:        result.DurableWorkDir,
+			cardSessionLeaseEpoch: result.CardSessionLeaseEpoch,
 			// Worktree mode commits the agent's leftovers before tearing the
 			// worktree down, so a failed run routinely still has a branch. This
 			// is the case where the user most needs it: the task went wrong and
@@ -6433,9 +6439,9 @@ func (d *Daemon) sendTerminalTaskReport(ctx context.Context, report terminalTask
 	}
 	switch report.kind {
 	case terminalTaskReportComplete:
-		return d.client.completeTaskWithRetrySchedule(ctx, report.taskID, report.output, report.branchName, report.sessionID, report.workDir, report.sessionRolloutMissing, report.retiredSessionID, report.durableWorkDir, schedule)
+		return d.client.completeTaskWithLeaseRetrySchedule(ctx, report.taskID, report.output, report.branchName, report.sessionID, report.workDir, report.sessionRolloutMissing, report.retiredSessionID, report.durableWorkDir, report.cardSessionLeaseEpoch, schedule)
 	case terminalTaskReportFail:
-		return d.client.failTaskWithRetrySchedule(ctx, report.taskID, report.errorMessage, report.sessionID, report.workDir, report.branchName, report.failureReason, report.sessionRolloutMissing, report.retiredSessionID, report.durableWorkDir, schedule)
+		return d.client.failTaskWithLeaseRetrySchedule(ctx, report.taskID, report.errorMessage, report.sessionID, report.workDir, report.branchName, report.failureReason, report.sessionRolloutMissing, report.retiredSessionID, report.durableWorkDir, report.cardSessionLeaseEpoch, schedule)
 	default:
 		return fmt.Errorf("unsupported terminal task report kind %d", report.kind)
 	}
@@ -8486,6 +8492,11 @@ func (d *Daemon) runTask(ctx context.Context, task Task, provider string, slot i
 		stopPrepareLease()
 		return TaskResult{}, fmt.Errorf("start task failed: %w", err)
 	}
+	// Keep the server-issued generation on every terminal return after the
+	// start acknowledgement, including provider/setup failures. The terminal
+	// callback carries this proof so a takeover cannot be overwritten by a
+	// stale daemon.
+	defer func() { taskResult.CardSessionLeaseEpoch = cardSessionLease.LeaseEpoch }()
 	// The claim is created before the server binds an issue task to its card
 	// session generation. Therefore task.CardSessionID is normally empty here;
 	// the start response is the authoritative binding for this turn.

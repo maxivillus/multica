@@ -4354,6 +4354,10 @@ type TaskCompleteRequest struct {
 	Output    string `json:"output"`
 	SessionID string `json:"session_id"` // Claude session ID for future resumption
 	WorkDir   string `json:"work_dir"`   // working directory used during execution
+	// CardSessionLeaseEpoch is the server-issued generation the daemon held
+	// while running this task. Terminal provider-state writes require it for
+	// card-session tasks so a stale host cannot overwrite a newer turn.
+	CardSessionLeaseEpoch int64 `json:"card_session_lease_epoch,omitempty"`
 	// DurableWorkDir is the configured project directory that replaces a
 	// disposable task worktree after the daemon confirms the worktree is gone.
 	DurableWorkDir string `json:"durable_work_dir,omitempty"`
@@ -4403,9 +4407,19 @@ func (h *Handler) CompleteTask(w http.ResponseWriter, r *http.Request) {
 	taskID := chi.URLParam(r, "taskId")
 
 	// Verify the caller owns this task's workspace.
-	_, workspaceID, ok := h.requireDaemonTaskAccessWithWorkspace(w, r, taskID)
+	accessTask, workspaceID, ok := h.requireDaemonTaskAccessWithWorkspace(w, r, taskID)
 	if !ok {
 		return
+	}
+	leaseOwner := ""
+	if accessTask.CardSessionID.Valid {
+		var err error
+		leaseOwner, err = h.daemonLeaseOwnerForTask(r.Context(), accessTask)
+		if err != nil {
+			slog.Warn("resolve card-session lease owner for complete failed", "task_id", taskID, "error", err)
+			writeError(w, http.StatusInternalServerError, "failed to load task runtime")
+			return
+		}
 	}
 
 	var req TaskCompleteRequest
@@ -4422,6 +4436,10 @@ func (h *Handler) CompleteTask(w http.ResponseWriter, r *http.Request) {
 	// re-route below feeds req.Output into the failure classifier, and that
 	// classifier must see exactly the text we are going to persist.
 	sanitizeTaskCompleteRequest(&req)
+	if accessTask.CardSessionID.Valid && (leaseOwner == "" || req.CardSessionLeaseEpoch <= 0) {
+		writeError(w, http.StatusConflict, "card-session lease proof required")
+		return
+	}
 
 	// GH #6402: a daemon whose backend does not (yet) read the provider's
 	// structured terminal reason reports a context-exhausted run as a clean
@@ -4439,7 +4457,7 @@ func (h *Handler) CompleteTask(w http.ResponseWriter, r *http.Request) {
 			"task_id", taskID,
 			"failure_reason", taskfailure.ReasonAgentContextOverflow,
 		)
-		h.failTask(w, r, taskID, workspaceID, TaskFailRequest{
+		h.failTask(w, r, taskID, workspaceID, leaseOwner, TaskFailRequest{
 			Error:          req.Output,
 			FailureReason:  string(taskfailure.ReasonAgentContextOverflow),
 			SessionID:      req.SessionID,
@@ -4451,6 +4469,7 @@ func (h *Handler) CompleteTask(w http.ResponseWriter, r *http.Request) {
 			BranchName:            req.BranchName,
 			SessionRolloutMissing: req.SessionRolloutMissing,
 			RetiredSessionID:      req.RetiredSessionID,
+			CardSessionLeaseEpoch: req.CardSessionLeaseEpoch,
 		})
 		return
 	}
@@ -4460,7 +4479,7 @@ func (h *Handler) CompleteTask(w http.ResponseWriter, r *http.Request) {
 	// transaction (force session_id NULL + flag the row), so an auto-retry the
 	// same commit creates and wakes can never observe the withheld pointer or a
 	// missing continuity-gap flag.
-	task, transitioned, err := h.TaskService.CompleteTaskWithTransition(r.Context(), parseUUID(taskID), result, req.SessionID, req.WorkDir, req.BranchName, req.SessionRolloutMissing, req.RetiredSessionID, req.DurableWorkDir)
+	task, transitioned, err := h.TaskService.CompleteTaskWithTransitionFenced(r.Context(), parseUUID(taskID), result, req.SessionID, req.WorkDir, req.BranchName, req.SessionRolloutMissing, req.RetiredSessionID, req.DurableWorkDir, leaseOwner, req.CardSessionLeaseEpoch)
 	if err != nil {
 		// A CompleteTask error is an infrastructure failure (transaction /
 		// assistant-outcome write), not a bad request: an already-finalized
@@ -5121,11 +5140,15 @@ func (h *Handler) GetTaskStatus(w http.ResponseWriter, r *http.Request) {
 
 // FailTask marks a running task as failed.
 type TaskFailRequest struct {
-	Error          string `json:"error"`
-	SessionID      string `json:"session_id,omitempty"`
-	WorkDir        string `json:"work_dir,omitempty"`
-	DurableWorkDir string `json:"durable_work_dir,omitempty"`
-	FailureReason  string `json:"failure_reason,omitempty"`
+	Error     string `json:"error"`
+	SessionID string `json:"session_id,omitempty"`
+	WorkDir   string `json:"work_dir,omitempty"`
+	// CardSessionLeaseEpoch is the server-issued generation the daemon held
+	// while running this task. Terminal provider-state writes require it for
+	// card-session tasks so a stale host cannot overwrite a newer turn.
+	CardSessionLeaseEpoch int64  `json:"card_session_lease_epoch,omitempty"`
+	DurableWorkDir        string `json:"durable_work_dir,omitempty"`
+	FailureReason         string `json:"failure_reason,omitempty"`
 	// BranchName: a failed run can still have produced a branch — worktree mode
 	// commits whatever the agent left before tearing the worktree down. Report
 	// it so a partially-successful run is still findable.
@@ -5145,9 +5168,19 @@ func (h *Handler) FailTask(w http.ResponseWriter, r *http.Request) {
 	taskID := chi.URLParam(r, "taskId")
 
 	// Verify the caller owns this task's workspace.
-	_, workspaceID, ok := h.requireDaemonTaskAccessWithWorkspace(w, r, taskID)
+	accessTask, workspaceID, ok := h.requireDaemonTaskAccessWithWorkspace(w, r, taskID)
 	if !ok {
 		return
+	}
+	leaseOwner := ""
+	if accessTask.CardSessionID.Valid {
+		var err error
+		leaseOwner, err = h.daemonLeaseOwnerForTask(r.Context(), accessTask)
+		if err != nil {
+			slog.Warn("resolve card-session lease owner for fail failed", "task_id", taskID, "error", err)
+			writeError(w, http.StatusInternalServerError, "failed to load task runtime")
+			return
+		}
 	}
 
 	var req TaskFailRequest
@@ -5159,8 +5192,12 @@ func (h *Handler) FailTask(w http.ResponseWriter, r *http.Request) {
 	// here lands in a TEXT column too and a NUL in any one of them fails the
 	// same transaction (GH #7098).
 	sanitizeTaskFailRequest(&req)
+	if accessTask.CardSessionID.Valid && (leaseOwner == "" || req.CardSessionLeaseEpoch <= 0) {
+		writeError(w, http.StatusConflict, "card-session lease proof required")
+		return
+	}
 
-	h.failTask(w, r, taskID, workspaceID, req)
+	h.failTask(w, r, taskID, workspaceID, leaseOwner, req)
 }
 
 // failTask records a terminal failure and writes the response. Shared by the
@@ -5168,13 +5205,13 @@ func (h *Handler) FailTask(w http.ResponseWriter, r *http.Request) {
 // run re-classified at the /complete boundary lands through exactly the same
 // transaction, token revocation and runtime wake-up as one the daemon reported
 // as failed itself.
-func (h *Handler) failTask(w http.ResponseWriter, r *http.Request, taskID, workspaceID string, req TaskFailRequest) {
+func (h *Handler) failTask(w http.ResponseWriter, r *http.Request, taskID, workspaceID, leaseOwner string, req TaskFailRequest) {
 	// MUL-5305: SessionRolloutMissing is applied inside FailTask's terminal
 	// transaction — forcing session_id NULL (overriding the COALESCE that would
 	// keep a stale mid-flight pin) and flagging the row in the same commit that
 	// creates and wakes the auto-retry, so the retry can never claim the withheld
 	// pointer or miss the continuity gap.
-	task, transitioned, err := h.TaskService.FailTaskWithTransition(r.Context(), parseUUID(taskID), req.Error, req.SessionID, req.WorkDir, req.BranchName, req.FailureReason, req.SessionRolloutMissing, req.RetiredSessionID, req.DurableWorkDir)
+	task, transitioned, err := h.TaskService.FailTaskWithTransitionFenced(r.Context(), parseUUID(taskID), req.Error, req.SessionID, req.WorkDir, req.BranchName, req.FailureReason, req.SessionRolloutMissing, req.RetiredSessionID, req.DurableWorkDir, leaseOwner, req.CardSessionLeaseEpoch)
 	if err != nil {
 		// A FailTask error is an infrastructure failure (the terminal
 		// transaction that also clears the withheld session, writes the

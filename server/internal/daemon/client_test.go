@@ -647,3 +647,47 @@ func TestTerminalReportsCarryDurableWorkDir(t *testing.T) {
 		})
 	}
 }
+
+func TestTerminalReportsCarryCardSessionLeaseEpoch(t *testing.T) {
+	for _, tc := range []struct {
+		name string
+		call func(*Client) error
+		path string
+	}{
+		{
+			name: "complete",
+			path: "/api/daemon/tasks/task-1/complete",
+			call: func(c *Client) error {
+				return c.completeTaskWithLeaseRetrySchedule(context.Background(), "task-1", "done", "", "", "/tmp/wd", false, "", "", 7, nil)
+			},
+		},
+		{
+			name: "fail",
+			path: "/api/daemon/tasks/task-1/fail",
+			call: func(c *Client) error {
+				return c.failTaskWithLeaseRetrySchedule(context.Background(), "task-1", "boom", "", "/tmp/wd", "", "agent_error", false, "", "", 7, nil)
+			},
+		},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			var body map[string]any
+			srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				if r.URL.Path != tc.path {
+					t.Errorf("path = %q, want %q", r.URL.Path, tc.path)
+				}
+				if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
+					t.Errorf("decode terminal body: %v", err)
+				}
+				w.WriteHeader(http.StatusOK)
+			}))
+			defer srv.Close()
+
+			if err := tc.call(NewClient(srv.URL)); err != nil {
+				t.Fatalf("terminal report: %v", err)
+			}
+			if got := body["card_session_lease_epoch"]; got != float64(7) {
+				t.Fatalf("card_session_lease_epoch = %v, want 7 (body: %v)", got, body)
+			}
+		})
+	}
+}

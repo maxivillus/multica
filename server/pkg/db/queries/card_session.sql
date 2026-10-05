@@ -318,6 +318,13 @@ RETURNING cs.*;
 -- comment cannot claim the card between completion and the asynchronous pin.
 -- Empty values intentionally preserve the last known pointer: a provider
 -- turn may finish without repeating its stable session id.
+-- Card-session terminal callbacks carry the server-issued lease epoch. A
+-- callback from a previous owner/generation must not overwrite the pointer
+-- selected by the replacement host. The NULL-owner branch is intentional:
+-- the short resume path releases its lease before the terminal HTTP callback,
+-- while the epoch still fences a takeover. Empty owner/epoch is retained only
+-- for internal service callers that do not cross the daemon boundary; the
+-- daemon handler supplies both proofs for card-session callbacks.
 UPDATE card_session AS cs
 SET provider_session_id = COALESCE(NULLIF(sqlc.arg(provider_session_id), ''), cs.provider_session_id),
     work_dir = COALESCE(NULLIF(sqlc.arg(work_dir), ''), cs.work_dir),
@@ -327,7 +334,21 @@ FROM agent_task_queue AS t
 WHERE t.id = sqlc.arg(task_id)
   AND t.card_session_id = cs.id
   AND cs.state <> 'closed'
-  AND t.status IN ('completed', 'failed', 'cancelled');
+  AND t.status IN ('completed', 'failed', 'cancelled')
+  AND (
+      (
+          sqlc.arg(lease_epoch)::bigint > 0
+          AND cs.lease_epoch = sqlc.arg(lease_epoch)::bigint
+          AND (
+              cs.lease_owner IS NULL
+              OR cs.lease_owner = NULLIF(sqlc.arg(lease_owner)::text, '')
+          )
+      )
+      OR (
+          sqlc.arg(lease_epoch)::bigint <= 0
+          AND NULLIF(sqlc.arg(lease_owner)::text, '') IS NULL
+      )
+  );
 
 -- name: TouchCardSessionsForTasks :exec
 -- Provider usage and committed task transitions advance activity after their
