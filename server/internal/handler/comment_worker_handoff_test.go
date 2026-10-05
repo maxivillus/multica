@@ -20,7 +20,7 @@ func claimWorkerReplyRun(t *testing.T, runtimeID string) *AgentTaskResponse {
 	t.Helper()
 	req := newDaemonTokenRequest(http.MethodPost, "/api/daemon/runtimes/"+runtimeID+"/tasks/claim", nil, testWorkspaceID, "worker-reply-handoff")
 	req = withURLParam(req, "runtimeId", runtimeID)
-	req.Header.Set("X-Client-Capabilities", protocol.DaemonCapabilityCoalescedCommentsV1)
+	req.Header.Set("X-Client-Capabilities", protocol.DaemonCapabilityCardSessionLeaseV1+","+protocol.DaemonCapabilityCoalescedCommentsV1)
 	var response struct {
 		Task *AgentTaskResponse `json:"task"`
 	}
@@ -30,7 +30,19 @@ func claimWorkerReplyRun(t *testing.T, runtimeID string) *AgentTaskResponse {
 
 func completeWorkerReplyRun(t *testing.T, taskID string) {
 	t.Helper()
-	req := newDaemonTokenRequest(http.MethodPost, "/api/daemon/tasks/"+taskID+"/complete", map[string]any{"output": "Processed the inputs delivered to this run"}, testWorkspaceID, "worker-reply-handoff")
+	ctx := context.Background()
+	task, err := testHandler.Queries.GetAgentTask(ctx, parseUUID(taskID))
+	if err != nil {
+		t.Fatalf("load worker reply task: %v", err)
+	}
+	lease, err := testHandler.Queries.GetCardSession(ctx, task.CardSessionID)
+	if err != nil {
+		t.Fatalf("load worker reply lease: %v", err)
+	}
+	req := newDaemonTokenRequest(http.MethodPost, "/api/daemon/tasks/"+taskID+"/complete", map[string]any{
+		"output":                   "Processed the inputs delivered to this run",
+		"card_session_lease_epoch": lease.LeaseEpoch,
+	}, testWorkspaceID, "worker-reply-handoff")
 	req = withURLParam(req, "taskId", taskID)
 	testutil.Call(t, testHandler.CompleteTask, req).Want(http.StatusOK)
 }
@@ -91,7 +103,7 @@ func TestWorkerReplyDelivery(t *testing.T) {
 					}
 				}
 				if state == "running" {
-					if _, err := testHandler.TaskService.StartTaskWithCardSessionLease(ctx, parseUUID(leaderTaskID), "test-daemon"); err != nil {
+					if _, err := testHandler.TaskService.StartTaskWithCardSessionLease(ctx, parseUUID(leaderTaskID), "worker-reply-handoff"); err != nil {
 						t.Fatal(err)
 					}
 				}
@@ -124,7 +136,7 @@ func TestWorkerReplyDelivery(t *testing.T) {
 					t.Fatal("an earlier claim cannot have delivered a later comment")
 				}
 				if state != "running" {
-					if _, err := testHandler.TaskService.StartTaskWithCardSessionLease(ctx, parseUUID(leaderTaskID), "test-daemon"); err != nil {
+					if _, err := testHandler.TaskService.StartTaskWithCardSessionLease(ctx, parseUUID(leaderTaskID), "worker-reply-handoff"); err != nil {
 						t.Fatal(err)
 					}
 				}
@@ -152,7 +164,7 @@ func TestWorkerReplyDelivery(t *testing.T) {
 				if successor.SquadID != parseUUID(squadID) || successor.OriginatorUserID != parseUUID(testUserID) || successor.AccountableUserID != parseUUID(testUserID) || successor.DelegatedFromTaskID != parseUUID(workerTaskID) {
 					t.Fatal("worker follow-up lost squad or human delegation provenance")
 				}
-				if _, err := testHandler.TaskService.StartTaskWithCardSessionLease(ctx, parseUUID(next.ID), "test-daemon"); err != nil {
+				if _, err := testHandler.TaskService.StartTaskWithCardSessionLease(ctx, parseUUID(next.ID), "worker-reply-handoff"); err != nil {
 					t.Fatal(err)
 				}
 				completeWorkerReplyRun(t, next.ID)
@@ -226,7 +238,7 @@ func TestWorkerReplyReconcileBoundaries(t *testing.T) {
 				}
 				if mode == "completed_before_registration" {
 					registration.before = func() {
-						if _, err := testHandler.TaskService.StartTaskWithCardSessionLease(ctx, parseUUID(taskID), "test-daemon"); err != nil {
+						if _, err := testHandler.TaskService.StartTaskWithCardSessionLease(ctx, parseUUID(taskID), "worker-reply-handoff"); err != nil {
 							t.Fatal(err)
 						}
 						completeWorkerReplyRun(t, taskID)
@@ -266,7 +278,7 @@ func TestWorkerReplyReconcileBoundaries(t *testing.T) {
 				dbfx.Exec(t, `UPDATE issue SET assignee_type = 'agent', assignee_id = $2 WHERE id = $1`, issueID, workerID)
 			}
 			if mode != "completed_before_registration" {
-				if _, err := testHandler.TaskService.StartTaskWithCardSessionLease(ctx, parseUUID(taskID), "test-daemon"); err != nil {
+				if _, err := testHandler.TaskService.StartTaskWithCardSessionLease(ctx, parseUUID(taskID), "worker-reply-handoff"); err != nil {
 					t.Fatal(err)
 				}
 				completeWorkerReplyRun(t, taskID)
@@ -285,7 +297,7 @@ func TestWorkerReplyReconcileBoundaries(t *testing.T) {
 			if next == nil || !slices.Contains(next.DeliveredCommentIDs, replyID) {
 				t.Fatal("accepted reply was not delivered")
 			}
-			if _, err := testHandler.TaskService.StartTaskWithCardSessionLease(ctx, parseUUID(next.ID), "test-daemon"); err != nil {
+			if _, err := testHandler.TaskService.StartTaskWithCardSessionLease(ctx, parseUUID(next.ID), "worker-reply-handoff"); err != nil {
 				t.Fatal(err)
 			}
 			completeWorkerReplyRun(t, next.ID)

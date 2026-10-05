@@ -232,8 +232,8 @@ func TestTerminalTaskFencesStaleCardSessionProviderState(t *testing.T) {
 	if _, _, err := testHandler.TaskService.CompleteTaskWithTransitionFenced(
 		ctx, staleTaskID, []byte(`{"output":"stale"}`),
 		"provider-stale", "/work/stale", "", false, "", "", "daemon-a", lease.LeaseEpoch,
-	); err != nil {
-		t.Fatalf("complete stale task: %v", err)
+	); !errors.Is(err, service.ErrCardSessionLeaseUnavailable) {
+		t.Fatalf("complete stale task error = %v, want ErrCardSessionLeaseUnavailable", err)
 	}
 
 	var activityAfter time.Time

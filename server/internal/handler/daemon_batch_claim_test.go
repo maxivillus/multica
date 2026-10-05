@@ -59,7 +59,7 @@ func batchClaimRequest(workspaceID string, runtimeIDs []string, maxTasks int, ca
 	req := newDaemonTokenRequest(http.MethodPost, "/api/daemon/tasks/claim",
 		map[string]any{"daemon_id": batchClaimTestDaemonID, "runtime_ids": runtimeIDs, "max_tasks": maxTasks}, workspaceID, batchClaimTestDaemonID)
 	if capabilities != "" {
-		req.Header.Set("X-Client-Capabilities", capabilities)
+		req.Header.Set("X-Client-Capabilities", protocol.DaemonCapabilityCardSessionLeaseV1+","+capabilities)
 	}
 	return req
 }

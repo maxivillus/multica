@@ -7,6 +7,7 @@ import (
 	"testing"
 
 	"github.com/multica-ai/multica/server/internal/daemonws"
+	"github.com/multica-ai/multica/server/pkg/protocol"
 )
 
 // TestDaemonRPCHandler_TasksClaim pins the WS-first claim binding (MUL-4257):
@@ -27,6 +28,7 @@ func TestDaemonRPCHandler_TasksClaim(t *testing.T) {
 		WorkspaceID:  testWorkspaceID,
 		WorkspaceIDs: []string{testWorkspaceID},
 		RuntimeIDs:   []string{rt},
+		Capabilities: protocol.DaemonCapabilityCardSessionLeaseV1,
 	}
 	body, _ := json.Marshal(map[string]any{
 		"daemon_id":   "ws-daemon",

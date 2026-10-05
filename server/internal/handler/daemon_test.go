@@ -90,6 +90,13 @@ func newDaemonTokenRequest(method, path string, body any, workspaceID, daemonID 
 	}
 	req := httptest.NewRequest(method, path, &buf)
 	req.Header.Set("Content-Type", "application/json")
+	// Claim tests model the current daemon. Active issue tasks are intentionally
+	// withheld from daemons that cannot prove the card-session lease at terminal
+	// callbacks, so the shared helper advertises that capability by default.
+	// Tests for legacy claim behaviour explicitly replace or delete this header.
+	if strings.Contains(path, "/claim") {
+		req.Header.Set("X-Client-Capabilities", protocol.DaemonCapabilityCardSessionLeaseV1)
+	}
 	// No X-User-ID — daemon tokens don't set it.
 	ctx := middleware.WithDaemonContext(req.Context(), workspaceID, daemonID)
 	return req.WithContext(ctx)
@@ -543,7 +550,7 @@ func TestClaimTaskByRuntime_SkillBundleRefsAndResolve(t *testing.T) {
 	})
 
 	req := newDaemonTokenRequest("POST", "/api/daemon/runtimes/"+runtimeID+"/tasks/claim", nil, testWorkspaceID, "skill-refs-daemon")
-	req.Header.Set("X-Client-Capabilities", protocol.DaemonCapabilitySkillBundlesV1)
+	req.Header.Set("X-Client-Capabilities", protocol.DaemonCapabilityCardSessionLeaseV1+","+protocol.DaemonCapabilitySkillBundlesV1)
 	req = withURLParam(req, "runtimeId", runtimeID)
 	w := testutil.Call(t, testHandler.ClaimTaskByRuntime, req).Want(http.StatusOK)
 
@@ -2751,7 +2758,7 @@ func claimTaskForRuntimeGuardWithCapabilities(t *testing.T, runtimeID, daemonID,
 	req := newDaemonTokenRequest("POST", "/api/daemon/runtimes/"+runtimeID+"/claim", nil,
 		testWorkspaceID, daemonID)
 	if capabilities != "" {
-		req.Header.Set("X-Client-Capabilities", capabilities)
+		req.Header.Set("X-Client-Capabilities", protocol.DaemonCapabilityCardSessionLeaseV1+","+capabilities)
 	}
 	rctx := chi.NewRouteContext()
 	rctx.URLParams.Add("runtimeId", runtimeID)
