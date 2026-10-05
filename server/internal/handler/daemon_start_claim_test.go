@@ -3,6 +3,7 @@ package handler
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"net/http"
 	"net/http/httptest"
@@ -10,10 +11,42 @@ import (
 	"testing"
 	"time"
 
+	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgtype"
+	"github.com/jackc/pgx/v5/pgxpool"
+	"github.com/multica-ai/multica/server/internal/service"
 	"github.com/multica-ai/multica/server/internal/testutil"
 	"github.com/multica-ai/multica/server/pkg/protocol"
 )
+
+type startAfterCommitTxStarter struct {
+	pool        *pgxpool.Pool
+	afterCommit func()
+}
+
+func (s *startAfterCommitTxStarter) Begin(ctx context.Context) (pgx.Tx, error) {
+	tx, err := s.pool.Begin(ctx)
+	if err != nil {
+		return nil, err
+	}
+	return &startAfterCommitTx{Tx: tx, afterCommit: s.afterCommit}, nil
+}
+
+type startAfterCommitTx struct {
+	pgx.Tx
+	afterCommit func()
+}
+
+func (t *startAfterCommitTx) Commit(ctx context.Context) error {
+	if err := t.Tx.Commit(ctx); err != nil {
+		return err
+	}
+	if t.afterCommit != nil {
+		t.afterCommit()
+		t.afterCommit = nil
+	}
+	return nil
+}
 
 func startClaimFixture(t *testing.T, status string) (string, string, time.Time) {
 	t.Helper()
@@ -306,5 +339,72 @@ func TestStartTaskPATFallbackUsesRuntimeDaemonLeaseOwner(t *testing.T) {
 	}
 	if owner != "" {
 		t.Fatalf("released PAT lease owner = %q, want empty", owner)
+	}
+}
+
+func TestStartTaskResponseKeepsTransactionalLeaseProofAcrossCancellation(t *testing.T) {
+	if testHandler == nil || testPool == nil {
+		t.Skip("database not available")
+	}
+	ctx := context.Background()
+	workspaceID, runtimeID, agentID, _, issueID := createCardSessionCapacityFixture(t, ctx)
+	generation := time.Now().UTC().Truncate(time.Microsecond)
+	var taskID string
+	if err := testPool.QueryRow(ctx, `
+		INSERT INTO agent_task_queue (agent_id, runtime_id, issue_id, status, priority, dispatched_at)
+		VALUES ($1, $2, $3, 'dispatched', 0, $4)
+		RETURNING id`, agentID, runtimeID, issueID, generation).Scan(&taskID); err != nil {
+		t.Fatalf("insert dispatched task: %v", err)
+	}
+	t.Cleanup(func() {
+		_, _ = testPool.Exec(context.Background(), `DELETE FROM agent_task_queue WHERE id = $1`, taskID)
+	})
+
+	previousStarter := testHandler.TaskService.TxStarter
+	t.Cleanup(func() { testHandler.TaskService.TxStarter = previousStarter })
+	testHandler.TaskService.TxStarter = &startAfterCommitTxStarter{
+		pool: testPool,
+		afterCommit: func() {
+			if _, err := testPool.Exec(ctx, `
+				UPDATE card_session
+				SET state = 'paused', pause_reason = 'cancelled'
+				WHERE issue_id = $1`, issueID); err != nil {
+				t.Fatalf("cancel card session in commit barrier: %v", err)
+			}
+		},
+	}
+
+	startReq := newRequestAsUser(testUserID, http.MethodPost, "/api/daemon/tasks/"+taskID+"/start", map[string]any{
+		"runtime_id":    runtimeID,
+		"dispatched_at": generation.Format(time.RFC3339Nano),
+		"capabilities":  []string{protocol.DaemonCapabilityCardSessionLeaseV1},
+	})
+	startReq.Header.Set("X-Workspace-ID", workspaceID)
+	startReq = withURLParam(startReq, "taskId", taskID)
+	startResp := httptest.NewRecorder()
+	testHandler.StartTask(startResp, startReq)
+	if startResp.Code != http.StatusOK {
+		t.Fatalf("start status = %d: %s", startResp.Code, startResp.Body.String())
+	}
+	var started AgentTaskResponse
+	if err := json.Unmarshal(startResp.Body.Bytes(), &started); err != nil {
+		t.Fatalf("decode start response: %v", err)
+	}
+	if started.CardSessionLeaseEpoch <= 0 || started.CardSessionID == "" {
+		t.Fatalf("start response lease = id %q epoch %d, want transactional proof", started.CardSessionID, started.CardSessionLeaseEpoch)
+	}
+
+	var currentOwner string
+	var currentEpoch int64
+	if err := testPool.QueryRow(ctx, `SELECT COALESCE(lease_owner, ''), lease_epoch FROM card_session WHERE id = $1`, started.CardSessionID).Scan(&currentOwner, &currentEpoch); err != nil {
+		t.Fatalf("read cancelled card session: %v", err)
+	}
+	if currentOwner != "" || currentEpoch <= started.CardSessionLeaseEpoch {
+		t.Fatalf("cancelled card session = owner %q epoch %d, want cleared owner and epoch > response %d", currentOwner, currentEpoch, started.CardSessionLeaseEpoch)
+	}
+	if _, _, err := testHandler.TaskService.CompleteTaskWithTransitionFenced(
+		ctx, parseUUID(taskID), []byte(`{"output":"stale"}`), "", "", "", false, "", "", "start-claim-test", started.CardSessionLeaseEpoch,
+	); !errors.Is(err, service.ErrCardSessionLeaseUnavailable) {
+		t.Fatalf("terminal callback with pre-cancel proof error = %v, want ErrCardSessionLeaseUnavailable", err)
 	}
 }

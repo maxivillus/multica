@@ -4210,6 +4210,7 @@ func (h *Handler) StartTask(w http.ResponseWriter, r *http.Request) {
 	// and older clients that only negotiated per-task capabilities.
 	supportsCardSessionLease := requestHasClientCapability(r, protocol.DaemonCapabilityCardSessionLeaseV1) || slices.Contains(req.Capabilities, protocol.DaemonCapabilityCardSessionLeaseV1)
 	var task *db.AgentTaskQueue
+	var cardSession db.CardSession
 	var err error
 	legacy := req.RuntimeID == "" && req.DispatchedAt == ""
 	requireCardSessionCapability := func() bool {
@@ -4237,7 +4238,7 @@ func (h *Handler) StartTask(w http.ResponseWriter, r *http.Request) {
 		}
 		// Older daemons send {}. Keep their single-winner behavior; in
 		// particular, they cannot acknowledge an already-running task.
-		task, err = h.TaskService.StartTaskWithCardSessionLeaseCapability(r.Context(), parseUUID(taskID), leaseOwner, supportsCardSessionLease, enableTaskSupplement)
+		task, cardSession, err = h.TaskService.StartTaskWithCardSessionLeaseCapabilityAndProof(r.Context(), parseUUID(taskID), leaseOwner, supportsCardSessionLease, enableTaskSupplement)
 	} else {
 		runtimeID, ok := parseUUIDOrBadRequest(w, req.RuntimeID, "runtime_id")
 		if !ok {
@@ -4251,7 +4252,7 @@ func (h *Handler) StartTask(w http.ResponseWriter, r *http.Request) {
 		if !requireCardSessionCapability() {
 			return
 		}
-		task, err = h.TaskService.StartTaskForClaimWithCardSessionLeaseCapability(r.Context(), db.LockAgentTaskStartClaimParams{
+		task, cardSession, err = h.TaskService.StartTaskForClaimWithCardSessionLeaseCapabilityAndProof(r.Context(), db.LockAgentTaskStartClaimParams{
 			ID: parseUUID(taskID), RuntimeID: runtimeID,
 			DispatchedAt: pgtype.Timestamptz{Time: generation, Valid: true},
 		}, leaseOwner, supportsCardSessionLease, enableTaskSupplement)
@@ -4281,20 +4282,20 @@ func (h *Handler) StartTask(w http.ResponseWriter, r *http.Request) {
 	slog.Info("task started", "task_id", taskID, "agent_id", uuidToString(task.AgentID))
 	resp := taskToResponse(*task, workspaceID)
 	if task.CardSessionID.Valid {
-		if cardSession, sessionErr := h.Queries.GetCardSession(r.Context(), task.CardSessionID); sessionErr == nil {
-			resp.CardSessionGeneration = cardSession.Generation
-			resp.CardSessionLeaseEpoch = cardSession.LeaseEpoch
-			if workspace, workspaceErr := h.Queries.GetWorkspace(r.Context(), parseUUID(workspaceID)); workspaceErr == nil {
-				if settings, settingsErr := cardsession.Parse(workspace.Settings); settingsErr == nil {
-					resp.CardSessionIdleTimeoutHours = settings.IdleTimeoutHours
-				} else {
-					slog.Warn("start task: invalid card-session workspace settings; using server default", "task_id", taskID, "error", settingsErr)
-				}
-			} else if !errors.Is(workspaceErr, pgx.ErrNoRows) {
-				slog.Warn("start task: failed to load workspace card-session settings", "task_id", taskID, "error", workspaceErr)
+		if !cardSession.ID.Valid || cardSession.ID != task.CardSessionID || cardSession.LeaseEpoch <= 0 || !cardSession.LeaseOwner.Valid || cardSession.LeaseOwner.String != leaseOwner {
+			writeError(w, http.StatusConflict, "card session lease proof is unavailable")
+			return
+		}
+		resp.CardSessionGeneration = cardSession.Generation
+		resp.CardSessionLeaseEpoch = cardSession.LeaseEpoch
+		if workspace, workspaceErr := h.Queries.GetWorkspace(r.Context(), parseUUID(workspaceID)); workspaceErr == nil {
+			if settings, settingsErr := cardsession.Parse(workspace.Settings); settingsErr == nil {
+				resp.CardSessionIdleTimeoutHours = settings.IdleTimeoutHours
+			} else {
+				slog.Warn("start task: invalid card-session workspace settings; using server default", "task_id", taskID, "error", settingsErr)
 			}
-		} else if !errors.Is(sessionErr, pgx.ErrNoRows) {
-			slog.Warn("start task: failed to load card session lease epoch", "task_id", taskID, "card_session_id", uuidToString(task.CardSessionID), "error", sessionErr)
+		} else if !errors.Is(workspaceErr, pgx.ErrNoRows) {
+			slog.Warn("start task: failed to load workspace card-session settings", "task_id", taskID, "error", workspaceErr)
 		}
 	}
 	// Echo the capability the server actually committed for this exact run.

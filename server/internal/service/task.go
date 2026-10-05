@@ -4548,11 +4548,25 @@ func (s *TaskService) StartTaskWithCardSessionLeaseCapability(ctx context.Contex
 	return s.startTask(ctx, taskID, leaseOwner, supportsCardSessionLease, supplementSupport...)
 }
 
+// StartTaskWithCardSessionLeaseCapabilityAndProof returns the lease row that
+// was acquired in the same transaction as the task transition. Callers that
+// send the lease epoch to a daemon must use this proof instead of reading the
+// card session again after commit, because cancellation may advance the epoch
+// in that gap.
+func (s *TaskService) StartTaskWithCardSessionLeaseCapabilityAndProof(ctx context.Context, taskID pgtype.UUID, leaseOwner string, supportsCardSessionLease bool, supplementSupport ...bool) (*db.AgentTaskQueue, db.CardSession, error) {
+	return s.startTaskWithProof(ctx, taskID, leaseOwner, supportsCardSessionLease, supplementSupport...)
+}
+
 func (s *TaskService) startTask(ctx context.Context, taskID pgtype.UUID, leaseOwner string, supportsCardSessionLease bool, supplementSupport ...bool) (*db.AgentTaskQueue, error) {
+	task, _, err := s.startTaskWithProof(ctx, taskID, leaseOwner, supportsCardSessionLease, supplementSupport...)
+	return task, err
+}
+
+func (s *TaskService) startTaskWithProof(ctx context.Context, taskID pgtype.UUID, leaseOwner string, supportsCardSessionLease bool, supplementSupport ...bool) (*db.AgentTaskQueue, db.CardSession, error) {
 	enableTaskSupplement := len(supplementSupport) > 0 && supplementSupport[0]
 	if s.TxStarter == nil {
 		if strings.TrimSpace(leaseOwner) != "" {
-			return nil, fmt.Errorf("start task with card session lease requires a transaction")
+			return nil, db.CardSession{}, fmt.Errorf("start task with card session lease requires a transaction")
 		}
 		// Keep the legacy query-only service used by isolated mock tests. The
 		// production service always has a transaction starter so issue tasks are
@@ -4563,17 +4577,17 @@ func (s *TaskService) startTask(ctx context.Context, taskID pgtype.UUID, leaseOw
 			SupportsCardSessionLease: pgtype.Bool{Bool: supportsCardSessionLease, Valid: true},
 		})
 		if err != nil {
-			return nil, fmt.Errorf("start task: %w", err)
+			return nil, db.CardSession{}, fmt.Errorf("start task: %w", err)
 		}
 		if task.CardSessionID.Valid && strings.TrimSpace(leaseOwner) == "" {
-			return nil, ErrCardSessionLeaseOwner
+			return nil, db.CardSession{}, ErrCardSessionLeaseOwner
 		}
 		s.taskStarted(ctx, task)
-		return &task, nil
+		return &task, db.CardSession{}, nil
 	}
 	tx, err := s.TxStarter.Begin(ctx)
 	if err != nil {
-		return nil, fmt.Errorf("begin task start: %w", err)
+		return nil, db.CardSession{}, fmt.Errorf("begin task start: %w", err)
 	}
 	defer tx.Rollback(ctx)
 	qtx := s.Queries.WithTx(tx)
@@ -4583,25 +4597,27 @@ func (s *TaskService) startTask(ctx context.Context, taskID pgtype.UUID, leaseOw
 		SupportsCardSessionLease: pgtype.Bool{Bool: supportsCardSessionLease, Valid: true},
 	})
 	if err != nil {
-		return nil, fmt.Errorf("start task: %w", err)
+		return nil, db.CardSession{}, fmt.Errorf("start task: %w", err)
 	}
 	task, err = s.bindStartedIssueTaskToCardSession(ctx, qtx, task)
 	if err != nil {
-		return nil, err
+		return nil, db.CardSession{}, err
 	}
+	var lease db.CardSession
 	if task.CardSessionID.Valid {
 		if strings.TrimSpace(leaseOwner) == "" {
-			return nil, ErrCardSessionLeaseOwner
+			return nil, db.CardSession{}, ErrCardSessionLeaseOwner
 		}
-		if _, err := s.acquireCardSessionLeaseWithQueries(ctx, qtx, task.ID, leaseOwner); err != nil {
-			return nil, err
+		lease, err = s.acquireCardSessionLeaseWithQueries(ctx, qtx, task.ID, leaseOwner)
+		if err != nil {
+			return nil, db.CardSession{}, err
 		}
 	}
 	if err := tx.Commit(ctx); err != nil {
-		return nil, fmt.Errorf("commit task start: %w", err)
+		return nil, db.CardSession{}, fmt.Errorf("commit task start: %w", err)
 	}
 	s.taskStarted(ctx, task)
-	return &task, nil
+	return &task, lease, nil
 }
 
 // StartTaskForClaim serializes the ownership check and transition with reclaim,
@@ -4625,19 +4641,30 @@ func (s *TaskService) StartTaskForClaimWithCardSessionLeaseCapability(ctx contex
 	return s.startTaskForClaim(ctx, claim, leaseOwner, supportsCardSessionLease, supplementSupport...)
 }
 
+// StartTaskForClaimWithCardSessionLeaseCapabilityAndProof is the claim-aware
+// variant that returns the lease acquired by the start transaction.
+func (s *TaskService) StartTaskForClaimWithCardSessionLeaseCapabilityAndProof(ctx context.Context, claim db.LockAgentTaskStartClaimParams, leaseOwner string, supportsCardSessionLease bool, supplementSupport ...bool) (*db.AgentTaskQueue, db.CardSession, error) {
+	return s.startTaskForClaimWithProof(ctx, claim, leaseOwner, supportsCardSessionLease, supplementSupport...)
+}
+
 func (s *TaskService) startTaskForClaim(ctx context.Context, claim db.LockAgentTaskStartClaimParams, leaseOwner string, supportsCardSessionLease bool, supplementSupport ...bool) (*db.AgentTaskQueue, error) {
+	task, _, err := s.startTaskForClaimWithProof(ctx, claim, leaseOwner, supportsCardSessionLease, supplementSupport...)
+	return task, err
+}
+
+func (s *TaskService) startTaskForClaimWithProof(ctx context.Context, claim db.LockAgentTaskStartClaimParams, leaseOwner string, supportsCardSessionLease bool, supplementSupport ...bool) (*db.AgentTaskQueue, db.CardSession, error) {
 	if !claim.ID.Valid || !claim.RuntimeID.Valid || !claim.DispatchedAt.Valid {
-		return nil, fmt.Errorf("start task: incomplete claim")
+		return nil, db.CardSession{}, fmt.Errorf("start task: incomplete claim")
 	}
 	tx, err := s.TxStarter.Begin(ctx)
 	if err != nil {
-		return nil, fmt.Errorf("begin task start: %w", err)
+		return nil, db.CardSession{}, fmt.Errorf("begin task start: %w", err)
 	}
 	defer tx.Rollback(ctx)
 	qtx := s.Queries.WithTx(tx)
 	task, err := qtx.LockAgentTaskStartClaim(ctx, claim)
 	if err != nil {
-		return nil, fmt.Errorf("lock task start claim: %w", err)
+		return nil, db.CardSession{}, fmt.Errorf("lock task start claim: %w", err)
 	}
 	replay := task.Status == "running"
 	if !replay {
@@ -4647,28 +4674,30 @@ func (s *TaskService) startTaskForClaim(ctx context.Context, claim db.LockAgentT
 			SupportsCardSessionLease: pgtype.Bool{Bool: supportsCardSessionLease, Valid: true},
 		})
 		if err != nil {
-			return nil, fmt.Errorf("start claimed task: %w", err)
+			return nil, db.CardSession{}, fmt.Errorf("start claimed task: %w", err)
 		}
 		task, err = s.bindStartedIssueTaskToCardSession(ctx, qtx, task)
 		if err != nil {
-			return nil, err
+			return nil, db.CardSession{}, err
 		}
 	}
+	var lease db.CardSession
 	if task.CardSessionID.Valid {
 		if strings.TrimSpace(leaseOwner) == "" {
-			return nil, ErrCardSessionLeaseOwner
+			return nil, db.CardSession{}, ErrCardSessionLeaseOwner
 		}
-		if _, err := s.acquireCardSessionLeaseWithQueries(ctx, qtx, task.ID, leaseOwner); err != nil {
-			return nil, err
+		lease, err = s.acquireCardSessionLeaseWithQueries(ctx, qtx, task.ID, leaseOwner)
+		if err != nil {
+			return nil, db.CardSession{}, err
 		}
 	}
 	if err := tx.Commit(ctx); err != nil {
-		return nil, fmt.Errorf("commit task start: %w", err)
+		return nil, db.CardSession{}, fmt.Errorf("commit task start: %w", err)
 	}
 	if !replay {
 		s.taskStarted(ctx, task)
 	}
-	return &task, nil
+	return &task, lease, nil
 }
 
 func (s *TaskService) taskStarted(ctx context.Context, task db.AgentTaskQueue) {

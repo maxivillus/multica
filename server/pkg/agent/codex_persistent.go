@@ -37,6 +37,11 @@ type codexPersistentSession struct {
 	current *codexPersistentTurn
 	closed  bool
 
+	// beforeResultPublish is test-only synchronization for the terminal handoff
+	// invariant: current must be cleared before a consumer can observe Result.
+	// It remains nil in production.
+	beforeResultPublish func()
+
 	closeOnce sync.Once
 	closeErr  error
 }
@@ -506,6 +511,14 @@ func (p *codexPersistentSession) runTurn(ctx context.Context, prompt string, opt
 	if p.proxy != nil {
 		p.proxy.clearToken()
 	}
+	p.mu.Lock()
+	if p.current == turn {
+		p.current = nil
+	}
+	p.mu.Unlock()
+	if p.beforeResultPublish != nil {
+		p.beforeResultPublish()
+	}
 	turn.result <- Result{
 		Status:     status,
 		Output:     output,
@@ -516,11 +529,6 @@ func (p *codexPersistentSession) runTurn(ctx context.Context, prompt string, opt
 	}
 	close(turn.messages)
 	close(turn.result)
-	p.mu.Lock()
-	if p.current == turn {
-		p.current = nil
-	}
-	p.mu.Unlock()
 }
 
 func (p *codexPersistentSession) ProcessID() int {

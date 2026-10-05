@@ -712,6 +712,23 @@ WHERE task.id = $1
   AND cs.state <> 'closed'
   AND cs.lease_owner = $2::text
   AND cs.lease_epoch = $3
+  AND task.status IN ('running', 'completed', 'failed', 'cancelled')
+  AND NOT EXISTS (
+      SELECT 1
+      FROM agent_task_queue AS newer
+      WHERE newer.card_session_id = task.card_session_id
+        AND newer.id <> task.id
+        AND newer.status IN ('running', 'completed', 'failed', 'cancelled')
+        AND (
+            COALESCE(newer.started_at, newer.completed_at, newer.created_at)
+                > COALESCE(task.started_at, task.completed_at, task.created_at)
+            OR (
+                COALESCE(newer.started_at, newer.completed_at, newer.created_at)
+                    = COALESCE(task.started_at, task.completed_at, task.created_at)
+                AND newer.id > task.id
+            )
+        )
+  )
 RETURNING cs.id, cs.workspace_id, cs.issue_id, cs.agent_id, cs.generation, cs.state, cs.provider, cs.provider_session_id, cs.work_dir, cs.opened_at, cs.last_activity_at, cs.done_at, cs.retain_until, cs.closed_at, cs.lease_owner, cs.lease_epoch, cs.lease_heartbeat_at, cs.created_at, cs.updated_at, cs.pause_reason
 `
 
@@ -721,8 +738,10 @@ type ReleaseCardSessionLeaseByTaskParams struct {
 	LeaseEpoch int64       `json:"lease_epoch"`
 }
 
-// Release is fenced by both owner and epoch so a previous process cannot
-// clear a lease acquired by its replacement.
+// Release is fenced by owner, epoch, and task order. A same-owner replay keeps
+// the epoch stable, so an idle host being closed after a newer task starts
+// must not clear that newer host's lease. The newest task may still release
+// the generation after it reaches a terminal state.
 func (q *Queries) ReleaseCardSessionLeaseByTask(ctx context.Context, arg ReleaseCardSessionLeaseByTaskParams) (CardSession, error) {
 	row := q.db.QueryRow(ctx, releaseCardSessionLeaseByTask, arg.TaskID, arg.LeaseOwner, arg.LeaseEpoch)
 	var i CardSession

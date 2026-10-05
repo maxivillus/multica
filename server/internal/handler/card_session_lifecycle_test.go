@@ -111,6 +111,69 @@ func TestCardSessionDoneStaysOpenAndCancelledPausesUntilComment(t *testing.T) {
 	}
 }
 
+func TestCardSessionLeaseReleaseRejectsCompletedOlderTaskAfterSameOwnerRebind(t *testing.T) {
+	if testHandler == nil || testPool == nil {
+		t.Skip("database not available")
+	}
+	ctx := context.Background()
+	_, runtimeID, agentID, _, issueID := createCardSessionCapacityFixture(t, ctx)
+	var firstTaskID pgtype.UUID
+	if err := testPool.QueryRow(ctx, `
+		INSERT INTO agent_task_queue (agent_id, runtime_id, issue_id, status, priority, dispatched_at)
+		VALUES ($1, $2, $3, 'dispatched', 0, now())
+		RETURNING id`, agentID, runtimeID, issueID).Scan(&firstTaskID); err != nil {
+		t.Fatalf("insert first task: %v", err)
+	}
+	t.Cleanup(func() {
+		_, _ = testPool.Exec(context.Background(), `DELETE FROM agent_task_queue WHERE id = $1`, firstTaskID)
+	})
+	first, err := testHandler.TaskService.StartTaskWithCardSessionLease(ctx, firstTaskID, "daemon-a")
+	if err != nil {
+		t.Fatalf("start first task: %v", err)
+	}
+	firstLease, err := testHandler.Queries.GetCardSession(ctx, first.CardSessionID)
+	if err != nil {
+		t.Fatalf("load first lease: %v", err)
+	}
+	if _, err := testPool.Exec(ctx, `
+		UPDATE agent_task_queue
+		SET status = 'completed', completed_at = now(), started_at = now() - interval '1 minute'
+		WHERE id = $1`, firstTaskID); err != nil {
+		t.Fatalf("complete first task: %v", err)
+	}
+
+	var secondTaskID pgtype.UUID
+	if err := testPool.QueryRow(ctx, `
+		INSERT INTO agent_task_queue (agent_id, runtime_id, issue_id, card_session_id, status, priority, dispatched_at, started_at)
+		VALUES ($1, $2, $3, $4, 'running', 0, now(), now())
+		RETURNING id`, agentID, runtimeID, issueID, first.CardSessionID).Scan(&secondTaskID); err != nil {
+		t.Fatalf("insert rebound task: %v", err)
+	}
+	t.Cleanup(func() {
+		_, _ = testPool.Exec(context.Background(), `DELETE FROM agent_task_queue WHERE id = $1`, secondTaskID)
+	})
+	rebound, err := testHandler.TaskService.AcquireCardSessionLeaseForTask(ctx, secondTaskID, "daemon-a")
+	if err != nil {
+		t.Fatalf("same-owner rebind: %v", err)
+	}
+	if rebound.LeaseEpoch != firstLease.LeaseEpoch {
+		t.Fatalf("same-owner rebind epoch = %d, want unchanged %d", rebound.LeaseEpoch, firstLease.LeaseEpoch)
+	}
+	if _, err := testHandler.TaskService.ReleaseCardSessionLeaseByTask(ctx, firstTaskID, "daemon-a", firstLease.LeaseEpoch); !errors.Is(err, service.ErrCardSessionLeaseUnavailable) {
+		t.Fatalf("older task release error = %v, want ErrCardSessionLeaseUnavailable", err)
+	}
+	current, err := testHandler.Queries.GetCardSession(ctx, first.CardSessionID)
+	if err != nil {
+		t.Fatalf("load rebound lease: %v", err)
+	}
+	if !current.LeaseOwner.Valid || current.LeaseOwner.String != "daemon-a" {
+		t.Fatalf("older release cleared rebound lease: owner=%q valid=%t", current.LeaseOwner.String, current.LeaseOwner.Valid)
+	}
+	if _, err := testHandler.TaskService.ReleaseCardSessionLeaseByTask(ctx, secondTaskID, "daemon-a", rebound.LeaseEpoch); err != nil {
+		t.Fatalf("current task release: %v", err)
+	}
+}
+
 func TestTerminalTaskPersistsCardSessionProviderState(t *testing.T) {
 	if testHandler == nil || testPool == nil {
 		t.Skip("database not available")

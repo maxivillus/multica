@@ -323,8 +323,10 @@ WHERE task.id = sqlc.arg(task_id)
 RETURNING cs.*;
 
 -- name: ReleaseCardSessionLeaseByTask :one
--- Release is fenced by both owner and epoch so a previous process cannot
--- clear a lease acquired by its replacement.
+-- Release is fenced by owner, epoch, and task order. A same-owner replay keeps
+-- the epoch stable, so an idle host being closed after a newer task starts
+-- must not clear that newer host's lease. The newest task may still release
+-- the generation after it reaches a terminal state.
 UPDATE card_session AS cs
 SET lease_owner = NULL,
     lease_heartbeat_at = NULL,
@@ -335,6 +337,23 @@ WHERE task.id = sqlc.arg(task_id)
   AND cs.state <> 'closed'
   AND cs.lease_owner = sqlc.arg(lease_owner)::text
   AND cs.lease_epoch = sqlc.arg(lease_epoch)
+  AND task.status IN ('running', 'completed', 'failed', 'cancelled')
+  AND NOT EXISTS (
+      SELECT 1
+      FROM agent_task_queue AS newer
+      WHERE newer.card_session_id = task.card_session_id
+        AND newer.id <> task.id
+        AND newer.status IN ('running', 'completed', 'failed', 'cancelled')
+        AND (
+            COALESCE(newer.started_at, newer.completed_at, newer.created_at)
+                > COALESCE(task.started_at, task.completed_at, task.created_at)
+            OR (
+                COALESCE(newer.started_at, newer.completed_at, newer.created_at)
+                    = COALESCE(task.started_at, task.completed_at, task.created_at)
+                AND newer.id > task.id
+            )
+        )
+  )
 RETURNING cs.*;
 
 -- name: FinalizeCardSessionProviderStateByTask :exec
