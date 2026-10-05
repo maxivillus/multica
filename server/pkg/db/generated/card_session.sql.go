@@ -12,6 +12,14 @@ import (
 )
 
 const acquireCardSessionLeaseForTask = `-- name: AcquireCardSessionLeaseForTask :one
+WITH locked_task AS MATERIALIZED (
+    SELECT task.card_session_id
+    FROM agent_task_queue AS task
+    WHERE task.id = $3
+      AND task.status = 'running'
+      AND task.card_session_id IS NOT NULL
+    FOR UPDATE
+)
 UPDATE card_session AS cs
 SET lease_owner = NULLIF($1::text, ''),
     lease_epoch = cs.lease_epoch + CASE
@@ -22,10 +30,8 @@ SET lease_owner = NULLIF($1::text, ''),
     END,
     lease_heartbeat_at = now(),
     updated_at = now()
-FROM agent_task_queue AS task
-WHERE task.id = $3
-  AND task.card_session_id = cs.id
-  AND task.status = 'running'
+FROM locked_task AS task
+WHERE task.card_session_id = cs.id
   AND cs.state = 'open'
   AND NULLIF($1::text, '') IS NOT NULL
   AND (
@@ -47,6 +53,9 @@ type AcquireCardSessionLeaseForTaskParams struct {
 // owner has a fresh heartbeat. A same-owner replay with a fresh heartbeat is
 // idempotent; a takeover or stale same-owner recovery advances the fencing
 // epoch. The task binding keeps a stale task from acquiring a newer generation.
+// Lock the task first and the card session second. Terminal callbacks use the
+// same order, so a takeover and a terminal report cannot each hold one row
+// while waiting for the other.
 func (q *Queries) AcquireCardSessionLeaseForTask(ctx context.Context, arg AcquireCardSessionLeaseForTaskParams) (CardSession, error) {
 	row := q.db.QueryRow(ctx, acquireCardSessionLeaseForTask, arg.LeaseOwner, arg.StaleAfterSeconds, arg.TaskID)
 	var i CardSession
@@ -595,6 +604,30 @@ func (q *Queries) ListDueCardSessionCapacityWaitersForRuntimes(ctx context.Conte
 		return nil, err
 	}
 	return items, nil
+}
+
+const lockCardSessionForTaskTerminal = `-- name: LockCardSessionForTaskTerminal :one
+WITH locked_task AS MATERIALIZED (
+    SELECT task.card_session_id
+    FROM agent_task_queue AS task
+    WHERE task.id = $1
+      AND task.card_session_id IS NOT NULL
+    FOR UPDATE
+)
+SELECT cs.id
+FROM locked_task AS task
+JOIN card_session AS cs ON cs.id = task.card_session_id
+FOR UPDATE OF cs
+`
+
+// Terminal task callbacks and lease takeovers use task -> card_session lock
+// order. The lock is acquired before CompleteAgentTask/FailAgentTask so the
+// lease proof and the task status CAS share one serialization point.
+func (q *Queries) LockCardSessionForTaskTerminal(ctx context.Context, id pgtype.UUID) (pgtype.UUID, error) {
+	row := q.db.QueryRow(ctx, lockCardSessionForTaskTerminal, id)
+	var id_2 pgtype.UUID
+	err := row.Scan(&id_2)
+	return id_2, err
 }
 
 const lockIssueForCardSession = `-- name: LockIssueForCardSession :one

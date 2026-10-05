@@ -3382,6 +3382,18 @@ func lockChatSessionForTaskWrite(ctx context.Context, qtx *db.Queries, taskID pg
 	return nil
 }
 
+// lockCardSessionForTaskTerminal takes the card-session generation lock before
+// the terminal task CAS. Lease acquisition uses the same task -> card_session
+// order, so either the takeover commits first and the stale CAS observes the
+// new epoch, or the terminal report commits first and the takeover is later.
+// Non-card tasks have no row to lock and keep their existing path.
+func lockCardSessionForTaskTerminal(ctx context.Context, qtx *db.Queries, taskID pgtype.UUID) error {
+	if _, err := qtx.LockCardSessionForTaskTerminal(ctx, taskID); err != nil && !errors.Is(err, pgx.ErrNoRows) {
+		return fmt.Errorf("lock card session for terminal task write: %w", err)
+	}
+	return nil
+}
+
 // chatInputOwnerID resolves the id the task's user-message input batch is
 // keyed on: chat_input_task_id when set (auto-retry clones inherit their
 // parent's, so provenance checks reach the parent's sealed messages), falling
@@ -4818,6 +4830,9 @@ func (s *TaskService) CompleteTaskWithTransitionFenced(ctx context.Context, task
 		if err := lockChatSessionForTaskWrite(ctx, qtx, taskID); err != nil {
 			return err
 		}
+		if err := lockCardSessionForTaskTerminal(ctx, qtx, taskID); err != nil {
+			return err
+		}
 		t, err := qtx.CompleteAgentTask(ctx, db.CompleteAgentTaskParams{
 			ID:                    taskID,
 			Result:                result,
@@ -5337,6 +5352,9 @@ func (s *TaskService) FailTaskWithTransitionFenced(ctx context.Context, taskID p
 	var retried *db.AgentTaskQueue
 	if err := s.runInTx(ctx, func(qtx *db.Queries) error {
 		if err := lockChatSessionForTaskWrite(ctx, qtx, taskID); err != nil {
+			return err
+		}
+		if err := lockCardSessionForTaskTerminal(ctx, qtx, taskID); err != nil {
 			return err
 		}
 		t, err := qtx.FailAgentTask(ctx, db.FailAgentTaskParams{

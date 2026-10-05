@@ -424,6 +424,116 @@ func TestTerminalTaskEndpointsRejectStaleCardSessionLease(t *testing.T) {
 	}
 }
 
+func TestTerminalTaskLeaseFenceSerializesTakeover(t *testing.T) {
+	if testHandler == nil || testPool == nil {
+		t.Skip("database not available")
+	}
+
+	ctx := context.Background()
+	_, runtimeID, agentID, _, issueID := createCardSessionCapacityFixture(t, ctx)
+	issue, err := testHandler.Queries.GetIssue(ctx, util.MustParseUUID(issueID))
+	if err != nil {
+		t.Fatalf("load issue: %v", err)
+	}
+	agent, err := testHandler.Queries.GetAgent(ctx, util.MustParseUUID(agentID))
+	if err != nil {
+		t.Fatalf("load agent: %v", err)
+	}
+	session, err := testHandler.TaskService.EnsureCardSession(ctx, issue.ID, issue.WorkspaceID, agent.ID, agent.RuntimeMode)
+	if err != nil {
+		t.Fatalf("open card session: %v", err)
+	}
+
+	var taskID pgtype.UUID
+	if err := testPool.QueryRow(ctx, `
+		INSERT INTO agent_task_queue (
+			agent_id, runtime_id, issue_id, card_session_id, status, priority, started_at
+		)
+		VALUES ($1, $2, $3, $4, 'dispatched', 0, now())
+		RETURNING id`, agentID, runtimeID, issueID, session.ID).Scan(&taskID); err != nil {
+		t.Fatalf("insert running task: %v", err)
+	}
+	t.Cleanup(func() {
+		_, _ = testPool.Exec(context.Background(), `DELETE FROM agent_task_queue WHERE id = $1`, taskID)
+	})
+
+	started, err := testHandler.TaskService.StartTaskWithCardSessionLease(ctx, taskID, "daemon-a")
+	if err != nil {
+		t.Fatalf("start task: %v", err)
+	}
+	initialLease, err := testHandler.Queries.GetCardSession(ctx, started.CardSessionID)
+	if err != nil {
+		t.Fatalf("load initial lease: %v", err)
+	}
+
+	conn, err := testPool.Acquire(ctx)
+	if err != nil {
+		t.Fatalf("acquire takeover connection: %v", err)
+	}
+	defer conn.Release()
+	takeoverTx, err := conn.Begin(ctx)
+	if err != nil {
+		t.Fatalf("begin takeover transaction: %v", err)
+	}
+	defer takeoverTx.Rollback(ctx)
+	qtx := testHandler.Queries.WithTx(takeoverTx)
+	takenOver, err := qtx.AcquireCardSessionLeaseForTask(ctx, db.AcquireCardSessionLeaseForTaskParams{
+		TaskID:            taskID,
+		LeaseOwner:        "daemon-b",
+		StaleAfterSeconds: 0,
+	})
+	if err != nil {
+		t.Fatalf("stage card-session takeover: %v", err)
+	}
+	if takenOver.LeaseEpoch != initialLease.LeaseEpoch+1 {
+		t.Fatalf("staged takeover epoch = %d, want %d", takenOver.LeaseEpoch, initialLease.LeaseEpoch+1)
+	}
+
+	terminalResult := make(chan error, 1)
+	go func() {
+		_, _, completeErr := testHandler.TaskService.CompleteTaskWithTransitionFenced(
+			ctx,
+			taskID,
+			[]byte(`{"output":"stale"}`),
+			"provider-stale",
+			"/work/stale",
+			"",
+			false,
+			"",
+			"",
+			"daemon-a",
+			initialLease.LeaseEpoch,
+		)
+		terminalResult <- completeErr
+	}()
+
+	select {
+	case completeErr := <-terminalResult:
+		t.Fatalf("terminal callback completed while takeover was uncommitted: %v", completeErr)
+	case <-time.After(100 * time.Millisecond):
+	}
+	if err := takeoverTx.Commit(ctx); err != nil {
+		t.Fatalf("commit card-session takeover: %v", err)
+	}
+
+	select {
+	case completeErr := <-terminalResult:
+		if !errors.Is(completeErr, service.ErrCardSessionLeaseUnavailable) {
+			t.Fatalf("stale terminal error = %v, want ErrCardSessionLeaseUnavailable", completeErr)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("terminal callback did not finish after takeover commit")
+	}
+
+	var status string
+	if err := testPool.QueryRow(ctx, `SELECT status FROM agent_task_queue WHERE id = $1`, taskID).Scan(&status); err != nil {
+		t.Fatalf("read task after takeover race: %v", err)
+	}
+	if status != "running" {
+		t.Fatalf("stale terminal callback changed task status to %q, want running", status)
+	}
+}
+
 func TestCancelledIssueCancelsOnlyItsTasksAfterRequestDisconnect(t *testing.T) {
 	if testHandler == nil || testPool == nil {
 		t.Skip("database not available")

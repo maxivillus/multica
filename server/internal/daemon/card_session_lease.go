@@ -67,7 +67,14 @@ func (h *cardSessionLeaseHandle) loop() {
 				if h.ctx.Err() != nil {
 					return
 				}
-				onLost, markedLost := h.markLost()
+				onLost, markedLost, current := h.markLostFor(taskID, epoch)
+				if !current {
+					// The request was sent for a previous task/epoch and a
+					// successful rebind won the race while it was in flight. Its
+					// rejection belongs to that old generation and must not take
+					// the rebound host down.
+					continue
+				}
 				if !markedLost {
 					return
 				}
@@ -96,6 +103,27 @@ func (h *cardSessionLeaseHandle) markLost() (func(), bool) {
 	}
 	h.lost = true
 	return h.onLost, true
+}
+
+// markLostFor marks a lease lost only when the failed heartbeat still belongs
+// to the handle's current task and epoch. A heartbeat can be in flight while a
+// persistent host is rebound to a newer task; that old response must not close
+// the new generation. The third return value distinguishes that harmless race
+// from a handle that was already marked lost.
+func (h *cardSessionLeaseHandle) markLostFor(taskID string, epoch int64) (func(), bool, bool) {
+	if h == nil {
+		return nil, false, false
+	}
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	if h.taskID != taskID || h.epoch != epoch {
+		return nil, false, false
+	}
+	if h.lost {
+		return nil, false, true
+	}
+	h.lost = true
+	return h.onLost, true, true
 }
 
 func (h *cardSessionLeaseHandle) isLost() bool {
