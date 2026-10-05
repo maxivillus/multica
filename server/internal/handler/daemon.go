@@ -4202,6 +4202,15 @@ func (h *Handler) StartTask(w http.ResponseWriter, r *http.Request) {
 	var err error
 	legacy := req.RuntimeID == "" && req.DispatchedAt == ""
 	if legacy {
+		if accessTask.IssueID.Valid && !slices.Contains(req.Capabilities, protocol.DaemonCapabilityCardSessionLeaseV1) {
+			// Issue tasks may be bound to a card-session lease during this start
+			// transaction. Without the capability an older daemon can acquire that
+			// lease and then reach /complete or /fail without the epoch proof,
+			// leaving the task stuck behind a 409. Fail closed before it enters a
+			// generation the daemon cannot finalize, regardless of request shape.
+			writeError(w, http.StatusConflict, "card-session lease capability required; update daemon")
+			return
+		}
 		// Older daemons send {}. Keep their single-winner behavior; in
 		// particular, they cannot acknowledge an already-running task.
 		task, err = h.TaskService.StartTaskWithCardSessionLease(r.Context(), parseUUID(taskID), leaseOwner, enableTaskSupplement)
@@ -4213,6 +4222,12 @@ func (h *Handler) StartTask(w http.ResponseWriter, r *http.Request) {
 		generation, parseErr := time.Parse(time.RFC3339Nano, req.DispatchedAt)
 		if parseErr != nil || generation.Nanosecond()%1000 != 0 {
 			writeError(w, http.StatusBadRequest, "dispatched_at must be a PostgreSQL claim timestamp")
+			return
+		}
+		if accessTask.IssueID.Valid && !slices.Contains(req.Capabilities, protocol.DaemonCapabilityCardSessionLeaseV1) {
+			// The validated claim would otherwise start a card-session generation
+			// that an older daemon cannot finalize with its terminal callback.
+			writeError(w, http.StatusConflict, "card-session lease capability required; update daemon")
 			return
 		}
 		task, err = h.TaskService.StartTaskForClaimWithCardSessionLease(r.Context(), db.LockAgentTaskStartClaimParams{

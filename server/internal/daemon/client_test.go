@@ -58,6 +58,9 @@ func TestClient_IdentityHeaders_PostJSON(t *testing.T) {
 			// Without it the server never hands this daemon the wakeups that
 			// waited for its run; they start runs of their own instead.
 			protocol.DaemonCapabilityJoinedWakeupsV1,
+			// Card-session starts are rejected by a new server when this is
+			// absent, so an old daemon cannot begin a run it cannot finalize.
+			protocol.DaemonCapabilityCardSessionLeaseV1,
 		} {
 			if !capabilities[want] {
 				t.Errorf("X-Client-Capabilities missing %q: %v", want, capabilities)

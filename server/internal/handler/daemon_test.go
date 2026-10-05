@@ -2014,7 +2014,7 @@ func TestStartTask_AutopilotRunOnlyTask_ResolvesWorkspace(t *testing.T) {
 	// Same-workspace daemon token must succeed — this is the bug in #1224.
 	w = httptest.NewRecorder()
 	req = newDaemonTokenRequest("POST", "/api/daemon/tasks/"+taskID+"/start", map[string]any{
-		"capabilities": []string{protocol.DaemonCapabilityTaskSupplementV1},
+		"capabilities": []string{protocol.DaemonCapabilityCardSessionLeaseV1, protocol.DaemonCapabilityTaskSupplementV1},
 	},
 		testWorkspaceID, "legit-daemon")
 	req = req.WithContext(context.WithValue(req.Context(), chi.RouteCtxKey, rctx))

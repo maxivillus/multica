@@ -296,7 +296,7 @@ func TestTerminalTaskEndpointsRejectStaleCardSessionLease(t *testing.T) {
 			if err != nil {
 				t.Fatalf("load agent: %v", err)
 			}
-			session, err := testHandler.TaskService.EnsureCardSession(ctx, issue.ID, issue.WorkspaceID, agent.ID, agent.RuntimeMode)
+			_, err = testHandler.TaskService.EnsureCardSession(ctx, issue.ID, issue.WorkspaceID, agent.ID, agent.RuntimeMode)
 			if err != nil {
 				t.Fatalf("open card session: %v", err)
 			}
@@ -304,11 +304,11 @@ func TestTerminalTaskEndpointsRejectStaleCardSessionLease(t *testing.T) {
 			var taskID pgtype.UUID
 			if err := testPool.QueryRow(ctx, `
 				INSERT INTO agent_task_queue (
-					agent_id, runtime_id, issue_id, card_session_id, status, priority, started_at,
+					agent_id, runtime_id, issue_id, status, priority, started_at,
 					session_id, work_dir, result, error
 				)
-				VALUES ($1, $2, $3, $4, 'dispatched', 0, now(), 'session-before', '/work/before', '{}'::jsonb, 'error-before')
-				RETURNING id`, agentID, runtimeID, issueID, session.ID).Scan(&taskID); err != nil {
+				VALUES ($1, $2, $3, 'dispatched', 0, now(), 'session-before', '/work/before', '{}'::jsonb, 'error-before')
+				RETURNING id`, agentID, runtimeID, issueID).Scan(&taskID); err != nil {
 				t.Fatalf("insert terminal-fence task: %v", err)
 			}
 			t.Cleanup(func() {
@@ -439,7 +439,7 @@ func TestTerminalTaskLeaseFenceSerializesTakeover(t *testing.T) {
 	if err != nil {
 		t.Fatalf("load agent: %v", err)
 	}
-	session, err := testHandler.TaskService.EnsureCardSession(ctx, issue.ID, issue.WorkspaceID, agent.ID, agent.RuntimeMode)
+	_, err = testHandler.TaskService.EnsureCardSession(ctx, issue.ID, issue.WorkspaceID, agent.ID, agent.RuntimeMode)
 	if err != nil {
 		t.Fatalf("open card session: %v", err)
 	}
@@ -447,10 +447,10 @@ func TestTerminalTaskLeaseFenceSerializesTakeover(t *testing.T) {
 	var taskID pgtype.UUID
 	if err := testPool.QueryRow(ctx, `
 		INSERT INTO agent_task_queue (
-			agent_id, runtime_id, issue_id, card_session_id, status, priority, started_at
+			agent_id, runtime_id, issue_id, status, priority, started_at
 		)
-		VALUES ($1, $2, $3, $4, 'dispatched', 0, now())
-		RETURNING id`, agentID, runtimeID, issueID, session.ID).Scan(&taskID); err != nil {
+		VALUES ($1, $2, $3, 'dispatched', 0, now())
+		RETURNING id`, agentID, runtimeID, issueID).Scan(&taskID); err != nil {
 		t.Fatalf("insert running task: %v", err)
 	}
 	t.Cleanup(func() {
@@ -531,6 +531,115 @@ func TestTerminalTaskLeaseFenceSerializesTakeover(t *testing.T) {
 	}
 	if status != "running" {
 		t.Fatalf("stale terminal callback changed task status to %q, want running", status)
+	}
+}
+
+func TestTerminalTaskLeaseFenceRejectsCancelledIssue(t *testing.T) {
+	if testHandler == nil || testPool == nil {
+		t.Skip("database not available")
+	}
+
+	for _, terminal := range []string{"complete", "fail"} {
+		t.Run(terminal, func(t *testing.T) {
+			ctx := context.Background()
+			workspaceID, runtimeID, agentID, _, issueID := createCardSessionCapacityFixture(t, ctx)
+			issue, err := testHandler.Queries.GetIssue(ctx, util.MustParseUUID(issueID))
+			if err != nil {
+				t.Fatalf("load issue: %v", err)
+			}
+			agent, err := testHandler.Queries.GetAgent(ctx, util.MustParseUUID(agentID))
+			if err != nil {
+				t.Fatalf("load agent: %v", err)
+			}
+			_, err = testHandler.TaskService.EnsureCardSession(ctx, issue.ID, issue.WorkspaceID, agent.ID, agent.RuntimeMode)
+			if err != nil {
+				t.Fatalf("open card session: %v", err)
+			}
+
+			var taskID pgtype.UUID
+			if err := testPool.QueryRow(ctx, `
+				INSERT INTO agent_task_queue (
+					agent_id, runtime_id, issue_id, status, priority, dispatched_at
+				)
+				VALUES ($1, $2, $3, 'dispatched', 0, now())
+				RETURNING id`, agentID, runtimeID, issueID).Scan(&taskID); err != nil {
+				t.Fatalf("insert terminal-fence task: %v", err)
+			}
+			t.Cleanup(func() {
+				_, _ = testPool.Exec(context.Background(), `DELETE FROM agent_task_queue WHERE id = $1`, taskID)
+			})
+
+			started, err := testHandler.TaskService.StartTaskWithCardSessionLease(ctx, taskID, "daemon-a")
+			if err != nil {
+				t.Fatalf("start task: %v", err)
+			}
+			initialLease, err := testHandler.Queries.GetCardSession(ctx, started.CardSessionID)
+			if err != nil {
+				t.Fatalf("load initial lease: %v", err)
+			}
+
+			if _, err := testPool.Exec(ctx, `UPDATE issue SET status = 'cancelled' WHERE id = $1`, issueID); err != nil {
+				t.Fatalf("cancel issue: %v", err)
+			}
+			cancelledLease, err := testHandler.Queries.GetCardSession(ctx, started.CardSessionID)
+			if err != nil {
+				t.Fatalf("load cancelled lease: %v", err)
+			}
+			if cancelledLease.State != "paused" || cancelledLease.LeaseOwner.Valid {
+				t.Fatalf("cancelled lease = state=%q owner_valid=%t, want paused and no owner", cancelledLease.State, cancelledLease.LeaseOwner.Valid)
+			}
+			if cancelledLease.LeaseEpoch != initialLease.LeaseEpoch+1 {
+				t.Fatalf("cancelled lease epoch = %d, want %d", cancelledLease.LeaseEpoch, initialLease.LeaseEpoch+1)
+			}
+
+			body := map[string]any{
+				"card_session_lease_epoch": initialLease.LeaseEpoch,
+				"session_id":               "provider-stale",
+				"work_dir":                 "/work/stale",
+			}
+			if terminal == "fail" {
+				body["error"] = "stale failure"
+				body["failure_reason"] = "agent_error"
+			}
+			path := "/api/daemon/tasks/" + util.UUIDToString(taskID) + "/" + terminal
+			w := httptest.NewRecorder()
+			req := newDaemonTokenRequest(http.MethodPost, path, body, workspaceID, "daemon-a")
+			rctx := chi.NewRouteContext()
+			rctx.URLParams.Add("taskId", util.UUIDToString(taskID))
+			req = req.WithContext(context.WithValue(req.Context(), chi.RouteCtxKey, rctx))
+			if terminal == "complete" {
+				testHandler.CompleteTask(w, req)
+			} else {
+				testHandler.FailTask(w, req)
+			}
+			if w.Code != http.StatusConflict {
+				t.Fatalf("stale post-cancellation %s status = %d, want 409: %s", terminal, w.Code, w.Body.String())
+			}
+
+			var status string
+			if err := testPool.QueryRow(ctx, `SELECT status FROM agent_task_queue WHERE id = $1`, taskID).Scan(&status); err != nil {
+				t.Fatalf("read task after stale %s: %v", terminal, err)
+			}
+			if status != "running" {
+				t.Fatalf("stale post-cancellation %s changed task status to %q, want running", terminal, status)
+			}
+			var relatedTasks int
+			if err := testPool.QueryRow(ctx, `
+				SELECT count(*) FROM agent_task_queue
+				WHERE id = $1 OR parent_task_id = $1`, taskID).Scan(&relatedTasks); err != nil {
+				t.Fatalf("count task side effects after stale %s: %v", terminal, err)
+			}
+			if relatedTasks != 1 {
+				t.Fatalf("stale post-cancellation %s created task side effects: related task count=%d, want 1", terminal, relatedTasks)
+			}
+			var pending int
+			if err := testPool.QueryRow(ctx, `SELECT count(*) FROM issue_task_cancel_outbox WHERE issue_id = $1`, issueID).Scan(&pending); err != nil {
+				t.Fatalf("count pending cancellation after stale %s: %v", terminal, err)
+			}
+			if pending != 1 {
+				t.Fatalf("pending cancellation after stale %s = %d, want 1", terminal, pending)
+			}
+		})
 	}
 }
 

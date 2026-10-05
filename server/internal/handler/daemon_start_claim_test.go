@@ -12,6 +12,7 @@ import (
 
 	"github.com/jackc/pgx/v5/pgtype"
 	"github.com/multica-ai/multica/server/internal/testutil"
+	"github.com/multica-ai/multica/server/pkg/protocol"
 )
 
 func startClaimFixture(t *testing.T, status string) (string, string, time.Time) {
@@ -31,8 +32,9 @@ func startClaimFixture(t *testing.T, status string) (string, string, time.Time) 
 }
 
 func startClaimRequest(taskID, runtimeID string, generation time.Time) *http.Request {
-	return withURLParam(newDaemonTokenRequest("POST", "/api/daemon/tasks/"+taskID+"/start", map[string]string{
+	return withURLParam(newDaemonTokenRequest("POST", "/api/daemon/tasks/"+taskID+"/start", map[string]any{
 		"runtime_id": runtimeID, "dispatched_at": generation.Format(time.RFC3339Nano),
+		"capabilities": []string{protocol.DaemonCapabilityCardSessionLeaseV1},
 	}, testWorkspaceID, "start-claim-test"), "taskId", taskID)
 }
 
@@ -174,10 +176,18 @@ func TestStartClaimInvalidBodiesAndLegacy(t *testing.T) {
 		req := withURLParam(newDaemonTokenRequest("POST", "/start", body, testWorkspaceID, "legacy-test"), "taskId", id)
 		testutil.Call(t, testHandler.StartTask, req).Want(http.StatusBadRequest)
 	}
-	for _, code := range []int{http.StatusOK, http.StatusBadRequest} {
-		req := withURLParam(newDaemonTokenRequest("POST", "/start", nil, testWorkspaceID, "legacy-test"), "taskId", id)
-		testutil.Call(t, testHandler.StartTask, req).Want(code)
-	}
+	modernNoCapabilityReq := withURLParam(newDaemonTokenRequest("POST", "/start", map[string]any{
+		"runtime_id": runtimeID, "dispatched_at": generation.Format(time.RFC3339Nano),
+	}, testWorkspaceID, "legacy-test"), "taskId", id)
+	testutil.Call(t, testHandler.StartTask, modernNoCapabilityReq).Want(http.StatusConflict)
+	legacyReq := withURLParam(newDaemonTokenRequest("POST", "/start", nil, testWorkspaceID, "legacy-test"), "taskId", id)
+	testutil.Call(t, testHandler.StartTask, legacyReq).Want(http.StatusConflict)
+	capabilityReq := withURLParam(newDaemonTokenRequest("POST", "/start", map[string]any{
+		"capabilities": []string{protocol.DaemonCapabilityCardSessionLeaseV1},
+	}, testWorkspaceID, "legacy-test"), "taskId", id)
+	testutil.Call(t, testHandler.StartTask, capabilityReq).Want(http.StatusOK)
+	replayReq := withURLParam(newDaemonTokenRequest("POST", "/start", nil, testWorkspaceID, "legacy-test"), "taskId", id)
+	testutil.Call(t, testHandler.StartTask, replayReq).Want(http.StatusConflict)
 }
 
 func TestStartClaimWirePrecision(t *testing.T) {
@@ -238,6 +248,7 @@ func TestStartTaskPATFallbackUsesRuntimeDaemonLeaseOwner(t *testing.T) {
 	startReq := newRequestAsUser(testUserID, http.MethodPost, "/api/daemon/tasks/"+taskID+"/start", map[string]any{
 		"runtime_id":    runtimeID,
 		"dispatched_at": generation.Format(time.RFC3339Nano),
+		"capabilities":  []string{protocol.DaemonCapabilityCardSessionLeaseV1},
 	})
 	startReq.Header.Set("X-Workspace-ID", workspaceID)
 	startReq = withURLParam(startReq, "taskId", taskID)

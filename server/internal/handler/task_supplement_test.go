@@ -72,7 +72,10 @@ func TestTaskSupplementClaimStartReplay(t *testing.T) {
 	for range 2 {
 		req := withURLParam(newDaemonTokenRequest(http.MethodPost, "/start", map[string]any{
 			"runtime_id": f.runtimeID, "dispatched_at": generation.Format(time.RFC3339Nano),
-			"capabilities": []string{protocol.DaemonCapabilityTaskSupplementV1},
+			"capabilities": []string{
+				protocol.DaemonCapabilityCardSessionLeaseV1,
+				protocol.DaemonCapabilityTaskSupplementV1,
+			},
 		}, testWorkspaceID, "start-claim-test"), "taskId", f.taskID)
 		var started AgentTaskResponse
 		testutil.Call(t, testHandler.StartTask, req).Want(http.StatusOK).JSON(&started)
@@ -186,9 +189,9 @@ func TestTaskSupplementNegotiationFailsClosed(t *testing.T) {
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			fixture := newSupplementFixture(t, tc.provider, "dispatched", false)
-			var capabilities []string
+			capabilities := []string{protocol.DaemonCapabilityCardSessionLeaseV1}
 			if tc.daemonAdvertises {
-				capabilities = []string{protocol.DaemonCapabilityTaskSupplementV1}
+				capabilities = append(capabilities, protocol.DaemonCapabilityTaskSupplementV1)
 			}
 			req := withURLParam(newDaemonTokenRequest(http.MethodPost, "/start", map[string]any{"capabilities": capabilities}, testWorkspaceID, "test-daemon"), "taskId", fixture.taskID)
 			var started AgentTaskResponse

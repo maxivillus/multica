@@ -8484,8 +8484,11 @@ func (d *Daemon) runTask(ctx context.Context, task Task, provider string, slot i
 	// "start task failed: <…>" string and the same failure_reason
 	// taxonomy as before — see MUL-2946 for the classifier contract.
 	var taskCapabilities []string
-	if agent.SupportsTaskSupplement(provider, resolvedVersion) && task.IssueID != "" {
-		taskCapabilities = append(taskCapabilities, protocol.DaemonCapabilityTaskSupplementV1)
+	if task.IssueID != "" {
+		taskCapabilities = append(taskCapabilities, protocol.DaemonCapabilityCardSessionLeaseV1)
+		if agent.SupportsTaskSupplement(provider, resolvedVersion) {
+			taskCapabilities = append(taskCapabilities, protocol.DaemonCapabilityTaskSupplementV1)
+		}
 	}
 	taskSupplementNegotiated, cardSessionLease, err := d.client.StartTaskWithLease(prepareCtx, task, taskCapabilities...)
 	if err != nil {
