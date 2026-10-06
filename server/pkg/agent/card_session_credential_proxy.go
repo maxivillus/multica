@@ -34,6 +34,8 @@ type codexCredentialProxy struct {
 	mu           sync.RWMutex
 	currentToken string
 	tokenEpoch   uint64
+	tokenContext context.Context
+	tokenCancel  context.CancelFunc
 }
 
 func newCodexCredentialProxy(upstreamURL, daemonPort, initialToken string) (*codexCredentialProxy, error) {
@@ -60,6 +62,12 @@ func newCodexCredentialProxy(upstreamURL, daemonPort, initialToken string) (*cod
 	if err != nil {
 		return nil, fmt.Errorf("listen persistent credential broker: %w", err)
 	}
+	initialToken = strings.TrimSpace(initialToken)
+	var tokenContext context.Context
+	var tokenCancel context.CancelFunc
+	if initialToken != "" {
+		tokenContext, tokenCancel = context.WithCancel(context.Background())
+	}
 	p := &codexCredentialProxy{
 		listener:     listener,
 		url:          "http://" + listener.Addr().String(),
@@ -67,7 +75,9 @@ func newCodexCredentialProxy(upstreamURL, daemonPort, initialToken string) (*cod
 		broker:       broker,
 		upstream:     upstream,
 		daemon:       daemon,
-		currentToken: strings.TrimSpace(initialToken),
+		currentToken: initialToken,
+		tokenContext: tokenContext,
+		tokenCancel:  tokenCancel,
 	}
 	p.server = &http.Server{Handler: http.HandlerFunc(p.serveHTTP)}
 	go func() { _ = p.server.Serve(listener) }()
@@ -91,10 +101,14 @@ func (p *codexCredentialProxy) serveHTTP(w http.ResponseWriter, r *http.Request)
 	}
 	p.mu.RLock()
 	token := p.currentToken
+	tokenContext := p.tokenContext
 	p.mu.RUnlock()
 	if token == "" {
 		http.Error(w, "persistent credential broker idle", http.StatusUnauthorized)
 		return
+	}
+	if tokenContext == nil {
+		tokenContext = context.Background()
 	}
 
 	target := p.upstream
@@ -105,7 +119,13 @@ func (p *codexCredentialProxy) serveHTTP(w http.ResponseWriter, r *http.Request)
 		http.Error(w, "persistent credential broker route unavailable", http.StatusServiceUnavailable)
 		return
 	}
-	forward := r.Clone(r.Context())
+	forwardContext, cancelForward := context.WithCancel(r.Context())
+	stopOnRevoke := context.AfterFunc(tokenContext, cancelForward)
+	defer func() {
+		stopOnRevoke()
+		cancelForward()
+	}()
+	forward := r.Clone(forwardContext)
 	forward.URL.Scheme = target.Scheme
 	forward.URL.Host = target.Host
 	forward.URL.Path = joinProxyPath(target.Path, r.URL.Path)
@@ -160,11 +180,18 @@ func (p *codexCredentialProxy) setTokenForTurn(token string) (uint64, error) {
 	if token == "" || !strings.HasPrefix(token, "mat_") {
 		return 0, fmt.Errorf("persistent card session requires a task-scoped mat_ credential")
 	}
+	tokenContext, tokenCancel := context.WithCancel(context.Background())
 	p.mu.Lock()
+	previousCancel := p.tokenCancel
 	p.tokenEpoch++
 	epoch := p.tokenEpoch
 	p.currentToken = token
+	p.tokenContext = tokenContext
+	p.tokenCancel = tokenCancel
 	p.mu.Unlock()
+	if previousCancel != nil {
+		previousCancel()
+	}
 	return epoch, nil
 }
 
@@ -173,8 +200,14 @@ func (p *codexCredentialProxy) clearToken() {
 		return
 	}
 	p.mu.Lock()
+	tokenCancel := p.tokenCancel
 	p.currentToken = ""
+	p.tokenContext = nil
+	p.tokenCancel = nil
 	p.mu.Unlock()
+	if tokenCancel != nil {
+		tokenCancel()
+	}
 }
 
 func (p *codexCredentialProxy) clearTokenForEpoch(epoch uint64) {
@@ -183,7 +216,15 @@ func (p *codexCredentialProxy) clearTokenForEpoch(epoch uint64) {
 	}
 	p.mu.Lock()
 	if p.tokenEpoch == epoch {
+		tokenCancel := p.tokenCancel
 		p.currentToken = ""
+		p.tokenContext = nil
+		p.tokenCancel = nil
+		p.mu.Unlock()
+		if tokenCancel != nil {
+			tokenCancel()
+		}
+		return
 	}
 	p.mu.Unlock()
 }

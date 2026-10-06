@@ -122,3 +122,81 @@ done
 		t.Fatalf("credential remained after turn: %q", current)
 	}
 }
+
+func TestCodexCredentialProxyRevocationCancelsInFlightRequest(t *testing.T) {
+	requestStarted := make(chan struct{})
+	requestCancelled := make(chan struct{})
+	allowSideEffect := make(chan struct{})
+	sideEffect := make(chan struct{})
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		close(requestStarted)
+		select {
+		case <-r.Context().Done():
+			close(requestCancelled)
+		case <-allowSideEffect:
+			close(sideEffect)
+			w.WriteHeader(http.StatusNoContent)
+		}
+	}))
+	defer upstream.Close()
+
+	proxy, err := newCodexCredentialProxy(upstream.URL, "", "")
+	if err != nil {
+		t.Fatalf("new proxy: %v", err)
+	}
+	defer proxy.close()
+	epoch, err := proxy.setTokenForTurn("mat_task_a")
+	if err != nil {
+		t.Fatalf("set token: %v", err)
+	}
+
+	response := make(chan struct {
+		status int
+		err    error
+	}, 1)
+	go func() {
+		req, requestErr := http.NewRequest(http.MethodGet, proxy.url+"/api/me", nil)
+		if requestErr != nil {
+			response <- struct {
+				status int
+				err    error
+			}{err: requestErr}
+			return
+		}
+		req.Header.Set("Authorization", "Bearer "+proxy.broker)
+		resp, requestErr := http.DefaultClient.Do(req)
+		if resp != nil {
+			defer resp.Body.Close()
+		}
+		status := 0
+		if resp != nil {
+			status = resp.StatusCode
+		}
+		response <- struct {
+			status int
+			err    error
+		}{status: status, err: requestErr}
+	}()
+
+	select {
+	case <-requestStarted:
+	case <-time.After(2 * time.Second):
+		t.Fatal("upstream request did not start")
+	}
+	proxy.clearTokenForEpoch(epoch)
+	select {
+	case <-requestCancelled:
+	case <-time.After(2 * time.Second):
+		t.Fatal("revocation did not cancel the in-flight upstream request")
+	}
+	close(allowSideEffect)
+	result := <-response
+	if result.err != nil {
+		t.Fatalf("proxy request after revocation: %v", result.err)
+	}
+	select {
+	case <-sideEffect:
+		t.Fatal("revoked request reached the upstream side effect")
+	default:
+	}
+}

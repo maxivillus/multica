@@ -198,3 +198,85 @@ done
 		t.Fatalf("second result = %+v, open=%t", result, ok)
 	}
 }
+
+func TestCodexPersistentSessionRejectsExecuteAfterCloseDuringAdmission(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("shell-script fixture is POSIX-only")
+	}
+	fakePath := writeFakeCodexAppServer(t, `
+while IFS= read -r line; do
+  id=$(printf '%s\n' "$line" | sed -n 's/.*"id":\([0-9][0-9]*\).*/\1/p')
+  method=$(printf '%s\n' "$line" | sed -n 's/.*"method":"\([^"]*\)".*/\1/p')
+  case "$method" in
+    initialize) printf '{"jsonrpc":"2.0","id":%s,"result":{}}\n' "$id" ;;
+    thread/start) printf '{"jsonrpc":"2.0","id":%s,"result":{"thread":{"id":"thread-close"}}}\n' "$id" ;;
+    *) printf '{"jsonrpc":"2.0","id":%s,"result":{}}\n' "$id" ;;
+  esac
+done
+`)
+	backend, err := New("codex", Config{
+		ExecutablePath: fakePath,
+		Env:            map[string]string{"MULTICA_SERVER_URL": "http://127.0.0.1:1"},
+	})
+	if err != nil {
+		t.Fatalf("new codex backend: %v", err)
+	}
+	host, err := backend.(PersistentBackend).OpenPersistent(context.Background(), ExecOptions{
+		TaskAuthToken:          "mat_task_a",
+		HandshakeTimeout:       time.Second,
+		ThreadHandshakeTimeout: time.Second,
+	})
+	if err != nil {
+		t.Fatalf("open persistent backend: %v", err)
+	}
+	persistent := host.(*codexPersistentSession)
+
+	admissionEntered := make(chan struct{})
+	releaseAdmission := make(chan struct{})
+	persistent.beforeTurnAdmission = func() {
+		close(admissionEntered)
+		<-releaseAdmission
+	}
+	executeDone := make(chan struct {
+		session *Session
+		err     error
+	}, 1)
+	go func() {
+		session, executeErr := host.Execute(context.Background(), "after close", ExecOptions{
+			TaskAuthToken: "mat_task_b",
+			Timeout:       time.Second,
+		})
+		executeDone <- struct {
+			session *Session
+			err     error
+		}{session: session, err: executeErr}
+	}()
+	select {
+	case <-admissionEntered:
+	case <-time.After(2 * time.Second):
+		_ = host.Close()
+		t.Fatal("execute did not reach admission barrier")
+	}
+
+	closeDone := make(chan error, 1)
+	go func() { closeDone <- host.Close() }()
+	select {
+	case err := <-closeDone:
+		if err != nil {
+			t.Fatalf("close persistent backend: %v", err)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("close did not complete while admission was blocked")
+	}
+	close(releaseAdmission)
+	result := <-executeDone
+	if result.session != nil || result.err == nil || result.err.Error() != "codex persistent session is closed" {
+		t.Fatalf("execute after close = session=%v err=%v, want closed error", result.session, result.err)
+	}
+	persistent.proxy.mu.RLock()
+	currentToken := persistent.proxy.currentToken
+	persistent.proxy.mu.RUnlock()
+	if currentToken != "" {
+		t.Fatalf("credential remained after rejected admission: %q", currentToken)
+	}
+}

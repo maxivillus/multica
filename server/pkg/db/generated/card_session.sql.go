@@ -959,6 +959,25 @@ WHERE t.id = $1
                   THEN GREATEST(1, LEAST(999, (w.settings->'card_sessions'->>'idle_timeout_hours')::INTEGER))
               ELSE 24
           END)
+          -- A cancelled pin is allowed to fill its own empty task row after
+          -- the cancel commit, but it must not replace provider state already
+          -- recorded by a newer task on this same card-session generation.
+          AND NOT EXISTS (
+              SELECT 1
+              FROM agent_task_queue AS newer
+              WHERE newer.card_session_id = t.card_session_id
+                AND newer.id <> t.id
+                AND (NULLIF(newer.session_id, '') IS NOT NULL OR NULLIF(newer.work_dir, '') IS NOT NULL)
+                AND (
+                    COALESCE(newer.started_at, newer.completed_at, newer.created_at)
+                        > COALESCE(t.started_at, t.completed_at, t.created_at)
+                    OR (
+                        COALESCE(newer.started_at, newer.completed_at, newer.created_at)
+                            = COALESCE(t.started_at, t.completed_at, t.created_at)
+                        AND newer.id > t.id
+                    )
+                )
+          )
       )
   )
 `

@@ -1580,3 +1580,77 @@ func TestClosedCardSessionRejectsLateTaskCallbacksFromPriorGeneration(t *testing
 		})
 	}
 }
+
+func TestCancelledCardSessionLatePinDoesNotOverwriteNewerProviderState(t *testing.T) {
+	if testHandler == nil || testPool == nil {
+		t.Skip("database not available")
+	}
+	ctx := context.Background()
+	_, runtimeID, agentID, _, issueID := createCardSessionCapacityFixture(t, ctx)
+	issue, err := testHandler.Queries.GetIssue(ctx, util.MustParseUUID(issueID))
+	if err != nil {
+		t.Fatalf("load issue: %v", err)
+	}
+	agent, err := testHandler.Queries.GetAgent(ctx, util.MustParseUUID(agentID))
+	if err != nil {
+		t.Fatalf("load agent: %v", err)
+	}
+	generation, err := testHandler.TaskService.EnsureCardSession(ctx, issue.ID, issue.WorkspaceID, agent.ID, agent.RuntimeMode)
+	if err != nil {
+		t.Fatalf("open generation: %v", err)
+	}
+
+	var cancelledTaskID, newerTaskID pgtype.UUID
+	if err := testPool.QueryRow(ctx, `
+		INSERT INTO agent_task_queue (
+			agent_id, runtime_id, issue_id, card_session_id, status, priority,
+			created_at, started_at, completed_at
+		)
+		VALUES ($1, $2, $3, $4, 'cancelled', 0,
+			now() - interval '10 minutes', now() - interval '10 minutes', now() - interval '9 minutes')
+		RETURNING id`, agentID, runtimeID, issueID, generation.ID).Scan(&cancelledTaskID); err != nil {
+		t.Fatalf("insert cancelled task: %v", err)
+	}
+	if err := testPool.QueryRow(ctx, `
+		INSERT INTO agent_task_queue (
+			agent_id, runtime_id, issue_id, card_session_id, status, priority,
+			created_at, started_at, completed_at, session_id, work_dir
+		)
+		VALUES ($1, $2, $3, $4, 'completed', 0,
+			now() - interval '2 minutes', now() - interval '2 minutes', now() - interval '1 minutes',
+			'newer-provider-session', '/work/newer-provider')
+		RETURNING id`, agentID, runtimeID, issueID, generation.ID).Scan(&newerTaskID); err != nil {
+		t.Fatalf("insert newer task: %v", err)
+	}
+	t.Cleanup(func() {
+		_, _ = testPool.Exec(context.Background(), `DELETE FROM agent_task_queue WHERE id IN ($1, $2)`, cancelledTaskID, newerTaskID)
+	})
+	if _, err := testPool.Exec(ctx, `
+		UPDATE card_session
+		SET provider_session_id = 'newer-provider-session', work_dir = '/work/newer-provider'
+		WHERE id = $1`, generation.ID); err != nil {
+		t.Fatalf("record newer provider state: %v", err)
+	}
+	if _, err := testPool.Exec(ctx, `UPDATE issue SET status = 'cancelled' WHERE id = $1`, issueID); err != nil {
+		t.Fatalf("cancel issue: %v", err)
+	}
+
+	rows, err := testHandler.Queries.UpdateCardSessionProviderStateByTask(ctx, db.UpdateCardSessionProviderStateByTaskParams{
+		ID: cancelledTaskID, ProviderSessionID: "stale-provider-session", WorkDir: "/work/stale-provider",
+	})
+	if err != nil {
+		t.Fatalf("late cancelled provider pin: %v", err)
+	}
+	if rows != 0 {
+		t.Fatalf("late cancelled provider pin changed %d row(s), want no-op", rows)
+	}
+	var providerSessionID, workDir string
+	if err := testPool.QueryRow(ctx, `
+		SELECT provider_session_id, work_dir FROM card_session WHERE id = $1`, generation.ID,
+	).Scan(&providerSessionID, &workDir); err != nil {
+		t.Fatalf("read provider state after stale pin: %v", err)
+	}
+	if providerSessionID != "newer-provider-session" || workDir != "/work/newer-provider" {
+		t.Fatalf("stale pin changed provider state to (%q, %q), want newer provider state", providerSessionID, workDir)
+	}
+}

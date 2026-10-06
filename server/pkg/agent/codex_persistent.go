@@ -50,6 +50,10 @@ type codexPersistentSession struct {
 	// between setting the next token and clearing the previous one.
 	beforeTurnTokenCleanup func()
 
+	// beforeTurnAdmission is test-only synchronization for the close/admission
+	// race. It remains nil in production.
+	beforeTurnAdmission func()
+
 	closeOnce sync.Once
 	closeErr  error
 }
@@ -362,19 +366,36 @@ func (p *codexPersistentSession) Execute(ctx context.Context, prompt string, opt
 	}
 	p.current = turn
 	p.mu.Unlock()
+	if p.beforeTurnAdmission != nil {
+		p.beforeTurnAdmission()
+	}
 	if p.proxy != nil {
 		epoch, err := p.proxy.setTokenForTurn(opts.TaskAuthToken)
 		if err != nil {
 			p.mu.Lock()
-			p.current = nil
+			if p.current == turn {
+				p.current = nil
+			}
 			p.mu.Unlock()
 			return nil, err
 		}
 		turn.tokenEpoch = epoch
 	}
 
+	p.mu.Lock()
+	if p.closed || p.current != turn {
+		if p.current == turn {
+			p.current = nil
+		}
+		p.mu.Unlock()
+		if p.proxy != nil {
+			p.proxy.clearTokenForEpoch(turn.tokenEpoch)
+		}
+		return nil, errors.New("codex persistent session is closed")
+	}
 	p.resetClientForTurn()
 	go p.runTurn(ctx, prompt, opts, turn)
+	p.mu.Unlock()
 	return &Session{
 		Messages: turn.messages,
 		Result:   turn.result,
