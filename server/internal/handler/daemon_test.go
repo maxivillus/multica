@@ -90,6 +90,13 @@ func newDaemonTokenRequest(method, path string, body any, workspaceID, daemonID 
 	}
 	req := httptest.NewRequest(method, path, &buf)
 	req.Header.Set("Content-Type", "application/json")
+	// Claim tests model the current daemon. Active issue tasks are intentionally
+	// withheld from daemons that cannot prove the card-session lease at terminal
+	// callbacks, so the shared helper advertises that capability by default.
+	// Tests for legacy claim behaviour explicitly replace or delete this header.
+	if strings.Contains(path, "/claim") {
+		req.Header.Set("X-Client-Capabilities", protocol.DaemonCapabilityCardSessionLeaseV1)
+	}
 	// No X-User-ID — daemon tokens don't set it.
 	ctx := middleware.WithDaemonContext(req.Context(), workspaceID, daemonID)
 	return req.WithContext(ctx)
@@ -543,7 +550,7 @@ func TestClaimTaskByRuntime_SkillBundleRefsAndResolve(t *testing.T) {
 	})
 
 	req := newDaemonTokenRequest("POST", "/api/daemon/runtimes/"+runtimeID+"/tasks/claim", nil, testWorkspaceID, "skill-refs-daemon")
-	req.Header.Set("X-Client-Capabilities", protocol.DaemonCapabilitySkillBundlesV1)
+	req.Header.Set("X-Client-Capabilities", protocol.DaemonCapabilityCardSessionLeaseV1+","+protocol.DaemonCapabilitySkillBundlesV1)
 	req = withURLParam(req, "runtimeId", runtimeID)
 	w := testutil.Call(t, testHandler.ClaimTaskByRuntime, req).Want(http.StatusOK)
 
@@ -2013,9 +2020,7 @@ func TestStartTask_AutopilotRunOnlyTask_ResolvesWorkspace(t *testing.T) {
 
 	// Same-workspace daemon token must succeed — this is the bug in #1224.
 	w = httptest.NewRecorder()
-	req = newDaemonTokenRequest("POST", "/api/daemon/tasks/"+taskID+"/start", map[string]any{
-		"capabilities": []string{protocol.DaemonCapabilityTaskSupplementV1},
-	},
+	req = newDaemonTokenRequest("POST", "/api/daemon/tasks/"+taskID+"/start", map[string]any{},
 		testWorkspaceID, "legit-daemon")
 	req = req.WithContext(context.WithValue(req.Context(), chi.RouteCtxKey, rctx))
 
@@ -2753,7 +2758,7 @@ func claimTaskForRuntimeGuardWithCapabilities(t *testing.T, runtimeID, daemonID,
 	req := newDaemonTokenRequest("POST", "/api/daemon/runtimes/"+runtimeID+"/claim", nil,
 		testWorkspaceID, daemonID)
 	if capabilities != "" {
-		req.Header.Set("X-Client-Capabilities", capabilities)
+		req.Header.Set("X-Client-Capabilities", protocol.DaemonCapabilityCardSessionLeaseV1+","+capabilities)
 	}
 	rctx := chi.NewRouteContext()
 	rctx.URLParams.Add("runtimeId", runtimeID)
@@ -2968,8 +2973,8 @@ func TestClaimTask_IssuePriorSessionRuntimeGuard(t *testing.T) {
 	if task.PriorSessionID != "" {
 		t.Fatalf("runtime mismatch: expected empty PriorSessionID, got %q", task.PriorSessionID)
 	}
-	if task.PriorWorkDir != "/tmp/old-runtime-workdir" {
-		t.Fatalf("runtime mismatch: expected PriorWorkDir='/tmp/old-runtime-workdir', got %q", task.PriorWorkDir)
+	if task.PriorWorkDir != "" {
+		t.Fatalf("runtime mismatch: expected empty PriorWorkDir, got %q", task.PriorWorkDir)
 	}
 	if task.ThreadName != "runtime-session-skip fixture" {
 		t.Fatalf("issue task thread_name = %q, want issue title", task.ThreadName)
@@ -3075,10 +3080,113 @@ func TestClaimTask_IssuePriorSessionRuntimeGuard(t *testing.T) {
 	}
 }
 
+func TestClaimTask_IssueCardSessionRuntimeGuard(t *testing.T) {
+	if testHandler == nil {
+		t.Skip("database not available")
+	}
+
+	ctx := context.Background()
+	agentID, runtimeID, daemonID := createRuntimeGuardAgent(t, ctx)
+	oldRuntimeID := createRuntimeGuardRuntime(t, ctx, "kimi")
+
+	for i, tc := range []struct {
+		name        string
+		sourceRunID string
+		wantSession string
+		wantWorkDir string
+	}{
+		{
+			name:        "runtime mismatch withholds both pointers",
+			sourceRunID: "old-runtime-card-session",
+		},
+		{
+			name:        "matching runtime preserves both pointers",
+			sourceRunID: "same-runtime-card-session",
+			wantSession: "same-runtime-card-session",
+			wantWorkDir: "/tmp/same-runtime-card-session-workdir",
+		},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			number := 81250 + i
+			issueID := dbfx.Issue(t, "card-session runtime guard fixture", testutil.Cols{
+				"status": "in_progress",
+				"number": number,
+			})
+			var cardSessionID string
+			if err := testPool.QueryRow(ctx, `
+				INSERT INTO card_session (
+					workspace_id, issue_id, agent_id, generation, provider,
+					provider_session_id, work_dir
+				)
+				VALUES ($1, $2, $3, 1, 'opencode', $4, '/tmp/same-runtime-card-session-workdir')
+				RETURNING id::text
+			`, testWorkspaceID, issueID, agentID, tc.sourceRunID).Scan(&cardSessionID); err != nil {
+				t.Fatalf("insert card session: %v", err)
+			}
+			sourceRuntimeID := oldRuntimeID
+			if tc.wantSession != "" {
+				sourceRuntimeID = runtimeID
+			}
+			dbfx.Task(t, agentID, testutil.Cols{
+				"runtime_id":      sourceRuntimeID,
+				"issue_id":        issueID,
+				"card_session_id": cardSessionID,
+				"status":          "completed",
+				"session_id":      tc.sourceRunID,
+				"work_dir":        "/tmp/same-runtime-card-session-workdir",
+			})
+			dbfx.Exec(t, `
+				INSERT INTO agent_task_queue (agent_id, runtime_id, issue_id, status, priority)
+				VALUES ($1, $2, $3, 'queued', 0)
+			`, agentID, runtimeID, issueID)
+
+			task := claimTaskForRuntimeGuard(t, runtimeID, daemonID)
+			if task.PriorSessionID != tc.wantSession || task.PriorWorkDir != tc.wantWorkDir {
+				t.Fatalf("session/workdir = (%q, %q), want (%q, %q)",
+					task.PriorSessionID, task.PriorWorkDir, tc.wantSession, tc.wantWorkDir)
+			}
+			dbfx.Exec(t, `
+				UPDATE agent_task_queue
+				SET status = 'completed', completed_at = now()
+				WHERE issue_id = $1 AND status IN ('dispatched', 'running')
+			`, issueID)
+		})
+	}
+}
+
+func TestClaimTask_BacklogExplicitTaskDoesNotResumeTaskHistory(t *testing.T) {
+	if testHandler == nil {
+		t.Skip("database not available")
+	}
+	ctx := context.Background()
+	agentID, runtimeID, daemonID := createRuntimeGuardAgent(t, ctx)
+	issueID := dbfx.Issue(t, "backlog explicit mention resume guard", testutil.Cols{
+		"status": "backlog",
+		"number": 81209,
+	})
+	dbfx.Exec(t, `
+		INSERT INTO agent_task_queue (
+			agent_id, runtime_id, issue_id, status, priority, started_at,
+			completed_at, session_id, work_dir
+		)
+		VALUES ($1, $2, $3, 'completed', 0, now(), now(), 'backlog-old-session-sentinel', '/private/backlog-old-workdir-sentinel')
+	`, agentID, runtimeID, issueID)
+	dbfx.Exec(t, `
+		INSERT INTO agent_task_queue (agent_id, runtime_id, issue_id, status, priority)
+		VALUES ($1, $2, $3, 'queued', 0)
+	`, agentID, runtimeID, issueID)
+
+	task := claimTaskForRuntimeGuard(t, runtimeID, daemonID)
+	if task.PriorSessionID != "" || task.PriorWorkDir != "" || task.PriorSessionResumeUnavailable {
+		t.Fatalf("backlog explicit task received resume hints: session=%q workdir=%q unavailable=%t",
+			task.PriorSessionID, task.PriorWorkDir, task.PriorSessionResumeUnavailable)
+	}
+}
+
 // TestClaimTask_ManualRetryReusesWorkdir is the MUL-4869 claim-layer contract: a
-// manual retry (rerun_of_task_id set) ALWAYS hands back the source task's
-// workdir, and resumes the session only when the source failure did not poison
-// the conversation AND the source ran on the claiming runtime. The rerun row's
+// manual retry (rerun_of_task_id set) may reuse the source task's workdir only
+// when the source ran on the claiming runtime, and resumes the session only
+// when the source failure did not poison the conversation. The rerun row's
 // force_fresh_session is always true (rollback-safe); the session decision is
 // computed here from the source task, including the legacy 400 error-text guard.
 // Contrast with a plain force_fresh task carrying no rerun lineage, which resumes
@@ -3106,14 +3214,21 @@ func TestClaimTask_ManualRetryReusesWorkdir(t *testing.T) {
 			"status": "in_progress",
 			"number": issueNum,
 		})
+		var cardSessionID string
+		dbfx.QueryRow(t, `
+			INSERT INTO card_session (workspace_id, issue_id, agent_id, generation, provider)
+			VALUES ($1, $2, $3, 1, 'opencode')
+			RETURNING id
+		`, testWorkspaceID, issueID, agentID).Scan(&cardSessionID)
 		sourceID := dbfx.Task(t, agentID, testutil.Cols{
-			"runtime_id":     sourceRuntimeID,
-			"issue_id":       issueID,
-			"status":         "failed",
-			"failure_reason": failureReason,
-			"error":          errorText,
-			"session_id":     session,
-			"work_dir":       workdir,
+			"runtime_id":      sourceRuntimeID,
+			"issue_id":        issueID,
+			"card_session_id": cardSessionID,
+			"status":          "failed",
+			"failure_reason":  failureReason,
+			"error":           errorText,
+			"session_id":      session,
+			"work_dir":        workdir,
 		})
 		// force_fresh_session is always true on a rerun row (rollback-safe); the
 		// new claim handler resumes from the source task regardless.
@@ -3161,13 +3276,10 @@ func TestClaimTask_ManualRetryReusesWorkdir(t *testing.T) {
 		}
 	})
 
-	t.Run("different_runtime_reuses_workdir_drops_session", func(t *testing.T) {
+	t.Run("different_runtime_withholds_workdir_and_session", func(t *testing.T) {
 		task := insertRerun(t, otherRuntimeID, "timeout", "", "cross-session", "/tmp/retry-cross-workdir")
-		if task.PriorWorkDir != "/tmp/retry-cross-workdir" {
-			t.Fatalf("PriorWorkDir = %q, want /tmp/retry-cross-workdir (workdir offered regardless of runtime, best-effort)", task.PriorWorkDir)
-		}
-		if task.PriorSessionID != "" {
-			t.Fatalf("PriorSessionID = %q, want empty (cross-runtime session cannot resolve)", task.PriorSessionID)
+		if task.PriorWorkDir != "" || task.PriorSessionID != "" {
+			t.Fatalf("cross-runtime rerun pointers = (%q, %q), want both empty", task.PriorSessionID, task.PriorWorkDir)
 		}
 	})
 
@@ -3201,11 +3313,53 @@ func TestClaimTask_ManualRetryReusesWorkdir(t *testing.T) {
 			t.Fatal("cross-agent rerun must disclose that the requested source was not resumable")
 		}
 	})
+
+	t.Run("closed_generation_source_starts_clean", func(t *testing.T) {
+		issueNum++
+		issueID := dbfx.Issue(t, "manual-retry-closed-generation fixture", testutil.Cols{
+			"status": "in_progress",
+			"number": issueNum,
+		})
+		var closedGenerationID string
+		dbfx.QueryRow(t, `
+			INSERT INTO card_session (workspace_id, issue_id, agent_id, generation, provider, state, closed_at)
+			VALUES ($1, $2, $3, 1, 'opencode', 'closed', now())
+			RETURNING id
+		`, testWorkspaceID, issueID, agentID).Scan(&closedGenerationID)
+		dbfx.Exec(t, `
+			INSERT INTO card_session (workspace_id, issue_id, agent_id, generation, provider)
+			VALUES ($1, $2, $3, 2, 'opencode')
+		`, testWorkspaceID, issueID, agentID)
+		sourceID := dbfx.Task(t, agentID, testutil.Cols{
+			"runtime_id":      runtimeID,
+			"issue_id":        issueID,
+			"card_session_id": closedGenerationID,
+			"status":          "failed",
+			"failure_reason":  "timeout",
+			"session_id":      "stale-generation-session-marker",
+			"work_dir":        "/private/stale-generation-workdir-marker",
+		})
+		dbfx.Exec(t, `
+			INSERT INTO agent_task_queue (
+				agent_id, runtime_id, issue_id, status, priority,
+				rerun_of_task_id, force_fresh_session
+			)
+			VALUES ($1, $2, $3, 'queued', 0, $4, TRUE)
+		`, agentID, runtimeID, issueID, sourceID)
+
+		task := claimTaskForRuntimeGuard(t, runtimeID, daemonID)
+		if task.PriorSessionID != "" || task.PriorWorkDir != "" {
+			t.Fatalf("stale-generation rerun hints = (%q, %q), want clean start", task.PriorSessionID, task.PriorWorkDir)
+		}
+		if !task.PriorSessionResumeUnavailable {
+			t.Fatal("stale-generation rerun must disclose that its old provider state was discarded")
+		}
+	})
 }
 
 // createAutoRetryForTest runs the production retry insert against a failed
 // parent, so a claim test exercises the row CreateRetryTask actually writes.
-func createAutoRetryForTest(t *testing.T, ctx context.Context, parentID string) {
+func createAutoRetryForTest(t *testing.T, ctx context.Context, parentID string) string {
 	t.Helper()
 	child, err := testHandler.Queries.CreateRetryTask(ctx, db.CreateRetryTaskParams{ID: parseUUID(parentID)})
 	if err != nil {
@@ -3214,6 +3368,7 @@ func createAutoRetryForTest(t *testing.T, ctx context.Context, parentID string) 
 	t.Cleanup(func() {
 		testPool.Exec(context.Background(), `DELETE FROM agent_task_queue WHERE id = $1`, child.ID)
 	})
+	return uuidToString(child.ID)
 }
 
 // TestClaimTask_AutoRetryFreshSessionReusesParentWorkdir is the MUL-7034
@@ -3252,30 +3407,41 @@ func TestClaimTask_AutoRetryFreshSessionReusesParentWorkdir(t *testing.T) {
 			ctx := context.Background()
 			agentID, runtimeID, daemonID := createRuntimeGuardAgent(t, ctx)
 			issueID := dbfx.Issue(t, "auto-retry fresh-session fixture", testutil.Cols{"status": "in_progress"})
+			var cardSessionID string
+			dbfx.QueryRow(t, `
+				INSERT INTO card_session (
+					workspace_id, issue_id, agent_id, generation, provider,
+					provider_session_id, work_dir
+				)
+				VALUES ($1, $2, $3, 1, 'codex', 'codex-stuck-session', '/tmp/codex-stuck-workdir')
+				RETURNING id::text
+			`, testWorkspaceID, issueID, agentID).Scan(&cardSessionID)
 
 			// An earlier healthy turn is what the (agent, issue) resume lookup
 			// returns, since it skips the poisoned parent. Getting its session or
 			// workdir back would mean the retry fell through to that lookup.
 			dbfx.Task(t, agentID, testutil.Cols{
-				"runtime_id":   runtimeID,
-				"issue_id":     issueID,
-				"status":       "completed",
-				"started_at":   testutil.Raw("now() - interval '30 minutes'"),
-				"completed_at": testutil.Raw("now() - interval '25 minutes'"),
-				"session_id":   "earlier-healthy-session",
-				"work_dir":     "/tmp/earlier-healthy-workdir",
+				"runtime_id":      runtimeID,
+				"issue_id":        issueID,
+				"card_session_id": cardSessionID,
+				"status":          "completed",
+				"started_at":      testutil.Raw("now() - interval '30 minutes'"),
+				"completed_at":    testutil.Raw("now() - interval '25 minutes'"),
+				"session_id":      "earlier-healthy-session",
+				"work_dir":        "/tmp/earlier-healthy-workdir",
 			})
 			parentID := dbfx.Task(t, agentID, testutil.Cols{
-				"runtime_id":     runtimeID,
-				"issue_id":       issueID,
-				"status":         "failed",
-				"failure_reason": "codex_semantic_inactivity",
-				"started_at":     testutil.Raw("now() - interval '20 minutes'"),
-				"completed_at":   testutil.Raw("now() - interval '1 minute'"),
-				"session_id":     "codex-stuck-session",
-				"work_dir":       "/tmp/codex-stuck-workdir",
-				"attempt":        1,
-				"max_attempts":   2,
+				"runtime_id":      runtimeID,
+				"issue_id":        issueID,
+				"card_session_id": cardSessionID,
+				"status":          "failed",
+				"failure_reason":  "codex_semantic_inactivity",
+				"started_at":      testutil.Raw("now() - interval '20 minutes'"),
+				"completed_at":    testutil.Raw("now() - interval '1 minute'"),
+				"session_id":      "codex-stuck-session",
+				"work_dir":        "/tmp/codex-stuck-workdir",
+				"attempt":         1,
+				"max_attempts":    2,
 			})
 			createAutoRetryForTest(t, ctx, parentID)
 
@@ -3290,6 +3456,86 @@ func TestClaimTask_AutoRetryFreshSessionReusesParentWorkdir(t *testing.T) {
 				t.Fatal("auto-retry must disclose that the failed attempt's context did not come back")
 			}
 		})
+	}
+}
+
+func TestClaimTask_AutoRetryDoesNotReuseClosedCardSessionWorkdir(t *testing.T) {
+	if testHandler == nil {
+		t.Skip("database not available")
+	}
+	ctx := context.Background()
+	agentID, runtimeID, daemonID := createRuntimeGuardAgent(t, ctx)
+	issueID := dbfx.Issue(t, "auto-retry closed-generation fixture", testutil.Cols{"status": "in_progress"})
+
+	var closedSessionID string
+	dbfx.QueryRow(t, `
+		INSERT INTO card_session (workspace_id, issue_id, agent_id, generation, provider, state, closed_at)
+		VALUES ($1, $2, $3, 1, 'codex', 'closed', now())
+		RETURNING id::text
+	`, testWorkspaceID, issueID, agentID).Scan(&closedSessionID)
+	dbfx.Exec(t, `
+		INSERT INTO card_session (workspace_id, issue_id, agent_id, generation, provider)
+		VALUES ($1, $2, $3, 2, 'codex')
+	`, testWorkspaceID, issueID, agentID)
+	parentID := dbfx.Task(t, agentID, testutil.Cols{
+		"runtime_id":      runtimeID,
+		"issue_id":        issueID,
+		"card_session_id": closedSessionID,
+		"status":          "failed",
+		"failure_reason":  "codex_semantic_inactivity",
+		"started_at":      testutil.Raw("now() - interval '20 minutes'"),
+		"completed_at":    testutil.Raw("now() - interval '1 minute'"),
+		"session_id":      "closed-generation-session-marker",
+		"work_dir":        "/private/closed-generation-workdir-marker",
+		"attempt":         1,
+		"max_attempts":    2,
+	})
+	createAutoRetryForTest(t, ctx, parentID)
+
+	task := claimTaskForRuntimeGuardWithCapabilities(t, runtimeID, daemonID, protocol.DaemonCapabilityCheckoutKeepsWorkV1)
+	if task.PriorSessionID != "" || task.PriorWorkDir != "" {
+		t.Fatalf("closed-generation retry pointers = (%q, %q), want both empty", task.PriorSessionID, task.PriorWorkDir)
+	}
+	if !task.PriorSessionResumeUnavailable {
+		t.Fatal("retry from a closed generation must disclose that provider state was discarded")
+	}
+}
+
+func TestClaimTask_AutoRetryWithholdsPointersFromDifferentRuntime(t *testing.T) {
+	if testHandler == nil {
+		t.Skip("database not available")
+	}
+
+	ctx := context.Background()
+	agentID, claimRuntimeID, daemonID := createRuntimeGuardAgent(t, ctx)
+	sourceRuntimeID := createRuntimeGuardRuntime(t, ctx, "codex")
+	issueID := dbfx.Issue(t, "auto-retry cross-runtime fixture", testutil.Cols{"status": "in_progress"})
+	var cardSessionID string
+	dbfx.QueryRow(t, `
+		INSERT INTO card_session (
+			workspace_id, issue_id, agent_id, generation, provider,
+			provider_session_id, work_dir
+		)
+		VALUES ($1, $2, $3, 1, 'codex', 'source-runtime-session-marker', '/private/source-runtime-workdir-marker')
+		RETURNING id::text
+	`, testWorkspaceID, issueID, agentID).Scan(&cardSessionID)
+	parentID := dbfx.Task(t, agentID, testutil.Cols{
+		"runtime_id":      sourceRuntimeID,
+		"issue_id":        issueID,
+		"card_session_id": cardSessionID,
+		"status":          "failed",
+		"failure_reason":  "codex_semantic_inactivity",
+		"session_id":      "source-runtime-session-marker",
+		"work_dir":        "/private/source-runtime-workdir-marker",
+		"attempt":         1,
+		"max_attempts":    2,
+	})
+	retryID := createAutoRetryForTest(t, ctx, parentID)
+	dbfx.Exec(t, `UPDATE agent_task_queue SET runtime_id = $2 WHERE id = $1`, retryID, claimRuntimeID)
+
+	task := claimTaskForRuntimeGuardWithCapabilities(t, claimRuntimeID, daemonID, protocol.DaemonCapabilityCheckoutKeepsWorkV1)
+	if task.PriorSessionID != "" || task.PriorWorkDir != "" {
+		t.Fatalf("cross-runtime auto-retry pointers = (%q, %q), want both empty", task.PriorSessionID, task.PriorWorkDir)
 	}
 }
 
@@ -3338,6 +3584,40 @@ func TestClaimTask_ChatAutoRetryFreshSessionReusesParentWorkdir(t *testing.T) {
 	}
 }
 
+func TestClaimTask_ChatAutoRetryWithholdsWorkdirFromDifferentRuntime(t *testing.T) {
+	if testHandler == nil {
+		t.Skip("database not available")
+	}
+	ctx := context.Background()
+	agentID, runtimeID, daemonID := createRuntimeGuardAgent(t, ctx)
+	oldRuntimeID := createRuntimeGuardRuntime(t, ctx, "kimi")
+	chatSessionID := dbfx.ChatSession(t, agentID, testutil.Cols{
+		"title":      "auto-retry chat runtime mismatch",
+		"session_id": "old-chat-session",
+		"work_dir":   "/private/old-chat-runtime-workdir-marker",
+		"runtime_id": oldRuntimeID,
+	})
+	parentID := dbfx.Task(t, agentID, testutil.Cols{
+		"runtime_id":      oldRuntimeID,
+		"chat_session_id": chatSessionID,
+		"status":          "failed",
+		"failure_reason":  "codex_semantic_inactivity",
+		"started_at":      testutil.Raw("now() - interval '20 minutes'"),
+		"completed_at":    testutil.Raw("now() - interval '1 minute'"),
+		"session_id":      "old-chat-runtime-session-marker",
+		"work_dir":        "/private/old-chat-runtime-workdir-marker",
+		"attempt":         1,
+		"max_attempts":    2,
+	})
+	retryID := createAutoRetryForTest(t, ctx, parentID)
+	dbfx.Exec(t, `UPDATE agent_task_queue SET runtime_id = $2 WHERE id = $1`, retryID, runtimeID)
+
+	task := claimTaskForRuntimeGuardWithCapabilities(t, runtimeID, daemonID, protocol.DaemonCapabilityCheckoutKeepsWorkV1)
+	if task.PriorSessionID != "" || task.PriorWorkDir != "" {
+		t.Fatalf("cross-runtime chat retry pointers = (%q, %q), want both empty", task.PriorSessionID, task.PriorWorkDir)
+	}
+}
+
 func TestClaimTask_ChatPriorSessionRuntimeGuard(t *testing.T) {
 	if testHandler == nil {
 		t.Skip("database not available")
@@ -3375,8 +3655,8 @@ func TestClaimTask_ChatPriorSessionRuntimeGuard(t *testing.T) {
 	if task.PriorSessionID != "" {
 		t.Fatalf("chat runtime mismatch: expected empty PriorSessionID, got %q", task.PriorSessionID)
 	}
-	if task.PriorWorkDir != "/tmp/old-chat-workdir" {
-		t.Fatalf("chat runtime mismatch: expected PriorWorkDir='/tmp/old-chat-workdir', got %q", task.PriorWorkDir)
+	if task.PriorWorkDir != "" {
+		t.Fatalf("chat runtime mismatch: expected empty PriorWorkDir, got %q", task.PriorWorkDir)
 	}
 	dbfx.Exec(t, `
 		UPDATE agent_task_queue

@@ -720,6 +720,13 @@ func (s *IssueWakeupService) dispatch(ctx context.Context, prev db.IssueWakeup) 
 	}
 	q := s.Tasks.Queries.WithTx(tx)
 	var fenced bool
+	if prev.IssueID.Valid {
+		// Take the issue lifecycle lock before workspace, issue, or wakeup row
+		// locks. Status changes take the same lock in their database trigger.
+		if err = q.LockIssueTaskLifecycle(ctx, prev.IssueID); err != nil {
+			return err
+		}
+	}
 	if candidate.ID.Valid {
 		if err = tx.QueryRow(ctx, "SELECT lock_task_owner_rows($1,$2,$3)", candidate.ID, prev.IssueID, candidate.RuntimeID).Scan(&fenced); err != nil {
 			return err
@@ -732,7 +739,9 @@ func (s *IssueWakeupService) dispatch(ctx context.Context, prev db.IssueWakeup) 
 			return err
 		}
 	}
-	issue, err := q.LockWakeupIssue(ctx, prev.IssueID)
+	issue, err := q.GetIssueInWorkspace(ctx, db.GetIssueInWorkspaceParams{
+		ID: prev.IssueID, WorkspaceID: prev.WorkspaceID,
+	})
 	if errors.Is(err, pgx.ErrNoRows) {
 		return qCleanupMissingWakeup(ctx, tx, prev.ID)
 	}

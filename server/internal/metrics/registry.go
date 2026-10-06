@@ -12,12 +12,13 @@ import (
 )
 
 type RegistryOptions struct {
-	Pool        *pgxpool.Pool
-	ReplicaPool *pgxpool.Pool
-	Realtime    *realtime.Metrics
-	DaemonWS    *daemonws.Metrics
-	Version     string
-	Commit      string
+	Pool                     *pgxpool.Pool
+	ReplicaPool              *pgxpool.Pool
+	Realtime                 *realtime.Metrics
+	DaemonWS                 *daemonws.Metrics
+	Version                  string
+	Commit                   string
+	CardSessionObservability bool
 }
 
 type Registry struct {
@@ -28,6 +29,7 @@ type Registry struct {
 	ChannelLease *ChannelLeaseMetrics
 	Wecom        *WecomMetrics
 	DBRouting    *DBRoutingMetrics
+	CardSession  *CardSessionMetrics
 }
 
 func NewRegistry(opts RegistryOptions) *Registry {
@@ -58,6 +60,11 @@ func NewRegistry(opts RegistryOptions) *Registry {
 	reg.MustRegister(wecomMetrics.Collectors()...)
 	dbRoutingMetrics := NewDBRoutingMetrics()
 	reg.MustRegister(dbRoutingMetrics.Collectors()...)
+	var cardSessionMetrics *CardSessionMetrics
+	if opts.CardSessionObservability {
+		cardSessionMetrics = NewCardSessionMetrics()
+		reg.MustRegister(cardSessionMetrics.Collectors()...)
+	}
 
 	if opts.Pool != nil {
 		reg.MustRegister(NewDBCollector(opts.Pool, opts.ReplicaPool))
@@ -77,6 +84,7 @@ func NewRegistry(opts RegistryOptions) *Registry {
 		ChannelLease: channelLease,
 		Wecom:        wecomMetrics,
 		DBRouting:    dbRoutingMetrics,
+		CardSession:  cardSessionMetrics,
 	}
 }
 

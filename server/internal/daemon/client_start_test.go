@@ -136,6 +136,68 @@ func startTestClaim() Task {
 	return Task{ID: "task-1", RuntimeID: "runtime-1", DispatchedAt: "2026-09-17T09:00:00.123456Z", StartClaimSupported: true}
 }
 
+func TestStartTaskWithLeaseAndCardSessionLeaseEndpoints(t *testing.T) {
+	client := NewClient("https://daemon.test")
+	client.client.Transport = startTaskTransport(func(r *http.Request) (*http.Response, error) {
+		if r.Method != http.MethodPost {
+			t.Fatalf("method = %s, want POST", r.Method)
+		}
+		var body map[string]any
+		if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
+			t.Fatalf("decode %s body: %v", r.URL.Path, err)
+		}
+		var response string
+		switch r.URL.Path {
+		case "/api/daemon/tasks/task-1/start":
+			if body["runtime_id"] != "runtime-1" {
+				t.Fatalf("start runtime_id = %#v", body["runtime_id"])
+			}
+			response = `{"supplement_capability":"task-supplement-v1","card_session_id":"session-1","card_session_generation":4,"card_session_lease_epoch":7,"lease_heartbeat_at":"2026-09-30T09:00:00Z","card_session_idle_timeout_hours":48}`
+		case "/api/daemon/tasks/task-1/card-session/heartbeat":
+			if body["lease_epoch"] != float64(7) {
+				t.Fatalf("heartbeat lease_epoch = %#v", body["lease_epoch"])
+			}
+			response = `{"card_session_id":"session-1","generation":4,"lease_epoch":7,"lease_heartbeat_at":"2026-09-30T09:00:30Z"}`
+		case "/api/daemon/tasks/task-1/card-session/release":
+			if body["lease_epoch"] != float64(7) {
+				t.Fatalf("release lease_epoch = %#v", body["lease_epoch"])
+			}
+			response = `{"card_session_id":"session-1","generation":4,"lease_epoch":7}`
+		default:
+			t.Fatalf("unexpected path: %s", r.URL.Path)
+		}
+		return &http.Response{
+			StatusCode: http.StatusOK,
+			Header:     http.Header{"Content-Type": []string{"application/json"}},
+			Body:       io.NopCloser(strings.NewReader(response)),
+		}, nil
+	})
+
+	negotiated, lease, err := client.StartTaskWithLease(context.Background(), startTestClaim())
+	if err != nil {
+		t.Fatalf("StartTaskWithLease: %v", err)
+	}
+	if !negotiated || lease.CardSessionID != "session-1" || lease.Generation != 4 || lease.LeaseEpoch != 7 || lease.LeaseHeartbeatAt != "2026-09-30T09:00:00Z" || lease.IdleTimeoutHours != 48 {
+		t.Fatalf("start lease = %#v, negotiated=%t", lease, negotiated)
+	}
+
+	heartbeat, err := client.HeartbeatCardSessionLease(context.Background(), "task-1", lease.LeaseEpoch)
+	if err != nil {
+		t.Fatalf("HeartbeatCardSessionLease: %v", err)
+	}
+	if heartbeat.LeaseEpoch != lease.LeaseEpoch || heartbeat.LeaseHeartbeatAt != "2026-09-30T09:00:30Z" {
+		t.Fatalf("heartbeat lease = %#v", heartbeat)
+	}
+
+	released, err := client.ReleaseCardSessionLease(context.Background(), "task-1", lease.LeaseEpoch)
+	if err != nil {
+		t.Fatalf("ReleaseCardSessionLease: %v", err)
+	}
+	if released.CardSessionID != lease.CardSessionID || released.Generation != lease.Generation {
+		t.Fatalf("released lease = %#v", released)
+	}
+}
+
 func TestStartTaskLegacyServerDoesNotRetry(t *testing.T) {
 	calls := 0
 	client := NewClient("https://daemon.test")

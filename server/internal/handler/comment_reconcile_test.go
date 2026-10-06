@@ -17,10 +17,30 @@ import (
 // completeTaskViaHandler drives the daemon CompleteTask endpoint for taskID.
 func completeTaskViaHandler(t *testing.T, taskID, output string) *httptest.ResponseRecorder {
 	t.Helper()
+	ctx := context.Background()
+	task, err := testHandler.Queries.GetAgentTask(ctx, parseUUID(taskID))
+	if err != nil {
+		t.Fatalf("load task for completion: %v", err)
+	}
+	daemonID := "legit-daemon"
+	var leaseEpoch int64
+	if task.CardSessionID.Valid {
+		lease, leaseErr := testHandler.Queries.GetCardSession(ctx, task.CardSessionID)
+		if leaseErr != nil {
+			t.Fatalf("load card-session lease for completion: %v", leaseErr)
+		}
+		if lease.LeaseOwner.Valid && lease.LeaseOwner.String != "" {
+			daemonID = lease.LeaseOwner.String
+		}
+		leaseEpoch = lease.LeaseEpoch
+	}
+	body := map[string]any{"output": output}
+	if leaseEpoch > 0 {
+		body["card_session_lease_epoch"] = leaseEpoch
+	}
 	w := httptest.NewRecorder()
 	req := newDaemonTokenRequest("POST", "/api/daemon/tasks/"+taskID+"/complete",
-		map[string]any{"output": output},
-		testWorkspaceID, "legit-daemon")
+		body, testWorkspaceID, daemonID)
 	rctx := chi.NewRouteContext()
 	rctx.URLParams.Add("taskId", taskID)
 	req = req.WithContext(context.WithValue(req.Context(), chi.RouteCtxKey, rctx))

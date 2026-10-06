@@ -56,9 +56,9 @@ func TestListTasksByIssueHydratesUsage(t *testing.T) {
 	unpricedTask := newTask("completed")
 
 	if _, err := testPool.Exec(ctx, `
-		INSERT INTO task_usage (task_id, provider, model, input_tokens, output_tokens, cache_read_tokens, cache_write_tokens, cost_usd_ticks)
-		VALUES ($1, 'anthropic', 'claude-opus-5',  96000, 34000, 712000, 50000, NULL),
-		       ($1, 'openai',    'gpt-5.6-terra',  31000, 12000, 158000, 11000, 3310000000)
+		INSERT INTO task_usage (task_id, provider, model, input_tokens, output_tokens, cache_read_tokens, cache_write_tokens, cost_usd_ticks, card_session_mode)
+		VALUES ($1, 'anthropic', 'claude-opus-5',  96000, 34000, 712000, 50000, NULL, 'resume'),
+		       ($1, 'openai',    'gpt-5.6-terra',  31000, 12000, 158000, 11000, 3310000000, 'persistent')
 	`, pricedTask); err != nil {
 		t.Fatalf("insert task usage: %v", err)
 	}
@@ -105,6 +105,9 @@ func TestListTasksByIssueHydratesUsage(t *testing.T) {
 		opus.CacheReadTokens != 712000 || opus.CacheWriteTokens != 50000 {
 		t.Errorf("opus token counts = %+v, want 96000/34000/712000/50000", opus)
 	}
+	if opus.CardSessionMode != "resume" {
+		t.Errorf("opus card_session_mode = %q, want resume", opus.CardSessionMode)
+	}
 	// The provider reported no cost for this row, so the client must estimate
 	// it — a 0 here would tell the client the provider said "free".
 	if opus.CostUsdTicks != nil {
@@ -117,6 +120,9 @@ func TestListTasksByIssueHydratesUsage(t *testing.T) {
 	}
 	if terra.CostUsdTicks == nil || *terra.CostUsdTicks != 3310000000 {
 		t.Errorf("terra cost_usd_ticks = %v, want 3310000000", terra.CostUsdTicks)
+	}
+	if terra.CardSessionMode != "persistent" {
+		t.Errorf("terra card_session_mode = %q, want persistent", terra.CardSessionMode)
 	}
 
 	unpriced, ok := byID[unpricedTask]

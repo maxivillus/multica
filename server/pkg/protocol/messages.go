@@ -71,6 +71,12 @@ const (
 	// It is persisted when this exact task enters running; absence always means
 	// unsupported so mixed server/daemon versions fail closed.
 	DaemonCapabilityTaskSupplementV1 = "task-supplement-v1"
+	// DaemonCapabilityCardSessionLeaseV1 advertises that the daemon understands
+	// the server-issued card-session lease epoch returned by task start and will
+	// include it in terminal callbacks. Starts without this capability are
+	// rejected for issue tasks so an old daemon cannot start work it cannot prove
+	// at completion.
+	DaemonCapabilityCardSessionLeaseV1 = "card-session-lease-v1"
 
 	TaskSupplementFailureTurnNotStarted   = "turn_not_started"
 	TaskSupplementFailureProviderRejected = "provider_rejected"

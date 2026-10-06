@@ -6,6 +6,7 @@ import (
 	"errors"
 	"log/slog"
 	"os/exec"
+	"path/filepath"
 	"strings"
 	"syscall"
 	"time"
@@ -348,7 +349,7 @@ func (c Config) logAgentCommandFields(cmd *exec.Cmd, source agentCommandLogArgs,
 	trustedPositionals := c.trustedAgentCommandPositionals(args, source)
 	fields := []any{
 		"provider", c.provider,
-		"exec", cmd.Path,
+		"exec", filepath.Base(cmd.Path),
 		"args", redactAgentCommandArgs(args, trustedPositionals),
 		"arg_count", len(args),
 	}
@@ -356,6 +357,31 @@ func (c Config) logAgentCommandFields(cmd *exec.Cmd, source agentCommandLogArgs,
 		fields = append(fields, "prompt_bytes", promptBytes)
 	}
 	logger.Info("agent command", fields...)
+}
+
+// logNativeBinaryResolution records that a Windows launcher was bypassed
+// without including either host path in package logs.
+func logNativeBinaryResolution(logger *slog.Logger, provider, shim, native string) {
+	if logger == nil {
+		return
+	}
+	logger.Info(provider+" resolved to native binary to avoid .cmd shim argv truncation",
+		"shim_present", shim != "",
+		"native_present", native != "",
+	)
+}
+
+// logPowerShellRoute records the chosen wrapper route using presence markers;
+// all three values can contain machine-specific paths.
+func logPowerShellRoute(logger *slog.Logger, toolName, route, powershell, ps1, original string) {
+	if logger == nil {
+		return
+	}
+	logger.Info(toolName+": routing through powershell -"+route,
+		"powershell_present", powershell != "",
+		"script_present", ps1 != "",
+		"launcher_present", original != "",
+	)
 }
 
 // trustedAgentCommandPositionals maps source indexes onto the final exec.Cmd

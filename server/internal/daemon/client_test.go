@@ -58,6 +58,9 @@ func TestClient_IdentityHeaders_PostJSON(t *testing.T) {
 			// Without it the server never hands this daemon the wakeups that
 			// waited for its run; they start runs of their own instead.
 			protocol.DaemonCapabilityJoinedWakeupsV1,
+			// Card-session starts are rejected by a new server when this is
+			// absent, so an old daemon cannot begin a run it cannot finalize.
+			protocol.DaemonCapabilityCardSessionLeaseV1,
 		} {
 			if !capabilities[want] {
 				t.Errorf("X-Client-Capabilities missing %q: %v", want, capabilities)
@@ -643,6 +646,50 @@ func TestTerminalReportsCarryDurableWorkDir(t *testing.T) {
 			}
 			if got := body["durable_work_dir"]; got != durableWorkDir {
 				t.Fatalf("durable_work_dir = %v, want %q (body: %v)", got, durableWorkDir, body)
+			}
+		})
+	}
+}
+
+func TestTerminalReportsCarryCardSessionLeaseEpoch(t *testing.T) {
+	for _, tc := range []struct {
+		name string
+		call func(*Client) error
+		path string
+	}{
+		{
+			name: "complete",
+			path: "/api/daemon/tasks/task-1/complete",
+			call: func(c *Client) error {
+				return c.completeTaskWithLeaseRetrySchedule(context.Background(), "task-1", "done", "", "", "/tmp/wd", false, "", "", 7, nil)
+			},
+		},
+		{
+			name: "fail",
+			path: "/api/daemon/tasks/task-1/fail",
+			call: func(c *Client) error {
+				return c.failTaskWithLeaseRetrySchedule(context.Background(), "task-1", "boom", "", "/tmp/wd", "", "agent_error", false, "", "", 7, nil)
+			},
+		},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			var body map[string]any
+			srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				if r.URL.Path != tc.path {
+					t.Errorf("path = %q, want %q", r.URL.Path, tc.path)
+				}
+				if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
+					t.Errorf("decode terminal body: %v", err)
+				}
+				w.WriteHeader(http.StatusOK)
+			}))
+			defer srv.Close()
+
+			if err := tc.call(NewClient(srv.URL)); err != nil {
+				t.Fatalf("terminal report: %v", err)
+			}
+			if got := body["card_session_lease_epoch"]; got != float64(7) {
+				t.Fatalf("card_session_lease_epoch = %v, want 7 (body: %v)", got, body)
 			}
 		})
 	}

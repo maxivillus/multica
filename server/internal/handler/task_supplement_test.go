@@ -72,7 +72,10 @@ func TestTaskSupplementClaimStartReplay(t *testing.T) {
 	for range 2 {
 		req := withURLParam(newDaemonTokenRequest(http.MethodPost, "/start", map[string]any{
 			"runtime_id": f.runtimeID, "dispatched_at": generation.Format(time.RFC3339Nano),
-			"capabilities": []string{protocol.DaemonCapabilityTaskSupplementV1},
+			"capabilities": []string{
+				protocol.DaemonCapabilityCardSessionLeaseV1,
+				protocol.DaemonCapabilityTaskSupplementV1,
+			},
 		}, testWorkspaceID, "start-claim-test"), "taskId", f.taskID)
 		var started AgentTaskResponse
 		testutil.Call(t, testHandler.StartTask, req).Want(http.StatusOK).JSON(&started)
@@ -186,11 +189,11 @@ func TestTaskSupplementNegotiationFailsClosed(t *testing.T) {
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			fixture := newSupplementFixture(t, tc.provider, "dispatched", false)
-			var capabilities []string
+			capabilities := []string{protocol.DaemonCapabilityCardSessionLeaseV1}
 			if tc.daemonAdvertises {
-				capabilities = []string{protocol.DaemonCapabilityTaskSupplementV1}
+				capabilities = append(capabilities, protocol.DaemonCapabilityTaskSupplementV1)
 			}
-			req := withURLParam(newRequest(http.MethodPost, "/start", map[string]any{"capabilities": capabilities}), "taskId", fixture.taskID)
+			req := withURLParam(newDaemonTokenRequest(http.MethodPost, "/start", map[string]any{"capabilities": capabilities}, testWorkspaceID, "test-daemon"), "taskId", fixture.taskID)
 			var started AgentTaskResponse
 			testutil.Call(t, testHandler.StartTask, req).Want(http.StatusOK).JSON(&started)
 			if started.Status != "running" || started.StartedAt == nil {
@@ -217,7 +220,7 @@ func TestTaskSupplementCapabilityDoesNotBreakNonIssueStarts(t *testing.T) {
 			runtimeID := dbfx.Runtime(t, "supplement-no-issue", testutil.Cols{"provider": provider})
 			agentID := dbfx.Agent(t, "Supplement no issue", runtimeID)
 			taskID := dbfx.Task(t, agentID, testutil.Cols{"runtime_id": runtimeID, "issue_id": nil, "status": "dispatched"})
-			started, err := testHandler.TaskService.StartTask(t.Context(), parseUUID(taskID), true)
+			started, err := testHandler.TaskService.StartTaskWithCardSessionLease(t.Context(), parseUUID(taskID), "test-daemon", true)
 			if err != nil || started.Status != "running" {
 				t.Fatalf("non-issue start = %#v: %v", started, err)
 			}

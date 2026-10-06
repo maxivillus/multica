@@ -8,6 +8,16 @@ WITH candidate AS MATERIALIZED (
     JOIN agent_runtime r ON r.id = t.runtime_id
     WHERE t.id = @task_id
       AND t.status IN ('dispatched', 'waiting_local_directory')
+      AND (
+          COALESCE(sqlc.narg('supports_card_session_lease')::bool, true)
+          OR t.issue_id IS NULL
+          OR NOT EXISTS (
+              SELECT 1
+              FROM issue i
+              WHERE i.id = t.issue_id
+                AND issue_status_allows_agent_task(i.workspace_id, i.status)
+          )
+      )
     FOR UPDATE OF t
 ), capability AS (
     INSERT INTO task_supplement_capability (task_id, workspace_id, issue_id, capability)

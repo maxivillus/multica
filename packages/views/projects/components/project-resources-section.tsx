@@ -704,7 +704,7 @@ function ResourceRow({
             takes that slot, and this panel is narrow enough that an inline
             badge truncates the repository name away — which is exactly when
             someone needs to read both.
-            
+
             Rendered even when nothing is pinned, showing "Default branch".
             Without it, clearing a branch makes the line vanish, which reads
             the same as the setting never having existed — there is no way to

@@ -178,6 +178,7 @@ type AgentTaskQueue struct {
 	CancelledByID             pgtype.UUID `json:"cancelled_by_id"`
 	CancelledByName           pgtype.Text `json:"cancelled_by_name"`
 	IssueSnapshot             []byte      `json:"issue_snapshot"`
+	CardSessionID             pgtype.UUID `json:"card_session_id"`
 }
 
 type AgentToLabel struct {
@@ -320,6 +321,30 @@ type AutopilotTrigger struct {
 	CreatedByType pgtype.Text `json:"created_by_type"`
 	// The member a schedule/webhook run fires AS: dispatch admission, the task's originator/accountable, and every delegated run all resolve to this one human (MUL-6951). For a trigger created since MUL-6951 it is the creator, written at creation. For a legacy trigger it is a best-effort principal inferred once by backfill and frozen (the last publisher, migration 449, else the autopilot's creator, migration 467), not proof of who created it. Ordinary edits never rewrite it, so editing the trigger cannot re-authorize its runs as the editor. NULL means no principal and the dispatch fails closed. No FK; workspace membership is re-validated on every dispatch.
 	CreatedByID pgtype.UUID `json:"created_by_id"`
+}
+
+// Server-owned lifecycle for a per-issue agent generation; provider process state is resumable but not the source of truth.
+type CardSession struct {
+	ID                pgtype.UUID        `json:"id"`
+	WorkspaceID       pgtype.UUID        `json:"workspace_id"`
+	IssueID           pgtype.UUID        `json:"issue_id"`
+	AgentID           pgtype.UUID        `json:"agent_id"`
+	Generation        int64              `json:"generation"`
+	State             string             `json:"state"`
+	Provider          string             `json:"provider"`
+	ProviderSessionID pgtype.Text        `json:"provider_session_id"`
+	WorkDir           pgtype.Text        `json:"work_dir"`
+	OpenedAt          pgtype.Timestamptz `json:"opened_at"`
+	LastActivityAt    pgtype.Timestamptz `json:"last_activity_at"`
+	DoneAt            pgtype.Timestamptz `json:"done_at"`
+	RetainUntil       pgtype.Timestamptz `json:"retain_until"`
+	ClosedAt          pgtype.Timestamptz `json:"closed_at"`
+	LeaseOwner        pgtype.Text        `json:"lease_owner"`
+	LeaseEpoch        int64              `json:"lease_epoch"`
+	LeaseHeartbeatAt  pgtype.Timestamptz `json:"lease_heartbeat_at"`
+	CreatedAt         pgtype.Timestamptz `json:"created_at"`
+	UpdatedAt         pgtype.Timestamptz `json:"updated_at"`
+	PauseReason       pgtype.Text        `json:"pause_reason"`
 }
 
 type ChannelBindingToken struct {
@@ -965,6 +990,12 @@ type IssueSubscriber struct {
 	OptOutScope    pgtype.Text        `json:"opt_out_scope"`
 }
 
+type IssueTaskCancelOutbox struct {
+	IssueID   pgtype.UUID        `json:"issue_id"`
+	TaskID    pgtype.UUID        `json:"task_id"`
+	CreatedAt pgtype.Timestamptz `json:"created_at"`
+}
+
 type IssueToLabel struct {
 	IssueID pgtype.UUID `json:"issue_id"`
 	LabelID pgtype.UUID `json:"label_id"`
@@ -1531,7 +1562,8 @@ type TaskUsage struct {
 	CreatedAt        pgtype.Timestamptz `json:"created_at"`
 	UpdatedAt        pgtype.Timestamptz `json:"updated_at"`
 	// Provider-reported cost in 1e-10 USD. NULL when the provider reports none; those rows are priced client-side from the static rate table.
-	CostUsdTicks pgtype.Int8 `json:"cost_usd_ticks"`
+	CostUsdTicks    pgtype.Int8 `json:"cost_usd_ticks"`
+	CardSessionMode pgtype.Text `json:"card_session_mode"`
 }
 
 type TaskUsageHourly struct {

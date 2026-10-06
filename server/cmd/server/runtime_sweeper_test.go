@@ -184,7 +184,7 @@ func TestRefreshAgentStatusFromTasks(t *testing.T) {
 		t.Fatalf("expected waiter-only agent status idle, got %q", agent.Status)
 	}
 
-	if _, err := taskService.StartTask(ctx, parseUUID(taskID)); err != nil {
+	if _, err := taskService.StartTaskWithCardSessionLease(ctx, parseUUID(taskID), "test-daemon"); err != nil {
 		t.Fatalf("StartTask from local-directory wait failed: %v", err)
 	}
 	agent, err = queries.GetAgent(ctx, parseUUID(agentID))
@@ -241,7 +241,7 @@ func TestStartTaskSkipsUnchangedAgentStatusWriteAndBroadcast(t *testing.T) {
 	})
 	taskService := service.NewTaskService(db.New(testPool), testPool, nil, bus)
 
-	if _, err := taskService.StartTask(ctx, parseUUID(taskID)); err != nil {
+	if _, err := taskService.StartTaskWithCardSessionLease(ctx, parseUUID(taskID), "test-daemon"); err != nil {
 		t.Fatalf("StartTask from dispatched failed: %v", err)
 	}
 

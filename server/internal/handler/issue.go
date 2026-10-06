@@ -3484,6 +3484,9 @@ func (h *Handler) CreateIssue(w http.ResponseWriter, r *http.Request) {
 
 	issue := res.Issue
 	slog.Info("issue created", append(logger.RequestAttrs(r), "issue_id", uuidToString(issue.ID), "title", issue.Title, "status", issue.Status, "workspace_id", workspaceID)...)
+	if issuestatus.AllowsAgentTask(r.Context(), h.Queries, issue.WorkspaceID, issue.Status) {
+		h.ensureIssueCardSession(r.Context(), issue)
+	}
 
 	resp := issueToResponse(issue, prefix)
 	fillCreated(&resp)
@@ -4008,8 +4011,13 @@ func (h *Handler) UpdateIssue(w http.ResponseWriter, r *http.Request) {
 	h.fillStatusCategory(r.Context(), issue.WorkspaceID, &resp)
 	assigneeChanged := (req.AssigneeType != nil || req.AssigneeID != nil) &&
 		(prevIssue.AssigneeType.String != issue.AssigneeType.String || uuidToString(prevIssue.AssigneeID) != uuidToString(issue.AssigneeID))
-	statusChanged := req.Status != nil && prevIssue.Status != issue.Status
+	statusChanged := prevIssue.Status != issue.Status
 	priorityChanged := req.Priority != nil && prevIssue.Priority != issue.Priority
+	if statusChanged {
+		h.reconcileCardSessionStatus(r.Context(), prevIssue, issue)
+	} else if assigneeChanged {
+		h.reconcileCardSessionAssignee(r.Context(), issue)
+	}
 	// project_changed gates the client's per-project issue-list refetch the way
 	// status/assignee flags gate theirs. Without it the client must diff
 	// project_id against its own cache, which breaks once an optimistic local
@@ -4064,18 +4072,10 @@ func (h *Handler) UpdateIssue(w http.ResponseWriter, r *http.Request) {
 	// WillEnqueueRun predicate, shared verbatim with the preview endpoint so
 	// the two never drift (MUL-3375).
 	//
-	// A reassignment intentionally does NOT cancel existing tasks on the issue
-	// (#4963 / MUL-4113). The previous "cancel every active task on the issue"
-	// was too coarse: it silently dropped unrelated in-flight work (a
-	// mention-triggered run for another agent, a squad task) with no requeue,
-	// and it self-cancelled a run that reassigned the issue from inside itself.
-	// Ownership handoff no longer implies interruption; the new assignee's run,
-	// if any, is enqueued by WillEnqueueRun below and runs alongside whatever
-	// was already in flight. No status change — not even → cancelled — cancels
-	// active tasks: a user clicking "cancel" on an issue has no expectation that
-	// it stops in-flight agent runs, so that implicit coupling is gone
-	// (MUL-4465). Deleting an issue still cancels its tasks (see DeleteIssue),
-	// because the tasks' owning issue ceases to exist.
+	// Reassignment leaves current issue tasks alone (#4963 / MUL-4113); the new
+	// assignee may run beside work already in flight. The explicit `cancelled`
+	// status is handled above as a hard stop for every active task on this issue.
+	// Deleting an issue also cancels its tasks because their owning card is removed.
 	if trigger, ok := h.IssueService.WillEnqueueRun(r.Context(),
 		service.IssueTriggerInput{
 			Issue:           issue,
@@ -4786,9 +4786,14 @@ func (h *Handler) BatchUpdateIssues(w http.ResponseWriter, r *http.Request) {
 		fillBatch(&resp)
 		assigneeChanged := (req.Updates.AssigneeType != nil || req.Updates.AssigneeID != nil) &&
 			(prevIssue.AssigneeType.String != issue.AssigneeType.String || uuidToString(prevIssue.AssigneeID) != uuidToString(issue.AssigneeID))
-		statusChanged := req.Updates.Status != nil && prevIssue.Status != issue.Status
+		statusChanged := prevIssue.Status != issue.Status
 		priorityChanged := req.Updates.Priority != nil && prevIssue.Priority != issue.Priority
 		projectChanged := req.Updates.ProjectID != nil && uuidToString(prevIssue.ProjectID) != uuidToString(issue.ProjectID)
+		if statusChanged {
+			h.reconcileCardSessionStatus(r.Context(), prevIssue, issue)
+		} else if assigneeChanged {
+			h.reconcileCardSessionAssignee(r.Context(), issue)
+		}
 
 		h.publish(protocol.EventIssueUpdated, workspaceID, actorType, actorID, map[string]any{
 			"issue":                      resp,
@@ -4818,8 +4823,9 @@ func (h *Handler) BatchUpdateIssues(w http.ResponseWriter, r *http.Request) {
 			h.dispatchIssueRun(r.Context(), issue, trigger, actorType, actorID, req.Updates.HandoffNote)
 		}
 
-		// No status change — not even → cancelled — cancels active tasks here,
-		// mirroring UpdateIssue (MUL-4465). See that handler for the rationale.
+		// A transition to `cancelled` already stopped this issue's active tasks
+		// through reconcileCardSessionStatus above; reassignment alone leaves work
+		// running, matching UpdateIssue.
 
 		if statusChanged || prevIssue.ParentIssueID != issue.ParentIssueID || prevIssue.Stage != issue.Stage {
 			changedParents = append(changedParents, issue.ParentIssueID, prevIssue.ParentIssueID)

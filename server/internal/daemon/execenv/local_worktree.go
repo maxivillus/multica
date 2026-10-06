@@ -345,8 +345,8 @@ func PrepareLocalWorktree(params LocalWorktreeParams, logger *slog.Logger) (*Loc
 	// long gone, but the user's repo still lists them. Prune only drops entries
 	// whose directory no longer exists, so it can never disturb a live task.
 	if out, pruneErr := runGit(gitRoot, "worktree", "prune"); pruneErr != nil && logger != nil {
-		logger.Warn("execenv: git worktree prune failed (non-fatal)",
-			"git_root", gitRoot, "output", out, "error", pruneErr)
+		attrs := localWorktreeSafeOperationAttrs("git_root_present", gitRoot, pruneErr, out)
+		logger.Warn("execenv: git worktree prune failed (non-fatal)", attrs...)
 	}
 	pruneOrphanedStateRefs(gitRoot, logger)
 
@@ -476,8 +476,9 @@ func PrepareLocalWorktree(params LocalWorktreeParams, logger *slog.Logger) (*Loc
 		// before continuing it. Recorded here as well as at Finalize so a turn
 		// that never reaches Finalize still leaves the branch identifiable.
 		if err := wt.recordState(wt.BaseCommit, logger); err != nil && logger != nil {
-			logger.Warn("execenv: could not record the task branch before the run (non-fatal; Finalize records the delivered tip)",
-				"branch", wt.Branch, "error", err)
+			attrs := localWorktreeSafeOperationAttrs("workdir_present", wt.WorkDir, err, "")
+			attrs = append(attrs, "branch", wt.Branch, "git_root_present", wt.GitRoot != "")
+			logger.Warn("execenv: could not record the task branch before the run (non-fatal; Finalize records the delivered tip)", attrs...)
 		}
 	}
 
@@ -493,8 +494,8 @@ func PrepareLocalWorktree(params LocalWorktreeParams, logger *slog.Logger) (*Loc
 
 	if logger != nil {
 		logger.Info("execenv: local worktree ready",
-			"git_root", gitRoot,
-			"path", worktreePath,
+			"git_root_present", gitRoot != "",
+			"workdir_present", worktreePath != "",
 			"branch", actualBranch,
 			"base", wt.BaseCommit,
 			"continued", wt.Continued,
@@ -551,8 +552,9 @@ func (w *LocalWorktree) Finalize(logger *slog.Logger) (LocalWorktreeOutcome, err
 		outcome.Branch = ""
 		outcome.PreservedPath = w.Path
 		if logger != nil {
-			logger.Error("execenv: worktree finalize aborted; nothing committed, worktree kept for inspection",
-				"path", w.Path, "branch", w.Branch, "git_root", w.GitRoot, "error", w.aborted)
+			attrs := worktreeSafeErrorAttrs(w.Path, w.aborted, "")
+			attrs = append(attrs, "branch", w.Branch, "git_root_present", w.GitRoot != "")
+			logger.Error("execenv: worktree finalize aborted; nothing committed, worktree kept for inspection", attrs...)
 		}
 		return outcome, fmt.Errorf(
 			"refusing to deliver branch %s: %w; the task worktree is preserved at %s (listed by `git worktree list` in %s)",
@@ -575,7 +577,7 @@ func (w *LocalWorktree) Finalize(logger *slog.Logger) (LocalWorktreeOutcome, err
 		}
 		if logger != nil {
 			logger.Error("execenv: worktree left with an unresolved merge; nothing committed, worktree kept",
-				"path", w.Path, "branch", w.Branch, "files", unmerged)
+				"workdir_present", w.Path != "", "branch", w.Branch, "unmerged_count", len(unmerged))
 		}
 		return outcome, fmt.Errorf(
 			"refusing to deliver branch %s: your local edits to %s are still unmerged in the task worktree; "+
@@ -589,8 +591,8 @@ func (w *LocalWorktree) Finalize(logger *slog.Logger) (LocalWorktreeOutcome, err
 	dirty, statusErr := worktreeIsDirty(w.Path)
 	if statusErr != nil {
 		if logger != nil {
-			logger.Warn("execenv: inspect worktree status failed; committing defensively",
-				"path", w.Path, "error", statusErr)
+			attrs := worktreeSafeErrorAttrs(w.Path, statusErr, "")
+			logger.Warn("execenv: inspect worktree status failed; committing defensively", attrs...)
 		}
 		dirty = true
 	}
@@ -599,8 +601,9 @@ func (w *LocalWorktree) Finalize(logger *slog.Logger) (LocalWorktreeOutcome, err
 		if err != nil {
 			outcome.PreservedPath = w.Path
 			if logger != nil {
-				logger.Error("execenv: could not commit the agent's changes; keeping the worktree so the work is recoverable",
-					"path", w.Path, "branch", w.Branch, "git_root", w.GitRoot, "error", err)
+				attrs := worktreeSafeErrorAttrs(w.Path, err, "")
+				attrs = append(attrs, "branch", w.Branch, "git_root_present", w.GitRoot != "")
+				logger.Error("execenv: could not commit the agent's changes; keeping the worktree so the work is recoverable", attrs...)
 			}
 			return outcome, fmt.Errorf(
 				"could not commit the agent's changes to branch %s: %w; the work is preserved in the worktree at %s (listed by `git worktree list` in %s) — recover it before that directory is reclaimed",
@@ -642,7 +645,7 @@ func (w *LocalWorktree) Finalize(logger *slog.Logger) (LocalWorktreeOutcome, err
 		}
 		if logger != nil {
 			logger.Info("execenv: the run concluded its merge without committing; keeping the branch's previous recorded state so the edits are offered again",
-				"path", w.Path, "branch", w.Branch)
+				"workdir_present", w.Path != "", "branch", w.Branch)
 		}
 		w.userState = w.priorState
 	}
@@ -658,8 +661,9 @@ func (w *LocalWorktree) Finalize(logger *slog.Logger) (LocalWorktreeOutcome, err
 			outcome.Branch = ""
 			outcome.PreservedPath = w.Path
 			if logger != nil {
-				logger.Error("execenv: the run's delivery point cannot be recorded as this conversation's; nothing recorded, worktree kept",
-					"path", w.Path, "branch", w.Branch, "git_root", w.GitRoot, "tip", tip, "base", w.BaseCommit, "error", verifyErr)
+				attrs := worktreeSafeErrorAttrs(w.Path, verifyErr, "")
+				attrs = append(attrs, "branch", w.Branch, "git_root_present", w.GitRoot != "", "tip", tip, "base", w.BaseCommit)
+				logger.Error("execenv: the run's delivery point cannot be recorded as this conversation's; nothing recorded, worktree kept", attrs...)
 			}
 			return outcome, fmt.Errorf(
 				"refusing to record branch %s: %w; the task worktree is preserved at %s (listed by `git worktree list` in %s) — "+
@@ -669,8 +673,9 @@ func (w *LocalWorktree) Finalize(logger *slog.Logger) (LocalWorktreeOutcome, err
 		if recErr := w.recordState(tip, logger); recErr != nil {
 			outcome.PreservedPath = w.Path
 			if logger != nil {
-				logger.Error("execenv: could not record the delivered task branch; keeping the worktree",
-					"path", w.Path, "branch", w.Branch, "git_root", w.GitRoot, "error", recErr)
+				attrs := worktreeSafeErrorAttrs(w.Path, recErr, "")
+				attrs = append(attrs, "branch", w.Branch, "git_root_present", w.GitRoot != "")
+				logger.Error("execenv: could not record the delivered task branch; keeping the worktree", attrs...)
 			}
 			return outcome, fmt.Errorf(
 				"could not record branch %s as this conversation's: %w; the work is committed to that branch and the "+
@@ -694,7 +699,7 @@ func (w *LocalWorktree) Finalize(logger *slog.Logger) (LocalWorktreeOutcome, err
 
 	if logger != nil {
 		logger.Info("execenv: local worktree finalized",
-			"git_root", w.GitRoot,
+			"git_root_present", w.GitRoot != "",
 			"branch", outcome.Branch,
 			"auto_committed", outcome.AutoCommitted,
 			"produced_work", producedWork,
@@ -720,8 +725,9 @@ func (w *LocalWorktree) Discard(logger *slog.Logger) {
 		// registration this leaves behind is pruned by the next prepare on
 		// this repo, which is the same self-heal path a crashed daemon uses.
 		if logger != nil {
-			logger.Warn("execenv: could not lock the repository to discard the task worktree",
-				"git_root", w.GitRoot, "path", w.Path, "branch", w.Branch, "error", err)
+			attrs := worktreeSafeErrorAttrs(w.Path, err, "")
+			attrs = append(attrs, "git_root_present", w.GitRoot != "", "branch", w.Branch)
+			logger.Warn("execenv: could not lock the repository to discard the task worktree", attrs...)
 		}
 		return
 	}
@@ -734,8 +740,25 @@ func (w *LocalWorktree) Discard(logger *slog.Logger) {
 	}
 	if logger != nil {
 		logger.Info("execenv: local worktree discarded before the agent ran",
-			"git_root", w.GitRoot, "path", w.Path, "branch", w.Branch, "branch_dropped", w.createdBranch)
+			"git_root_present", w.GitRoot != "", "workdir_present", w.Path != "", "branch", w.Branch, "branch_dropped", w.createdBranch)
 	}
+}
+
+func worktreeSafeErrorAttrs(workdir string, err error, output string) []any {
+	return localWorktreeSafeOperationAttrs("workdir_present", workdir, err, output)
+}
+
+func localWorktreeSafeOperationAttrs(pathField, path string, err error, output string) []any {
+	attrs := []any{
+		pathField, path != "",
+		"error_present", err != nil,
+		"output_present", output != "",
+		"output_bytes", len(output),
+	}
+	if err != nil {
+		attrs = append(attrs, "error_type", fmt.Sprintf("%T", err))
+	}
+	return attrs
 }
 
 // AbortWithReason marks the worktree undeliverable. Finalize will then commit
@@ -843,8 +866,8 @@ func removeLocalWorktreeDir(gitRoot, worktreePath string, logger *slog.Logger) e
 	if out, err := runGit(gitRoot, "worktree", "remove", "--force", worktreePath); err != nil {
 		removeErr = err
 		if logger != nil {
-			logger.Warn("execenv: git worktree remove failed; pruning registration",
-				"path", worktreePath, "output", out, "error", err)
+			attrs := worktreeSafeErrorAttrs(worktreePath, err, out)
+			logger.Warn("execenv: git worktree remove failed; pruning registration", attrs...)
 		}
 		// Fall back to deleting the directory ourselves and dropping the now
 		// dangling registration, so the user's repo isn't left listing a
@@ -852,11 +875,19 @@ func removeLocalWorktreeDir(gitRoot, worktreePath string, logger *slog.Logger) e
 		if rmErr := os.RemoveAll(worktreePath); rmErr != nil {
 			removeErr = errors.Join(removeErr, rmErr)
 			if logger != nil {
-				logger.Warn("execenv: remove worktree directory failed", "path", worktreePath, "error", rmErr)
+				attrs := worktreeSafeErrorAttrs(worktreePath, rmErr, "")
+				logger.Warn("execenv: remove worktree directory failed", attrs...)
 			}
 		}
 		if out, pruneErr := runGit(gitRoot, "worktree", "prune"); pruneErr != nil && logger != nil {
-			logger.Warn("execenv: git worktree prune failed", "output", out, "error", pruneErr)
+			attrs := []any{
+				"git_root_present", gitRoot != "",
+				"error_present", true,
+				"error_type", fmt.Sprintf("%T", pruneErr),
+				"output_present", out != "",
+				"output_bytes", len(out),
+			}
+			logger.Warn("execenv: git worktree prune failed", attrs...)
 		}
 	}
 	// Lstat verifies the path entry itself is gone. Stat would treat a broken
@@ -880,8 +911,9 @@ func deleteBranch(gitRoot, branch string, logger *slog.Logger) {
 		return
 	}
 	if out, err := runGit(gitRoot, "branch", "-D", branch); err != nil && logger != nil {
-		logger.Warn("execenv: delete task branch failed (non-fatal)",
-			"branch", branch, "output", out, "error", err)
+		attrs := localWorktreeSafeOperationAttrs("git_root_present", gitRoot, err, out)
+		attrs = append(attrs, "branch", branch)
+		logger.Warn("execenv: delete task branch failed (non-fatal)", attrs...)
 	}
 }
 
@@ -946,8 +978,8 @@ func captureUserSnapshot(gitRoot, envRoot, headSHA string, logger *slog.Logger) 
 			return "", fmt.Errorf("git add: %s: %w", strings.TrimSpace(out), err)
 		}
 		if logger != nil {
-			logger.Debug("execenv: snapshot index seeded from the repository index was unusable; rebuilding it",
-				"git_root", gitRoot, "output", strings.TrimSpace(out), "error", err)
+			attrs := localWorktreeSafeOperationAttrs("git_root_present", gitRoot, err, strings.TrimSpace(out))
+			logger.Debug("execenv: snapshot index seeded from the repository index was unusable; rebuilding it", attrs...)
 		}
 		if out, resetErr := runGitEnv(gitRoot, env, "read-tree", headSHA); resetErr != nil {
 			return "", fmt.Errorf("git read-tree: %s: %w", strings.TrimSpace(out), resetErr)
@@ -1198,7 +1230,7 @@ func resolveTaskBranch(gitRoot string, params LocalWorktreeParams, headSHA strin
 		}
 		if logger != nil {
 			logger.Info("execenv: branch exists but is not this conversation's; not continuing it",
-				"git_root", gitRoot, "branch", name)
+				"git_root_present", gitRoot != "", "branch", name)
 		}
 	}
 	return taskScoped
@@ -1235,7 +1267,7 @@ func planForConversationBranch(gitRoot, name, headSHA string, owner branchOwner,
 	plan.priorCheckpoint = record.checkpoint
 	if logger != nil {
 		logger.Info("execenv: continuing the conversation's existing branch",
-			"git_root", gitRoot, "branch", name, "tip", tip)
+			"git_root_present", gitRoot != "", "branch", name, "tip", tip)
 	}
 	return plan, true
 }
@@ -1264,7 +1296,7 @@ func branchOwnedBy(gitRoot, branch string, owner branchOwner, logger *slog.Logge
 	if _, err := runGit(gitRoot, "merge-base", "--is-ancestor", record.checkpoint, "refs/heads/"+branch); err != nil {
 		if logger != nil {
 			logger.Info("execenv: branch no longer contains the commit it was recorded at; not continuing it",
-				"git_root", gitRoot, "branch", branch, "checkpoint", record.checkpoint)
+				"git_root_present", gitRoot != "", "branch", branch, "checkpoint", record.checkpoint)
 		}
 		return branchRecord{}, false
 	}
@@ -1394,12 +1426,12 @@ func replayUserState(worktreePath string, plan taskBranchPlan, snapshot string, 
 	// not a cherry-pick it is expected to conclude with a command it never
 	// started.
 	if out, quitErr := runGit(worktreePath, "cherry-pick", "--quit"); quitErr != nil && logger != nil {
-		logger.Warn("execenv: could not clear the cherry-pick state after a conflicting replay (non-fatal)",
-			"path", worktreePath, "output", strings.TrimSpace(out), "error", quitErr)
+		attrs := worktreeSafeErrorAttrs(worktreePath, quitErr, strings.TrimSpace(out))
+		logger.Warn("execenv: could not clear the cherry-pick state after a conflicting replay (non-fatal)", attrs...)
 	}
 	if logger != nil {
 		logger.Warn("execenv: your local edits since the previous turn conflict with the work on this branch; handing the conflict to the agent",
-			"path", worktreePath, "branch", plan.name, "files", conflicts)
+			"workdir_present", worktreePath != "", "branch", plan.name, "conflict_count", len(conflicts))
 	}
 	return replayResult{conflicts: conflicts}, nil
 }
@@ -1477,8 +1509,9 @@ func unmergedPaths(worktreePath string) ([]string, error) {
 func abortCherryPick(worktreePath string, logger *slog.Logger) {
 	for _, args := range [][]string{{"cherry-pick", "--quit"}, {"reset", "--hard", "HEAD"}, {"clean", "-fdq"}} {
 		if out, err := runGit(worktreePath, args...); err != nil && logger != nil {
-			logger.Warn("execenv: could not restore the task worktree after a failed replay",
-				"path", worktreePath, "command", args[0], "output", strings.TrimSpace(out), "error", err)
+			attrs := worktreeSafeErrorAttrs(worktreePath, err, strings.TrimSpace(out))
+			attrs = append(attrs, "command", args[0])
+			logger.Warn("execenv: could not restore the task worktree after a failed replay", attrs...)
 		}
 	}
 }
@@ -1530,8 +1563,9 @@ func dropBranch(gitRoot, branch string, logger *slog.Logger) {
 	}
 	deleteBranch(gitRoot, branch, logger)
 	if out, err := runGit(gitRoot, "update-ref", "-d", userStateRef(branch)); err != nil && logger != nil {
-		logger.Debug("execenv: no local-directory snapshot to drop for task branch",
-			"branch", branch, "output", strings.TrimSpace(out))
+		attrs := localWorktreeSafeOperationAttrs("git_root_present", gitRoot, err, strings.TrimSpace(out))
+		attrs = append(attrs, "branch", branch)
+		logger.Debug("execenv: no local-directory snapshot to drop for task branch", attrs...)
 	}
 }
 
@@ -1546,7 +1580,8 @@ func pruneOrphanedStateRefs(gitRoot string, logger *slog.Logger) {
 	out, err := runGitTrimmed(gitRoot, "for-each-ref", "--format=%(refname)", localStateRefPrefix)
 	if err != nil {
 		if logger != nil {
-			logger.Debug("execenv: could not list local-directory snapshots", "git_root", gitRoot, "error", err)
+			attrs := localWorktreeSafeOperationAttrs("git_root_present", gitRoot, err, "")
+			logger.Debug("execenv: could not list local-directory snapshots", attrs...)
 		}
 		return
 	}
@@ -1564,14 +1599,15 @@ func pruneOrphanedStateRefs(gitRoot string, logger *slog.Logger) {
 		}
 		if out, delErr := runGit(gitRoot, "update-ref", "-d", ref); delErr != nil {
 			if logger != nil {
-				logger.Warn("execenv: could not drop the snapshot of a deleted task branch (non-fatal)",
-					"ref", ref, "output", strings.TrimSpace(out), "error", delErr)
+				attrs := localWorktreeSafeOperationAttrs("git_root_present", gitRoot, delErr, strings.TrimSpace(out))
+				attrs = append(attrs, "ref_present", ref != "")
+				logger.Warn("execenv: could not drop the snapshot of a deleted task branch (non-fatal)", attrs...)
 			}
 			continue
 		}
 		if logger != nil {
 			logger.Info("execenv: dropped the local-directory snapshot of a branch that no longer exists",
-				"git_root", gitRoot, "branch", branch)
+				"git_root_present", gitRoot != "", "branch", branch)
 		}
 	}
 }
@@ -1609,7 +1645,7 @@ func checkUntrackedReplayable(gitRoot string, logger *slog.Logger) error {
 		if info.Mode()&os.ModeSymlink != 0 {
 			skipped++
 			if logger != nil {
-				logger.Warn("execenv: untracked symlink cannot be replayed into a worktree", "file", rel)
+				logger.Warn("execenv: untracked symlink cannot be replayed into a worktree", "file_path_present", rel != "")
 			}
 			continue
 		}

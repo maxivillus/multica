@@ -73,7 +73,7 @@ func TestClaimTaskByRuntime_LegacySkillRedirectFollowsTheCapability(t *testing.T
 
 			req := newDaemonTokenRequest("POST", "/api/daemon/runtimes/"+runtimeID+"/tasks/claim", nil, testWorkspaceID, tc.fixture+"-daemon")
 			if tc.capabilities != "" {
-				req.Header.Set("X-Client-Capabilities", tc.capabilities)
+				req.Header.Set("X-Client-Capabilities", protocol.DaemonCapabilityCardSessionLeaseV1+","+tc.capabilities)
 			}
 			req = withURLParam(req, "runtimeId", runtimeID)
 

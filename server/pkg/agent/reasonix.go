@@ -131,7 +131,7 @@ func (b *reasonixBackend) Execute(ctx context.Context, prompt string, opts ExecO
 		_, _ = io.Copy(stderrSink, stderr)
 	}()
 
-	b.cfg.Logger.Info("reasonix acp started", "pid", cmd.Process.Pid, "cwd", opts.Cwd)
+	b.cfg.Logger.Info("reasonix acp started", "pid", cmd.Process.Pid, "cwd_present", opts.Cwd != "")
 
 	msgCh := make(chan Message, 256)
 	resCh := make(chan Result, 1)
@@ -312,8 +312,8 @@ func (b *reasonixBackend) Execute(ctx context.Context, prompt string, opts ExecO
 			if changed {
 				b.cfg.Logger.Warn("agent returned a different session id on resume — original was likely lost; continuing with the new id",
 					"backend", "reasonix",
-					"requested", opts.ResumeSessionID,
-					"actual", sessionID,
+					"requested_session_id_present", opts.ResumeSessionID != "",
+					"actual_session_id_present", sessionID != "",
 				)
 			}
 		} else {
@@ -337,7 +337,7 @@ func (b *reasonixBackend) Execute(ctx context.Context, prompt string, opts ExecO
 		}
 
 		c.sessionID = sessionID
-		b.cfg.Logger.Info("reasonix session created", "session_id", sessionID)
+		b.cfg.Logger.Info("reasonix session created", "session_id_present", sessionID != "")
 
 		// 3. If the caller picked a model (via agent.model from the
 		// UI dropdown), ask reasonix to switch the session to it before
@@ -354,7 +354,7 @@ func (b *reasonixBackend) Execute(ctx context.Context, prompt string, opts ExecO
 				"sessionId": sessionID,
 				"modelId":   opts.Model,
 			}); err != nil {
-				b.cfg.Logger.Warn("reasonix set_session_model failed", "error", err, "requested_model", opts.Model)
+				b.cfg.Logger.Warn("reasonix set_session_model failed", "error_present", err != nil, "requested_model", opts.Model)
 				finalStatus, finalError = reasonixRequestFailure(runCtx, timeout, fmt.Sprintf("reasonix could not switch to model %q: %v", opts.Model, err))
 				if setupFailureWithholdsSessionID(opts) {
 					sessionID = ""
@@ -365,7 +365,7 @@ func (b *reasonixBackend) Execute(ctx context.Context, prompt string, opts ExecO
 					// the daemon's resume-failure fallback retries fresh.
 					b.cfg.Logger.Warn("resumed session not found at set_model time; clearing session id so the daemon retries fresh",
 						"backend", "reasonix",
-						"session_id", sessionID,
+						"session_id_present", sessionID != "",
 					)
 					sessionID = ""
 					resumeRejected = true
@@ -417,7 +417,7 @@ func (b *reasonixBackend) Execute(ctx context.Context, prompt string, opts ExecO
 					// store the replacement id.
 					b.cfg.Logger.Warn("resumed session not found at prompt time; clearing session id so the daemon retries fresh",
 						"backend", "reasonix",
-						"session_id", sessionID,
+						"session_id_present", sessionID != "",
 					)
 					sessionID = ""
 					resumeRejected = true

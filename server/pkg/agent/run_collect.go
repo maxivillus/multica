@@ -393,15 +393,19 @@ func (c *collector) finish() {
 		releaseProcessGroup(c.cmd)
 
 		if !treeGone || !drained || !waitReturned {
-			slog.Default().Warn("agent: collect cleanup did not converge",
-				"command", c.cmd.Path,
-				"tree_gone", treeGone,
-				"output_drained", drained,
-				"wait_returned", waitReturned,
-				"window", collectReapWindow,
-				"settle_grace", collectSettleGrace)
+			logCollectCleanupDidNotConverge(slog.Default(), c.cmd.Path, treeGone, drained, waitReturned)
 		}
 	})
+}
+
+func logCollectCleanupDidNotConverge(logger *slog.Logger, command string, treeGone, drained, waitReturned bool) {
+	logger.Warn("agent: collect cleanup did not converge",
+		"command_present", command != "",
+		"tree_gone", treeGone,
+		"output_drained", drained,
+		"wait_returned", waitReturned,
+		"window", collectReapWindow,
+		"settle_grace", collectSettleGrace)
 }
 
 // reapKill is the process-tree kill, indirected so a test can make one pass miss

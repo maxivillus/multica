@@ -279,11 +279,11 @@ func opencodeInterruptSession(conn opencodeRunConnection, sessionID string, logg
 	if err != nil {
 		if logger != nil {
 			logger.Warn("opencode: session interrupt failed; the agent may keep running server-side",
-				"session", sessionID, "server", conn.server, "error", err, "output", strings.TrimSpace(string(out)))
+				"session_id_present", sessionID != "", "server_configured", conn.server != "", "error_present", err != nil, "output_bytes", len(out))
 		}
 		return
 	}
 	if logger != nil {
-		logger.Info("opencode: session interrupted", "session", sessionID, "server", conn.server)
+		logger.Info("opencode: session interrupted", "session_id_present", sessionID != "", "server_configured", conn.server != "")
 	}
 }

@@ -434,8 +434,8 @@ func Prepare(params PrepareParams, logger *slog.Logger) (*Environment, error) {
 	// the root marker keeps the CLI fail-closed guard active for subprocesses
 	// that lose all MULTICA_* env vars AND escape above the workdir. Non-fatal:
 	// without it the workdir marker still protects the common case.
-	if err := EnsureWorkspacesRootMarker(params.WorkspacesRoot); err != nil && logger != nil {
-		logger.Warn("execenv: workspaces root marker not written; fail-closed guard limited to the task workdir", "error", err)
+	if err := EnsureWorkspacesRootMarker(params.WorkspacesRoot); err != nil {
+		logSensitivePathError(logger, "execenv: workspaces root marker not written; fail-closed guard limited to the task workdir", err)
 	}
 
 	// Take exclusive ownership of the env root before touching anything in it.
@@ -594,7 +594,7 @@ func Prepare(params PrepareParams, logger *slog.Logger) (*Environment, error) {
 				return
 			}
 			if err := rollBackPreparedSidecars(*manifest); err != nil && logger != nil {
-				logger.Warn("execenv: roll back sidecars after failed prepare", "work_dir", workDir, "error", err)
+				logger.Warn("execenv: roll back sidecars after failed prepare", "workdir_present", workDir != "", "error_present", true)
 			}
 		}()
 	}
@@ -622,7 +622,7 @@ func Prepare(params PrepareParams, logger *slog.Logger) (*Environment, error) {
 			ChatSessionID: params.Task.ChatSessionID,
 			AgentID:       params.Task.AgentID,
 		}); err != nil && logger != nil {
-			logger.Warn("execenv: write managed env provenance failed (non-fatal); a follow-up may start a fresh session", "error", err)
+			logSensitivePathError(logger, "execenv: write managed env provenance failed (non-fatal); a follow-up may start a fresh session", err)
 		}
 	}
 
@@ -683,7 +683,7 @@ func Prepare(params PrepareParams, logger *slog.Logger) (*Environment, error) {
 	// the backend's fail-closed question handling.
 	if params.Provider == "reasonix" {
 		if err := writeReasonixProjectConfig(workDir, params.ReasonixEnv, manifest, logger); err != nil {
-			logger.Warn("execenv: write reasonix project config failed", "error", err)
+			logSensitivePathError(logger, "execenv: write reasonix project config failed", err)
 		}
 	}
 
@@ -711,7 +711,7 @@ func Prepare(params PrepareParams, logger *slog.Logger) (*Environment, error) {
 		if params.LocalWorkDir != "" {
 			return nil, fmt.Errorf("execenv: write sidecar manifest: %w", err)
 		}
-		logger.Warn("execenv: write sidecar manifest failed (non-fatal)", "error", err)
+		logSensitivePathError(logger, "execenv: write sidecar manifest failed (non-fatal)", err)
 	}
 
 	// For OpenClaw, synthesize a per-task config that pins workspace to
@@ -735,10 +735,20 @@ func Prepare(params PrepareParams, logger *slog.Logger) (*Environment, error) {
 		env.OpenclawIncludeRoot = result.IncludeRoot
 	}
 
-	logger.Info("execenv: prepared env", "root", envRoot, "repos_available", len(params.Task.Repos))
+	logger.Info("execenv: prepared env", "root_present", envRoot != "", "repos_available", len(params.Task.Repos))
 	prepareSucceeded = true
 	lockClaimed = false // ownership of any lock passes to the Environment
 	return env, nil
+}
+
+func logSensitivePathError(logger *slog.Logger, message string, err error) {
+	if logger == nil || err == nil {
+		return
+	}
+	logger.Warn(message,
+		"error_present", true,
+		"error_type", fmt.Sprintf("%T", err),
+	)
 }
 
 // ReuseParams describes the inputs to Reuse. It mirrors PrepareParams for
@@ -814,8 +824,8 @@ func Reuse(params ReuseParams, logger *slog.Logger) *Environment {
 	// fresh Prepare. Non-fatal: the per-workdir marker still protects the common
 	// case, and an empty WorkspacesRoot (legacy callers) simply skips this.
 	if params.WorkspacesRoot != "" {
-		if err := EnsureWorkspacesRootMarker(params.WorkspacesRoot); err != nil && logger != nil {
-			logger.Warn("execenv: workspaces root marker not written on reuse; fail-closed guard limited to the task workdir", "error", err)
+		if err := EnsureWorkspacesRootMarker(params.WorkspacesRoot); err != nil {
+			logSensitivePathError(logger, "execenv: workspaces root marker not written on reuse; fail-closed guard limited to the task workdir", err)
 		}
 	}
 
@@ -943,7 +953,7 @@ func Reuse(params ReuseParams, logger *slog.Logger) *Environment {
 	// the tool available again.
 	if params.Provider == "reasonix" {
 		if err := writeReasonixProjectConfig(params.WorkDir, params.ReasonixEnv, manifest, logger); err != nil {
-			logger.Warn("execenv: refresh reasonix project config failed", "error", err)
+			logSensitivePathError(logger, "execenv: refresh reasonix project config failed", err)
 		}
 	}
 
@@ -1007,7 +1017,7 @@ func Reuse(params ReuseParams, logger *slog.Logger) *Environment {
 
 	if env.RootDir != "" {
 		if err := writeSidecarManifest(env.RootDir, manifest); err != nil {
-			logger.Warn("execenv: refresh sidecar manifest failed", "error", err)
+			logSensitivePathError(logger, "execenv: refresh sidecar manifest failed", err)
 		}
 	}
 
@@ -1033,7 +1043,7 @@ func Reuse(params ReuseParams, logger *slog.Logger) *Environment {
 		env.OpenclawIncludeRoot = result.IncludeRoot
 	}
 
-	logger.Info("execenv: reusing env", "workdir", params.WorkDir)
+	logger.Info("execenv: reusing env", "workdir_present", params.WorkDir != "")
 	return env
 }
 
@@ -1255,7 +1265,7 @@ func (env *Environment) Cleanup(removeAll bool) error {
 
 	// Partial cleanup: remove workdir, keep output/ and logs/.
 	if err := os.RemoveAll(env.WorkDir); err != nil {
-		env.logger.Warn("execenv: cleanup workdir failed", "error", err)
+		env.logger.Warn("execenv: cleanup workdir failed", "workdir_present", env.WorkDir != "", "error_present", true)
 		return err
 	}
 	return nil

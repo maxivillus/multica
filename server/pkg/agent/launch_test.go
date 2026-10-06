@@ -46,6 +46,34 @@ func TestLaunchPrefixPrecedesProtocolFlags(t *testing.T) {
 	}
 }
 
+func TestProviderLaunchLogsOmitHostPaths(t *testing.T) {
+	var logs bytes.Buffer
+	logger := slog.New(slog.NewJSONHandler(&logs, &slog.HandlerOptions{Level: slog.LevelDebug}))
+
+	shim := "/private/launch-shim-marker/tool.cmd"
+	native := "/private/native-binary-marker/tool.exe"
+	powershell := "/private/powershell-host-marker/pwsh.exe"
+	ps1 := "/private/powershell-script-marker/tool.ps1"
+	original := "/private/original-launcher-marker/tool.cmd"
+	configPath := "/private/config-path-marker/config.toml"
+	logNativeBinaryResolution(logger, "test", shim, native)
+	logPowerShellRoute(logger, "test", "File", powershell, ps1, original)
+	logCollectCleanupDidNotConverge(logger, "/private/collect-command-marker/tool", false, false, false)
+	logger.Debug("codex: wrote managed mcp_servers block to config.toml", "config_path_present", configPath != "", "managed", true)
+
+	got := logs.String()
+	for _, marker := range []string{shim, native, powershell, ps1, original, configPath, "launch-shim-marker", "native-binary-marker", "collect-command-marker"} {
+		if strings.Contains(got, marker) {
+			t.Errorf("provider launch log exposed private marker %q: %s", marker, got)
+		}
+	}
+	for _, safe := range []string{`"shim_present":true`, `"native_present":true`, `"powershell_present":true`, `"command_present":true`, `"config_path_present":true`} {
+		if !strings.Contains(got, safe) {
+			t.Errorf("provider launch log omitted safe marker %s: %s", safe, got)
+		}
+	}
+}
+
 // TestLaunchPrefixPlacesFlagStyleWrappersFirst pins where a flag-style prefix
 // lands. It asserts the argv Multica builds, not that any particular third-party
 // parser accepts the new position — most treat the two orders as equivalent,
@@ -252,17 +280,18 @@ func TestLogAgentCommandRedactsTextAndJSON(t *testing.T) {
 
 			var buf bytes.Buffer
 			cfg := Config{Logger: slog.New(tc.handler(&buf)), provider: "codex"}
-			cmd := &exec.Cmd{Path: "/opt/multica/bin/codex", Args: append([]string{"codex"}, args...)}
+			privatePath := filepath.Join(t.TempDir(), "agent-command-private-path-marker", "codex")
+			cmd := &exec.Cmd{Path: privatePath, Args: append([]string{"codex"}, args...)}
 			cfg.logAgentCommandWithPrompt(cmd, newAgentCommandLogArgs(args), 123)
 
 			output := buf.String()
-			for _, secret := range secrets {
+			for _, secret := range append(secrets, privatePath, "agent-command-private-path-marker") {
 				if strings.Contains(output, secret) {
 					t.Errorf("%s log exposed %q: %s", tc.name, secret, output)
 				}
 			}
 			for _, diagnostic := range []string{
-				"agent command", "provider", "codex", "/opt/multica/bin/codex",
+				"agent command", "provider", "codex", "exec",
 				"--api-key", "--token", "--header", "-c", "--future-secret",
 				redactedAgentCommandArg, "arg_count", "prompt_bytes",
 			} {

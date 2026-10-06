@@ -299,6 +299,33 @@ func countCursorMessageTypes(messages []Message) map[MessageType]int {
 	return counts
 }
 
+func TestCursorExecuteRedactsUnknownEventType(t *testing.T) {
+	t.Parallel()
+
+	const marker = "71a53f20-9a20-4dc6-8c4b-86b503a6f21d"
+	_, result, logs := runCursorStreamLines(t, []string{
+		fmt.Sprintf(`{"type":%q}`, marker),
+	})
+
+	if result.Status != "failed" {
+		t.Fatalf("status = %q, want failed without a terminal result; error=%q", result.Status, result.Error)
+	}
+	for _, output := range []string{result.Error, logs} {
+		if strings.Contains(output, marker) {
+			t.Fatalf("unknown event type marker leaked into output: %s", output)
+		}
+	}
+	if !strings.Contains(result.Error, "last_event_type=unknown") {
+		t.Errorf("failure diagnostic should use the safe event label, got %q", result.Error)
+	}
+	if !strings.Contains(logs, "last_event_type=unknown") {
+		t.Errorf("protocol log should use the safe event label, logs:\n%s", logs)
+	}
+	if !strings.Contains(logs, `unhandled_event_types="unknown=1"`) {
+		t.Errorf("unhandled event tally should use the safe label, logs:\n%s", logs)
+	}
+}
+
 // TestCursorExecuteReportsUnhandledTopLevelTypes is the MUL-5434 regression.
 //
 // Reported symptom: a Cursor run that demonstrably used tools produced a single
@@ -343,11 +370,12 @@ func TestCursorExecuteReportsUnhandledTopLevelTypes(t *testing.T) {
 		t.Errorf("unhandled type folded into reasoning: thinking=%d", counts[MessageThinking])
 	}
 
-	// ...but the drop is now observable, and names the events that were dropped.
+	// ...but the drop is now observable. Unknown event names are collapsed so
+	// provider-controlled IDs or paths cannot be copied into diagnostics.
 	if !strings.Contains(logs, "cursor-agent ignored unhandled event types") {
 		t.Fatalf("no unhandled-type warning emitted; logs:\n%s", logs)
 	}
-	for _, want := range []string{`count=4`, `reasoning=1`, `toolCall=1`, `tool_calls=2`} {
+	for _, want := range []string{`count=4`, `types="unknown=4"`} {
 		if !strings.Contains(logs, want) {
 			t.Errorf("warning/summary missing %q; logs:\n%s", want, logs)
 		}

@@ -1962,11 +1962,15 @@ func (h *Handler) CreateComment(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	comment := created.Comment()
+	issue = h.reopenTerminalIssueOnComment(r.Context(), issue, created.IssueStatus, authorType, authorID)
 
 	// Fetch linked attachments so the response includes them.
 	groupedAtt := h.groupAttachments(r, []pgtype.UUID{comment.ID})
 	resp := commentToResponse(comment, nil, groupedAtt[uuidToString(comment.ID)])
 	resp.IssueRevision = created.IssueRevision
+	if issue.Revision > resp.IssueRevision {
+		resp.IssueRevision = issue.Revision
+	}
 	slog.Info("comment created", append(logger.RequestAttrs(r), "comment_id", uuidToString(comment.ID), "issue_id", issueID)...)
 	h.publish(protocol.EventCommentCreated, uuidToString(issue.WorkspaceID), authorType, authorID, map[string]any{
 		"comment":             resp,
@@ -1974,7 +1978,7 @@ func (h *Handler) CreateComment(w http.ResponseWriter, r *http.Request) {
 		"issue_assignee_type": textToPtr(issue.AssigneeType),
 		"issue_assignee_id":   uuidToPtr(issue.AssigneeID),
 		"issue_status":        issue.Status,
-		"issue_revision":      created.IssueRevision,
+		"issue_revision":      resp.IssueRevision,
 	})
 
 	// A reply in a resolved thread re-opens it. Done after CreateComment commits

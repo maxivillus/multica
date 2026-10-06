@@ -1,7 +1,9 @@
 package execenv
 
 import (
+	"bytes"
 	"encoding/json"
+	"log/slog"
 	"os"
 	"path/filepath"
 	"strings"
@@ -167,5 +169,61 @@ func TestReuse_SelfHealsWorkspacesRootMarker(t *testing.T) {
 	}
 	if _, err := os.Stat(rootMarker); err != nil {
 		t.Fatalf("Reuse did not restore the root marker: %v", err)
+	}
+}
+
+func TestPrepareAndReuseMarkerFailureLogsOmitPath(t *testing.T) {
+	for _, tc := range []struct {
+		name string
+		run  func(*testing.T, string, *slog.Logger)
+	}{
+		{
+			name: "prepare",
+			run: func(t *testing.T, root string, logger *slog.Logger) {
+				env, err := Prepare(PrepareParams{
+					WorkspacesRoot: root,
+					WorkspaceID:    "ws-marker-log-prepare",
+					TaskID:         "c3d4e5f6-a7b8-4901-cdef-234567890123",
+					AgentName:      "Marker Log Test",
+				}, logger)
+				if err != nil {
+					t.Fatalf("Prepare: %v", err)
+				}
+				env.Cleanup(true)
+			},
+		},
+		{
+			name: "reuse",
+			run: func(t *testing.T, root string, logger *slog.Logger) {
+				workDir := filepath.Join(t.TempDir(), "existing-workdir")
+				if err := os.MkdirAll(workDir, 0o755); err != nil {
+					t.Fatalf("mkdir workdir: %v", err)
+				}
+				if env := Reuse(ReuseParams{WorkspacesRoot: root, WorkDir: workDir}, logger); env == nil {
+					t.Fatal("Reuse returned nil for existing workdir")
+				}
+			},
+		},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			root := t.TempDir()
+			markerPath := filepath.Join(root, TaskContextMarkerRelPath)
+			if err := os.MkdirAll(filepath.Dir(markerPath), 0o755); err != nil {
+				t.Fatalf("mkdir marker directory: %v", err)
+			}
+			if err := os.WriteFile(markerPath, []byte(`{"managed_by":"foreign-marker-owner"}`), 0o644); err != nil {
+				t.Fatalf("write foreign marker: %v", err)
+			}
+
+			var logs bytes.Buffer
+			logger := slog.New(slog.NewTextHandler(&logs, nil))
+			tc.run(t, root, logger)
+			if strings.Contains(logs.String(), markerPath) {
+				t.Fatalf("marker path leaked into execenv logs: %s", logs.String())
+			}
+			if !strings.Contains(logs.String(), "error_present=true") {
+				t.Fatalf("marker failure log should retain a safe error indicator: %s", logs.String())
+			}
+		})
 	}
 }

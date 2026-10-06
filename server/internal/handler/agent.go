@@ -420,8 +420,15 @@ type AgentTaskResponse struct {
 	ProjectDescription   string                `json:"project_description,omitempty"` // durable project-level context injected into the brief
 	ProjectResources     []ProjectResourceData `json:"project_resources,omitempty"`   // resources attached to the project
 	CreatedAt            string                `json:"created_at"`
-	PriorSessionID       string                `json:"prior_session_id,omitempty"` // session ID from a previous task on same issue
-	PriorWorkDir         string                `json:"prior_work_dir,omitempty"`   // work_dir from a previous task on same issue
+	// CardSessionID identifies the server-owned generation this task is bound
+	// to. Lease owner identity and provider credentials never travel in this
+	// response; only the fencing epoch is returned on the start response.
+	CardSessionID               string `json:"card_session_id,omitempty"`
+	CardSessionGeneration       int64  `json:"card_session_generation,omitempty"`
+	CardSessionLeaseEpoch       int64  `json:"card_session_lease_epoch,omitempty"`
+	CardSessionIdleTimeoutHours int    `json:"card_session_idle_timeout_hours,omitempty"`
+	PriorSessionID              string `json:"prior_session_id,omitempty"` // session ID from a previous task on same issue
+	PriorWorkDir                string `json:"prior_work_dir,omitempty"`   // work_dir from a previous task on same issue
 	// PriorSessionResumeUnavailable is set when a more recent Codex session was
 	// withheld because its rollout was missing (MUL-5305); PriorSessionID (if
 	// any) is then an older fallback, and the daemon surfaces the continuity gap
@@ -737,6 +744,8 @@ type CoalescedCommentData struct {
 // Field names match the runtime/dashboard usage rows exactly so the client can
 // feed it to the same `estimateCost` / `estimateCacheSavings` helpers without
 // an adapter.
+// CardSessionMode is set only for card-session runs: `persistent` identifies a
+// live provider host and `resume` identifies the ordinary provider path.
 //
 // CostUsdTicks is the provider's own price for these tokens (1e-10 USD) and is
 // nil when the provider reported none — the client then estimates that slice
@@ -746,6 +755,7 @@ type CoalescedCommentData struct {
 type TaskUsageData struct {
 	Provider         string `json:"provider,omitempty"`
 	Model            string `json:"model"`
+	CardSessionMode  string `json:"card_session_mode,omitempty"`
 	InputTokens      int64  `json:"input_tokens"`
 	OutputTokens     int64  `json:"output_tokens"`
 	CacheReadTokens  int64  `json:"cache_read_tokens"`
@@ -853,6 +863,7 @@ func taskToResponse(t db.AgentTaskQueue, workspaceID string) AgentTaskResponse {
 		ParentTaskID:           uuidToPtr(t.ParentTaskID),
 		IsLeaderTask:           t.IsLeaderTask,
 		CreatedAt:              timestampToString(t.CreatedAt),
+		CardSessionID:          uuidToString(t.CardSessionID),
 		TriggerCommentID:       uuidToPtr(t.TriggerCommentID),
 		CoalescedCommentIDs:    uuidsToStrings(t.CoalescedCommentIds),
 		DeliveredCommentIDs:    uuidStringsOrEmpty(t.DeliveredCommentIds),

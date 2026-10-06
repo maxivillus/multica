@@ -56,6 +56,7 @@ type persistedTerminalTaskReport struct {
 	FailureReason         string    `json:"failure_reason,omitempty"`
 	SessionRolloutMissing bool      `json:"session_rollout_missing,omitempty"`
 	RetiredSessionID      string    `json:"retired_session_id,omitempty"`
+	CardSessionLeaseEpoch int64     `json:"card_session_lease_epoch,omitempty"`
 
 	PermanentRejectionCount   int        `json:"permanent_rejection_count,omitempty"`
 	FirstPermanentRejectionAt *time.Time `json:"first_permanent_rejection_at,omitempty"`
@@ -146,6 +147,7 @@ func persistedTerminalReport(report terminalTaskReport, createdAt time.Time) (pe
 		FailureReason:         report.failureReason,
 		SessionRolloutMissing: report.sessionRolloutMissing,
 		RetiredSessionID:      report.retiredSessionID,
+		CardSessionLeaseEpoch: report.cardSessionLeaseEpoch,
 	}, nil
 }
 
@@ -177,6 +179,7 @@ func (record persistedTerminalTaskReport) terminalReport() (terminalTaskReport, 
 		failureReason:         record.FailureReason,
 		sessionRolloutMissing: record.SessionRolloutMissing,
 		retiredSessionID:      record.RetiredSessionID,
+		cardSessionLeaseEpoch: record.CardSessionLeaseEpoch,
 	}, nil
 }
 
@@ -676,6 +679,7 @@ func (d *Daemon) handleTerminalReportDeliveryError(ctx context.Context, item pen
 			sessionID:             item.report.sessionID,
 			workDir:               item.report.workDir,
 			durableWorkDir:        item.report.durableWorkDir,
+			cardSessionLeaseEpoch: item.report.cardSessionLeaseEpoch,
 			failureReason:         "agent_error.unknown",
 			sessionRolloutMissing: item.report.sessionRolloutMissing,
 			retiredSessionID:      item.report.retiredSessionID,

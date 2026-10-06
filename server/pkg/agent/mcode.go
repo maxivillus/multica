@@ -136,7 +136,7 @@ func (b *mcodeBackend) Execute(ctx context.Context, prompt string, opts ExecOpti
 		_, _ = io.Copy(stderrSink, stderr)
 	}()
 
-	b.cfg.Logger.Info("mcode acp started", "pid", cmd.Process.Pid, "cwd", opts.Cwd)
+	b.cfg.Logger.Info("mcode acp started", "pid", cmd.Process.Pid, "cwd_present", opts.Cwd != "")
 	msgStream := newMcodeMessageStream(256)
 	resCh := make(chan Result, 1)
 	var deliverable acpDeliverableTracker
@@ -303,7 +303,7 @@ func (b *mcodeBackend) Execute(ctx context.Context, prompt string, opts ExecOpti
 
 		c.sessionID = sessionID
 		if opts.SystemPrompt != "" {
-			b.cfg.Logger.Debug("mcode ignoring ExecOptions.SystemPrompt; using cwd-scoped AGENTS.md", "cwd", opts.Cwd)
+			b.cfg.Logger.Debug("mcode ignoring ExecOptions.SystemPrompt; using cwd-scoped AGENTS.md", "cwd_present", opts.Cwd != "")
 		}
 		streamingCurrentTurn.Store(true)
 		_, err = c.request(runCtx, "session/prompt", map[string]any{

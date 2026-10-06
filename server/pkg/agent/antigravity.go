@@ -322,7 +322,7 @@ func (b *antigravityBackend) Execute(ctx context.Context, prompt string, opts Ex
 		return nil, fmt.Errorf("start agy: %w", err)
 	}
 
-	b.cfg.Logger.Info("agy started", "pid", cmd.Process.Pid, "cwd", opts.Cwd, "model", opts.Model)
+	b.cfg.Logger.Info("agy started", "pid", cmd.Process.Pid, "cwd_present", opts.Cwd != "", "model", opts.Model)
 
 	msgCh := make(chan Message, 256)
 	resCh := make(chan Result, 1)
@@ -435,7 +435,7 @@ func (b *antigravityBackend) Execute(ctx context.Context, prompt string, opts Ex
 			}
 		}
 		if err := scanner.Err(); err != nil {
-			b.cfg.Logger.Warn("agy stdout scanner error", "err", err)
+			b.cfg.Logger.Warn("agy stdout scanner error", "error_present", err != nil)
 		}
 
 		waitErr := cmd.Wait()
@@ -458,7 +458,7 @@ func (b *antigravityBackend) Execute(ctx context.Context, prompt string, opts Ex
 				// agy can emit a complete DONE response and only then fail a
 				// follow-up network operation. Preserve the finished answer instead
 				// of presenting that trailing transport error as a failed turn.
-				b.cfg.Logger.Warn("agy reported a trailing network error after a completed response", "err", streamResultError)
+				b.cfg.Logger.Warn("agy reported a trailing network error after a completed response", "error_present", streamResultError != "")
 			} else {
 				// Prefer the provider's structured error even when agy also exits
 				// non-zero; the process status alone discards the actionable cause.

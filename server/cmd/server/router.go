@@ -215,9 +215,11 @@ func NewRouter(pool *pgxpool.Pool, hub *realtime.Hub, bus *events.Bus, analytics
 }
 
 type RouterOptions struct {
-	HTTPMetrics         *obsmetrics.HTTPMetrics
-	BusinessMetrics     *obsmetrics.BusinessMetrics
-	ChannelLeaseMetrics *obsmetrics.ChannelLeaseMetrics
+	HTTPMetrics                     *obsmetrics.HTTPMetrics
+	BusinessMetrics                 *obsmetrics.BusinessMetrics
+	CardSessionMetrics              *obsmetrics.CardSessionMetrics
+	CardSessionObservabilityEnabled bool
+	ChannelLeaseMetrics             *obsmetrics.ChannelLeaseMetrics
 	// ChannelLeaseRedis is a dedicated non-blocking Redis client/pool. It is
 	// required only when CHANNEL_WS_LEASE_BACKEND=redis.
 	ChannelLeaseRedis redis.UniversalClient
@@ -455,6 +457,8 @@ func NewRouterWithOptions(pool *pgxpool.Pool, hub *realtime.Hub, bus *events.Bus
 	h.FeatureFlags = opts.FeatureFlags
 	h.TaskService.FeatureFlags = opts.FeatureFlags
 	h.TaskService.Metrics = opts.BusinessMetrics
+	h.TaskService.CardSessionMetrics = opts.CardSessionMetrics
+	h.TaskService.CardSessionObservabilityEnabled = opts.CardSessionObservabilityEnabled
 	h.IssueService.Metrics = opts.BusinessMetrics
 	entitlementClient, entitlementErr := entitlement.New(entitlement.Config{
 		BaseURL:  signupConfig.CloudURL,
@@ -1606,6 +1610,8 @@ func NewRouterWithOptions(pool *pgxpool.Pool, hub *realtime.Hub, bus *events.Bus
 
 		r.Post("/runtimes/{runtimeId}/recover-orphans", h.RecoverOrphanedTasks)
 		r.Post("/tasks/{taskId}/session", h.PinTaskSession)
+		r.Post("/tasks/{taskId}/card-session/heartbeat", h.HeartbeatCardSessionLease)
+		r.Post("/tasks/{taskId}/card-session/release", h.ReleaseCardSessionLease)
 	})
 
 	// Public Plugin Action API. This is the stable, globally versioned contract
